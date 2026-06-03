@@ -1,6 +1,6 @@
 [build]
 builder = "nixpacks"
-buildCommand = "npm install && pip3 install -r requirements.txt && playwright install chromium"
+buildCommand = "npm install && pip3 install -r requirements.txt"
 
 [deploy]
 startCommand = "node index.js"
