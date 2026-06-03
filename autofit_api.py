@@ -24,14 +24,21 @@ _uid_cache: dict = {}
 # ─── Session ─────────────────────────────────────────────────────────────────
 
 def load_token() -> str:
+    # env variable קודם (ענן), אחר-כך קובץ מקומי
+    env_token = os.environ.get("AUTOFIT_TOKEN")
+    if env_token:
+        return env_token
     if SESSION_FILE.exists():
         return json.loads(SESSION_FILE.read_text())["token"]
-    raise RuntimeError("No session — run login first")
+    raise RuntimeError("No session — set AUTOFIT_TOKEN env var or run login first")
 
 def save_token(token: str, coach_id: str):
     SESSION_FILE.write_text(json.dumps({"token": token, "coach_id": coach_id}))
 
 def load_coach_id() -> str:
+    env_id = os.environ.get("AUTOFIT_COACH_ID")
+    if env_id:
+        return env_id
     if SESSION_FILE.exists():
         return json.loads(SESSION_FILE.read_text()).get("coach_id", "")
     return ""
