@@ -1,6 +1,5 @@
 [build]
-builder = "nixpacks"
-buildCommand = "npm install && pip3 install -r requirements.txt"
+builder = "dockerfile"
 
 [deploy]
 startCommand = "node index.js"
