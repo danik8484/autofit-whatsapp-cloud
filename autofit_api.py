@@ -136,10 +136,11 @@ def find_user(query: str):
             break
         page += 1
 
-    # pass 1: התאמה מדויקת — כל מילות השאילתה בשם
+    # pass 1: word match מדויק — "דני" לא יתאים ל"דניאל"
     for u in all_users:
         full_name = u.get("name") or f"{u.get('first_name','')} {u.get('last_name','')}".strip()
-        if all(t in full_name for t in terms):
+        name_words = full_name.split()
+        if all(t in name_words for t in terms):
             uid = str(u["id"])
             _uid_cache[query] = (uid, full_name, False)
             return uid, full_name, False
@@ -148,7 +149,7 @@ def find_user(query: str):
     if len(terms) == 1:
         for u in all_users:
             full_name = u.get("name") or f"{u.get('first_name','')} {u.get('last_name','')}".strip()
-            if first_term in full_name:
+            if first_term in full_name.split():  # word match גם כאן
                 uid = str(u["id"])
                 _uid_cache[query] = (uid, full_name, False)
                 return uid, full_name, False
@@ -420,9 +421,29 @@ def parse_message(text: str) -> dict:
             if cleaned:
                 result["name"] = cleaned
         elif key in ("ארוחה", "meal", "ארוחת"):
-            # נרמול ארוחה — תומך גם ב"ערב וצהריים" (קח ראשונה)
-            normalized = _extract_meal(val)
-            result["meal"] = normalized if normalized else val.split()[0] if val.split() else val
+            # תמיכה בריבוי ארוחות: "ערב + צהריים" → שמור רשימה
+            parts = re.split(r'[+וV,]', val)
+            meals = [m for p in parts for m in [_extract_meal(p.strip())] if m]
+            if len(meals) > 1:
+                result["meals"] = meals  # ריבוי ארוחות
+            elif meals:
+                result["meal"] = meals[0]
+            else:
+                result["meal"] = val.strip()
+        elif _extract_meal(key):
+            # "ערב: X ל Y" — שם ארוחה ישירות כ-key
+            meal_key = _extract_meal(key)
+            v = val.strip()
+            v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
+            if " ל " in v:
+                nf, ht = v.split(" ל ", 1)
+            else:
+                ml = re.search(r'^(.+?)\s+ל([\u05D0-\u05EA].+)$', v)
+                nf, ht = (ml.group(1), ml.group(2)) if ml else (v, "")
+            op = f"הוסף ({nf.strip()}) במקום ({ht.strip()})" if ht.strip() else f"הוסף ({nf.strip()})"
+            if "extra_ops" not in result:
+                result["extra_ops"] = []
+            result["extra_ops"].append({"meal": meal_key, "change": op})
         elif key in ("שנה", "change", "פעולה", "בקשה"):
             result["change"] = val
         elif key in ("החלף", "הוסף"):
@@ -591,7 +612,12 @@ def execute_request(request_text: str, force: bool = False,
                     or (foods[0] if foods else None)
         if not best_food:
             return f"❓ לא נמצא '{food_override}' במאגר."
-        return add_food_to_meal(user_id, meal_id, best_food, food_row)
+        r = add_food_to_meal(user_id, meal_id, best_food, food_row)
+        if r.startswith("✅"):
+            fn = best_food.get("food_name","")
+            rep = food_row.get("food_name","") if food_row else ""
+            return f"✅ נוסף: *{fn}* ב{full_meal} של {full_name}" + (f"\nכתחליף ל: {rep}" if rep else "")
+        return r
 
     best_food, alternatives = find_best_food(new_food_query, coach_id)
 
@@ -601,7 +627,15 @@ def execute_request(request_text: str, force: bool = False,
             return f"❓ מצאתי כמה אפשרויות עבור '{new_food_query}':\n{options}\n\nשלח מספר או שם מדויק."
         return f"❓ לא מצאתי '{new_food_query}' במאגר.\nנסה שם יותר ספציפי (לדוגמא: 'פסטה מבושלת' במקום 'פסטה')."
 
-    return add_food_to_meal(user_id, meal_id, best_food, food_row)
+    result = add_food_to_meal(user_id, meal_id, best_food, food_row)
+    if result.startswith("✅"):
+        food_name = best_food.get("food_name", "")
+        if food_row:
+            replaced = food_row.get("food_name", "")
+            return f"✅ נוסף: *{food_name}* ב{full_meal} של {full_name}\nכתחליף ל: {replaced}"
+        else:
+            return f"✅ נוסף: *{food_name}* ב{full_meal} של {full_name}"
+    return result
 
 
 if __name__ == "__main__":

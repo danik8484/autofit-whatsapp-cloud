@@ -11,6 +11,8 @@ const ALLOWED = [
   '972539598622', // רון
 ];
 
+const SERVER_START = Math.floor(Date.now() / 1000); // זמן עליית השרת
+
 const app = express();
 app.use(express.json());
 
@@ -55,6 +57,7 @@ function runAutofit(phone, text, opts = {}) {
 
   proc.on('close', async code => {
     const raw = output.trim() || (code === 0 ? 'בוצע!' : 'משהו השתבש');
+    console.log(`[py→] ${raw.slice(0,80).replace(/\n/g,' | ')}`);
 
     // confidence נמוך — שאל אישור
     if (raw.startsWith('CONFIRM:')) {
@@ -126,6 +129,13 @@ app.post('/webhook', async (req, res) => {
   const msg = body.messageData;
   if (!msg || msg.typeMessage !== 'textMessage') return;
 
+  // התעלם מ-webhooks שנשלחו לפני שהשרת עלה (retries אחרי restart)
+  const msgTimestamp = body.timestamp;
+  if (msgTimestamp && msgTimestamp < SERVER_START - 10) {
+    console.log(`[skip] webhook לפני start (${Math.round(SERVER_START - msgTimestamp)}s ago)`);
+    return;
+  }
+
   // מניעת כפילויות — idMessage נמצא ב-top level של body
   const msgId = body.idMessage;
   if (msgId) {
@@ -143,7 +153,8 @@ app.post('/webhook', async (req, res) => {
   const sender = body.senderData?.sender?.replace('@c.us', '');
   if (!ALLOWED.includes(sender)) return;
 
-  console.log(`📨 מ: ${sender} | "${text}"`);
+  console.log(`📨 מ: ${sender} | "${text.slice(0,50).replace(/\n/g,'↵')}"`);
+  console.log(`[state] conf=${pendingConfirmations.has(sender)} corr=${pendingCorrections.has(sender)}`);
 
   // בדוק אם יש תיקון ממתין (ארוחה / בחירת מזון)
   if (pendingCorrections.has(sender)) {
@@ -215,7 +226,8 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ─── Health check ─────────────────────────────────────────────
-app.get('/', (_, res) => res.send('✅ autofit bot running'));
+app.get('/', (_, res) => res.send('✅ v2 autofit bot running'));
+app.get('/test', (req, res) => { const {spawn}=require('child_process'); const p=spawn('python3',[require('path').join(__dirname,'autofit_api.py'),'שם: רון וליצקו\nארוחה: ערב\nהוספה: טונה ל חזה עוף מבושל']); let o=''; p.stdout.on('data',d=>{o+=d}); p.on('close',()=>res.send(o)); });
 
 // ─── הפעל שרת + הגדר webhook ──────────────────────────────────
 const PORT = process.env.PORT || 3000;
