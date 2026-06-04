@@ -249,7 +249,8 @@ def search_food(query: str, coach_id: str = "") -> list:
     return []
 
 def normalize_food_query(q: str) -> str:
-    """מסיר ה' הידיעה מכל מילה ומנרמל ביטויי בישול נפוצים."""
+    """מסיר ה' הידיעה, תווי תבנית (<>), ומנרמל ביטויי בישול נפוצים."""
+    q = re.sub(r'[<>]', '', q)  # מסיר סוגריים זוויתיים מתבניות
     words = re.split(r'\s+', q.strip())  # מנרמל רווחים כפולים
     words = [re.sub(r'^ה(?=[א-ת])', '', w) for w in words if w]
     result = " ".join(words)
