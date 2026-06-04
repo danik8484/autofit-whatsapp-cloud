@@ -1,5 +1,4 @@
 node_modules/
-baileys_session/
 session.json
 *.log
 __pycache__/
