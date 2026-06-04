@@ -221,7 +221,7 @@ def find_meal_and_food(meals: list, meal_name: str, food_hint: str) -> tuple:
             )
         return target_meal["id"], match, None
 
-    return target_meal["id"], foods[0], None
+    return target_meal["id"], None, None  # אין food_hint → מזון חדש, לא תחליף
 
 
 # ─── Food search ──────────────────────────────────────────────────────────────
@@ -557,7 +557,7 @@ def execute_request(request_text: str, force: bool = False,
             available = [m.get("meal_name","").strip() for m in meals]
             if available:
                 opts = "\n".join(f"{i+1}. {a}" for i, a in enumerate(available))
-                return f"MEAL_OPTIONS:{full_meal}|" + "\n".join(available) + f"\n❓ לא מצאתי '{full_meal}'. יש:\n{opts}\n\nשלח מספר או שם ארוחה."
+                return f"MEAL_OPTIONS:{full_meal}|" + "|".join(available) + f"\n❓ לא מצאתי '{full_meal}'. יש:\n{opts}\n\nשלח מספר או שם ארוחה."
         # group_hint לא נמצא — הצג מזונות בארוחה
         if meal_id and "לא נמצא" in err:
             meal_foods = next((m.get("mealFoods") or m.get("new_meal_food") or []
