@@ -94,8 +94,16 @@ function runAutofit(phone, text, opts = {}) {
       return;
     }
 
-    // שמור state לתיקון אפשרויות מזון חדש
-    if (raw.startsWith('❓ מספר אפשרויות')) {
+    // שם לא נמצא — שאל לתיקון
+    if (raw.startsWith('NAME_NOT_FOUND:')) {
+      const badName = raw.slice('NAME_NOT_FOUND:'.length).trim();
+      pendingCorrections.set(phone, { type: 'name', originalText: text, timestamp: Date.now() });
+      await sendMessage(phone, `❌ לא מצאתי מתאמן בשם *${badName}*.\n\nשלח את השם המלא כפי שרשום ב-auto-fit ואנסה שוב.`);
+      return;
+    }
+
+    // אפשרויות מזון חדש — המתן לבחירה
+    if (raw.startsWith('❓ מצאתי כמה אפשרויות')) {
       const alternatives = raw.split('\n')
         .filter(l => /^\d+\./.test(l))
         .map(l => l.replace(/^\d+\.\s*/, '').trim());
@@ -104,7 +112,7 @@ function runAutofit(phone, text, opts = {}) {
       pendingCorrections.delete(phone);
     }
 
-    await sendMessage(phone, msg);
+    await sendMessage(phone, code === 0 ? raw : `❌ ${raw}`);
   });
 }
 
@@ -146,6 +154,13 @@ app.post('/webhook', async (req, res) => {
       pendingCorrections.delete(sender);
       runAutofit(sender, corr.originalText, { force: true, mealOverride: text.trim() });
       return;
+    } else if (corr.type === 'name') {
+      // תיקון שם — כל תשובה קצרה נחשבת לשם חדש
+      if (text.trim().length >= 2) {
+        pendingCorrections.delete(sender);
+        runAutofit(sender, corr.originalText, { force: true, nameOverride: text.trim() });
+        return;
+      }
     } else if (corr.type === 'food' || corr.type === 'meal' || corr.type === 'hint') {
       const numMatch = text.trim().match(/^(\d+)$/);
       let chosen = null;

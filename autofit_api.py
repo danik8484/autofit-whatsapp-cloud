@@ -250,15 +250,16 @@ def search_food(query: str, coach_id: str = "") -> list:
 
 def normalize_food_query(q: str) -> str:
     """מסיר ה' הידיעה, תווי תבנית (<>), ומנרמל ביטויי בישול נפוצים."""
-    q = re.sub(r'[<>]', '', q)  # מסיר סוגריים זוויתיים מתבניות
-    words = re.split(r'\s+', q.strip())  # מנרמל רווחים כפולים
+    q = re.sub(r'[<>]', '', q)
+    # ביטויי בישול — BEFORE strip ל' כדי ש"לאחר" לא יהפוך "אחר"
+    q = re.sub(r'לפני בשול\b', 'לפני בישול', q)
+    q = re.sub(r'(?:אחרי|לאחר) בישול\b', 'מבושל', q)
+    q = re.sub(r'לא\s+מבושל\b', 'לפני בישול', q)
+    words = re.split(r'\s+', q.strip())
     words = [re.sub(r'^ה(?=[א-ת])', '', w) for w in words if w]
-    result = " ".join(words)
-    # ביטויי בישול נפוצים
-    result = re.sub(r'לפני בשול\b', 'לפני בישול', result)
-    result = re.sub(r'(?:אחרי|לאחר) בישול\b', 'מבושל', result)
-    result = re.sub(r'לא\s+מבושל\b', 'לפני בישול', result)
-    return result
+    # ל' מיידית: "לאורז"→"אורז" — רק כשנשאר ≥3 תווים (מניעת "לחם"→"חם")
+    words = [re.sub(r'^ל(?=[א-ת]{3,})', '', w) for w in words]
+    return " ".join(words)
 
 def find_best_food(query: str, coach_id: str = ""):
     """
@@ -419,20 +420,28 @@ def parse_message(text: str) -> dict:
             if cleaned:
                 result["name"] = cleaned
         elif key in ("ארוחה", "meal", "ארוחת"):
-            # נרמול ארוחה דרך _extract_meal (כולל "צהרים"→"צהריים", "לילה"→"ערב" וכו')
+            # נרמול ארוחה — תומך גם ב"ערב וצהריים" (קח ראשונה)
             normalized = _extract_meal(val)
-            result["meal"] = normalized if normalized else val
+            result["meal"] = normalized if normalized else val.split()[0] if val.split() else val
         elif key in ("שנה", "change", "פעולה", "בקשה"):
             result["change"] = val
         elif key in ("החלף", "הוסף"):
             result["change"] = f"{key} {val}"
         elif key == "הוספה":
-            # פורמט חדש: "טונה בשמן ל אורז לבן" → הוסף (טונה) במקום (אורז)
-            if " ל " in val:
-                new_f, hint = val.split(" ל ", 1)
-                result["change"] = f"הוסף ({new_f.strip()}) במקום ({hint.strip()})"
+            # פורמט חדש: "X ל Y" עם רווח, או "X לY" עם ל' צמוד
+            v = val.strip()
+            # strip פועל מהתחלה ("הוסיפי פסטה" → "פסטה")
+            v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
+            if " ל " in v:
+                new_f, hint = v.split(" ל ", 1)
             else:
-                result["change"] = f"הוסף ({val.strip()})"
+                # ל' צמוד: "פסטה מבושלת לאורז" → "פסטה מבושלת" + "אורז"
+                m_l = re.search(r'^(.+?)\s+ל([\u05D0-\u05EA].+)$', v)
+                if m_l:
+                    new_f, hint = m_l.group(1), m_l.group(2)
+                else:
+                    new_f, hint = v, ""
+            result["change"] = f"הוסף ({new_f.strip()}) במקום ({hint.strip()})" if hint.strip() else f"הוסף ({new_f.strip()})"
 
     if "name" in result and "change" in result:
         result.setdefault("meal", "ערב")
@@ -486,8 +495,13 @@ def execute_request(request_text: str, force: bool = False,
                     food_override: str = "", hint_override: str = "") -> str:
     parsed = parse_message(request_text)
     if "name" not in parsed or "change" not in parsed:
+        missing = []
+        if "name" not in parsed:  missing.append("שם מתאמן")
+        if "change" not in parsed: missing.append("מה להוסיף")
+        hint = "ℹ️ חסר: " + ", ".join(missing) + "\n\n"
         return (
-            "פורמט שגוי. שלח:\n"
+            hint +
+            "פורמט:\n"
             "שם: <שם מתאמן>\n"
             "ארוחה: ערב / בוקר / צהריים\n"
             "הוספה: <מזון חדש> ל <מזון קיים>"
@@ -518,7 +532,7 @@ def execute_request(request_text: str, force: bool = False,
     # מצא מתאמן
     user_id, full_name, is_fuzzy = find_user(name)
     if not user_id:
-        return f"❌ לא נמצא מתאמן בשם '{name}'"
+        return f"NAME_NOT_FOUND:{name}"
 
     # אישור על התאמה עמומה (אם לא כבר אושר)
     if is_fuzzy and not force:
@@ -584,8 +598,8 @@ def execute_request(request_text: str, force: bool = False,
     if not best_food:
         if alternatives:
             options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:5]))
-            return f"❓ מספר אפשרויות עבור '{new_food_query}':\n{options}\n\nשלח מספר או שם מדויק."
-        return f"❓ לא נמצא '{new_food_query}' במאגר. נסה שם ספציפי יותר."
+            return f"❓ מצאתי כמה אפשרויות עבור '{new_food_query}':\n{options}\n\nשלח מספר או שם מדויק."
+        return f"❓ לא מצאתי '{new_food_query}' במאגר.\nנסה שם יותר ספציפי (לדוגמא: 'פסטה מבושלת' במקום 'פסטה')."
 
     return add_food_to_meal(user_id, meal_id, best_food, food_row)
 
