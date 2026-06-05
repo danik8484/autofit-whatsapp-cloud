@@ -222,6 +222,46 @@ def get_user_meals(user_id: str) -> list:
     data = _post("/coach/v2-getAllUserMeals", {"user_id": user_id})
     return data.get("data", {}).get("new_meals", [])
 
+def format_menu(user_id: str, full_name: str) -> str:
+    """מחזיר תפריט מלא של מתאמן כטקסט מפורמט ל-WhatsApp."""
+    meals = get_user_meals(user_id)
+    if not meals:
+        return f"❌ לא נמצאו ארוחות עבור {full_name}"
+
+    MEAL_EMOJI = {
+        "ארוחת בוקר": "🍳", "ארוחת צהריים": "🥗",
+        "ארוחת ערב": "🌙", "ארוחת ביניים": "🍎",
+        "ארוחת לילה": "🌙",
+    }
+
+    lines = [f"📋 תפריט של *{full_name}*:\n"]
+    for meal in meals:
+        meal_name = meal.get("meal_name", "ארוחה").strip()
+        emoji = MEAL_EMOJI.get(meal_name, "🍽")
+        lines.append(f"{emoji} *{meal_name}*")
+
+        foods = meal.get("mealFoods") or meal.get("new_meal_food") or []
+        if not foods:
+            lines.append("  (ריקה)")
+        for food in foods:
+            fname = food.get("food_name", "?")
+            grams = food.get("gram_value") or food.get("grams") or ""
+            grams_str = f" — {grams} גרם" if grams else ""
+            lines.append(f"• {fname}{grams_str}")
+            # תחליפים/אופציות (sub-foods)
+            subs = (food.get("sub_meal_food") or food.get("subMealFood") or
+                    food.get("sub_foods") or food.get("alternatives") or
+                    food.get("submealFoods") or [])
+            for sub in subs:
+                sname = sub.get("food_name", "?")
+                sgrams = sub.get("gram_value") or sub.get("grams") or ""
+                sgrams_str = f" — {sgrams} גרם" if sgrams else ""
+                lines.append(f"  ↳ {sname}{sgrams_str}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 def find_meal_and_food(meals: list, meal_name: str, food_hint: str) -> tuple:
     """
     מחזיר (meal_id, food_row) לפי שם ארוחה ו-food_hint (group_hint / "במקום X").
@@ -348,16 +388,17 @@ def find_best_food(query: str, coach_id: str = ""):
 
 # ─── Add food to meal ─────────────────────────────────────────────────────────
 
-def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict) -> str:
+def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict, grams_override: str = None) -> str:
     """
     מוסיף מזון לארוחה.
     אם food_row קיים → מוסיף כ-תחליף (v2-addUserSubmealFood)
     אם food_row None → מוסיף מזון חדש (v2-addUserMealFood)
+    grams_override: אם נשלח, משתמש בגרמים אלו במקום ברירת המחדל
     """
     if food_row:
         # תחליף — מוסיף כאופציה חלופית בקבוצה הקיימת
-        # גרמים: לקחת מהמזון המוחלף (כמות אמיתית מהתפריט), לא default של מאגר
-        actual_grams = str(food_row.get("gram_value") or food_row.get("grams") or food.get("grams") or food.get("gram_value") or "100")
+        # גרמים: grams_override → מהמנה האמיתית → default מאגר
+        actual_grams = str(grams_override or food_row.get("gram_value") or food_row.get("grams") or food.get("grams") or food.get("gram_value") or "100")
         body = {
             "mavap_status": "0",
             "user_id": str(user_id),
@@ -389,7 +430,7 @@ def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict) -> 
             "new_user_food_carb": food.get("carbs", 0),
             "new_user_food_protein": food.get("protein", 0),
             "new_user_food_calories": food.get("calories", 0),
-            "new_user_food_gram_value": str(food.get("grams") or food.get("gram_value") or "100"),
+            "new_user_food_gram_value": str(grams_override or food.get("grams") or food.get("gram_value") or "100"),
             "new_user_food_cup_value": str(food.get("cups") or food.get("cup_value") or "0.00"),
             "food_measure": "grams",
         }
@@ -531,6 +572,12 @@ def parse_message(text: str) -> dict:
                 v = re.sub(r'בנוסף\s+ל', 'ל ', v)  # "בנוסף ל X" → "ל X"
                 v = re.sub(r'במקום\s+של', 'ל ', v)   # "במקום של X" → "ל X"
                 v = re.sub(r'במקום', 'ל ', v)         # "במקום X" → "ל X"
+                # "עוד X גרם" — שמור גרמים ונקה מהטקסט
+                extra_grams = None
+                grams_m = re.search(r'\bעוד\s+(\d+)\s*גרם\b', v)
+                if grams_m:
+                    extra_grams = grams_m.group(1)
+                    v = re.sub(r'\bעוד\s+\d+\s*גרם\s*', '', v).strip()
                 # זהה ארוחה ספציפית בתוך הפעולה ("בבוקר", "בצהריים")
                 op_meal = _extract_meal(v)
                 if op_meal:
@@ -545,7 +592,7 @@ def parse_message(text: str) -> dict:
                         nf, ht = v, ""
                 _cl = lambda s: re.sub(r'[.\s:,]+$', '', s).strip()
                 change = f"הוסף ({_cl(nf)}) במקום ({_cl(ht)})" if _cl(ht) else f"הוסף ({_cl(nf)})"
-                return {"change": change, "meal": op_meal}
+                return {"change": change, "meal": op_meal, "extra_grams": extra_grams}
 
             # פצל ב-comma לפעולות מרובות
             raw_ops = [s.strip() for s in re.split(r',\s*', val) if s.strip()]
@@ -751,6 +798,13 @@ def execute_request(request_text: str, force: bool = False,
         new_food_raw = add_match.group(1).strip()
         group_hint_raw = (add_match.group(2) or "").strip() if add_match.lastindex and add_match.lastindex >= 2 else ""
 
+        # "עוד X גרם" — מה-op (מובנה) או מהטקסט החופשי
+        extra_grams = op.get("extra_grams")
+        grams_in_food = re.search(r'\bעוד\s+(\d+)\s*גרם\b', new_food_raw)
+        if grams_in_food:
+            extra_grams = grams_in_food.group(1)
+            new_food_raw = re.sub(r'\bעוד\s+\d+\s*גרם\s*', '', new_food_raw).strip()
+
         paren = re.search(r'\(([^)]+)\)', new_food_raw)
         new_food_query = normalize_food_query(paren.group(1).strip() if paren else new_food_raw)
         paren2 = re.search(r'\(([^)]+)\)', group_hint_raw)
@@ -821,18 +875,17 @@ def execute_request(request_text: str, force: bool = False,
                 all_results.append(err)
                 continue
 
-            add_result = add_food_to_meal(user_id, meal_id, best_food, food_row)
+            add_result = add_food_to_meal(user_id, meal_id, best_food, food_row, extra_grams)
             if add_result.startswith("✅"):
                 food_name = best_food.get("food_name", "")
                 if food_row:
                     replaced = food_row.get("food_name", "")
-                    # גרמים מהמנה האמיתית (לא default מאגר)
-                    meal_grams = food_row.get("gram_value") or food_row.get("grams") or ""
+                    meal_grams = extra_grams or food_row.get("gram_value") or food_row.get("grams") or ""
                     grams_str = f" ({meal_grams} גרם)" if meal_grams else ""
                     all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{grams_str}")
                 else:
-                    new_grams = best_food.get("grams") or best_food.get("gram_value") or ""
-                    grams_str = f" ({new_grams} גרם)" if new_grams else ""
+                    disp_grams = extra_grams or best_food.get("grams") or best_food.get("gram_value") or ""
+                    grams_str = f" ({disp_grams} גרם)" if disp_grams else ""
                     all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}")
             else:
                 all_results.append(add_result)
@@ -858,6 +911,15 @@ if __name__ == "__main__":
     meal_override  = _pop_arg("--meal")
     food_override  = _pop_arg("--food")
     hint_override  = _pop_arg("--hint")
+    menu_name      = _pop_arg("--menu")
+
+    if menu_name:
+        uid, full_name, _ = find_user(menu_name)
+        if not uid:
+            print(f"❌ לא מצאתי '{menu_name}'")
+            sys.exit(1)
+        print(format_menu(uid, full_name))
+        sys.exit(0)
 
     if not args:
         print("Usage: python3 autofit_api.py [--force] [--name <name>] <request>")

@@ -179,6 +179,26 @@ function runAutofit(phone, text, opts = {}) {
   });
 }
 
+// ─── הצגת תפריט מתאמן ────────────────────────────────────────
+function runMenu(phone, name) {
+  const script = path.join(__dirname, 'autofit_api.py');
+  const proc = spawn('python3', [script, '--menu', name]);
+  let output = '';
+  let timedOut = false;
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    proc.kill();
+    sendMessage(phone, '❌ הבקשה לקחה יותר מדי זמן. נסה שוב.');
+  }, 30000);
+  proc.stdout.on('data', d => { output += d.toString(); });
+  proc.stderr.on('data', d => console.error('[menu err]', d.toString().trim()));
+  proc.on('close', async code => {
+    clearTimeout(killTimer);
+    if (timedOut) return;
+    await sendMessage(phone, output.trim() || '❌ לא נמצא תפריט');
+  });
+}
+
 // ─── Webhook מ-Green API ──────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -223,6 +243,17 @@ app.post('/webhook', async (req, res) => {
     pendingConfirmations.delete(sender);
     pendingCorrections.delete(sender);
     await sendMessage(sender, hadPending ? '❌ הפעולה בוטלה' : 'אין פעולה פעילה לביטול');
+    return;
+  }
+
+  // ─── תפריט ─────────────────────────────────────────────────────
+  // "דני תפריט" / "תפריט דני" — הצג תפריט מלא
+  const menuM = /^([א-׺][א-׺\s'״׳]{1,30})\s+תפריט$/.exec(text.trim()) ||
+                /^תפריט\s+([א-׺][א-׺\s'״׳]{1,30})$/.exec(text.trim());
+  if (menuM) {
+    const menuName = menuM[1].trim();
+    console.log(`📋 תפריט עבור: "${menuName}"`);
+    runMenu(sender, menuName);
     return;
   }
 
