@@ -93,7 +93,8 @@ function runAutofit(phone, text, opts = {}) {
       const [header, ...rest] = raw.split('\n');
       const alts = header.slice('HINT_OPTIONS:'.length).split('|');
       const userMsg = rest.join('\n');
-      pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', timestamp: Date.now() });
+      // שמור גם foodOverride שכבר נבחר — כדי לא לשכוח אותו
+      pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', foodOverride: opts.foodOverride || '', timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -111,7 +112,8 @@ function runAutofit(phone, text, opts = {}) {
       const [header, ...rest] = raw.split('\n');
       const alts = header.slice('FOOD_OPTIONS:'.length).split('|');
       const userMsg = rest.join('\n');
-      pendingCorrections.set(phone, { type: 'food', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', timestamp: Date.now() });
+      // שמור גם hintOverride שכבר נבחר — כדי לא לשכוח אותו
+      pendingCorrections.set(phone, { type: 'food', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', hintOverride: opts.hintOverride || '', timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -205,9 +207,11 @@ app.post('/webhook', async (req, res) => {
           pendingCorrections.delete(sender);
           await sendMessage(sender, '⏳ מבצע...');
           if (corr.type === 'hint') {
-            runAutofit(sender, corr.originalText, { force: true, hintOverride: chosen, nameOverride: corr.nameOverride || '' });
+            // זכור גם foodOverride שנבחר קודם
+            runAutofit(sender, corr.originalText, { force: true, hintOverride: chosen, nameOverride: corr.nameOverride || '', foodOverride: corr.foodOverride || '' });
           } else {
-            runAutofit(sender, corr.originalText, { force: true, foodOverride: chosen, nameOverride: corr.nameOverride || '' });
+            // זכור גם hintOverride שנבחר קודם
+            runAutofit(sender, corr.originalText, { force: true, foodOverride: chosen, nameOverride: corr.nameOverride || '', hintOverride: corr.hintOverride || '' });
           }
           return;
         }
