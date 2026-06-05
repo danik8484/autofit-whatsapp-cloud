@@ -667,6 +667,16 @@ def parse_message(text: str) -> dict:
         result["confidence"] = 100
         return result
 
+    # הודעה מובנית (יש שם/ארוחה) אבל חסר הוספה — לא נפול לfree-text
+    _has_structured_key = any(
+        re.search(r'(?:^|\n)\s*(?:שם|ארוחה|meal)\s*:', text)
+        for _ in [1]
+    )
+    if "name" in result and _has_structured_key:
+        result.setdefault("meal", "ערב")
+        result["confidence"] = 100
+        return result  # חסר change — execute_request יחזיר "חסר מה להוסיף"
+
     # ── שפה חופשית ───────────────────────────────────────────────────────────
     full = " ".join(text.strip().split("\n"))
 
