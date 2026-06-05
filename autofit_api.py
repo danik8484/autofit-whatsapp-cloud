@@ -735,6 +735,31 @@ def parse_message(text: str) -> dict:
 
     # מזון — על הטקסט ללא השם
     new_food, group_hint = _extract_foods(clean_full)
+    if not new_food and "name" in result:
+        # fallback: הטקסט שנשאר אחרי הסרת שם+ארוחה = שם המזון
+        # מסיר פעלים בתחילה ותווי זבל
+        fb = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|הכנס|שים|תשים|הכניס)\s+', '', clean_full).strip()
+        fb = re.sub(r'[^א-ת\s\d%\'\"]+', ' ', fb).strip()
+        fb = re.sub(r'\s+', ' ', fb).strip()
+        if len(fb) >= 2:
+            # extra_grams: "50 גרם לAFOOD"
+            gm = re.match(r'^(\d+)\s*גרם\s+ל?\s*', fb)
+            if gm:
+                fb = fb[gm.end():].strip()
+            # בדוק hint
+            if ' במקום ' in fb:
+                parts = fb.split(' במקום ', 1)
+                new_food, group_hint = parts[0].strip(), parts[1].strip()
+            elif ' ל ' in fb:
+                parts = fb.split(' ל ', 1)
+                new_food, group_hint = parts[0].strip(), parts[1].strip()
+            else:
+                # "פרגיות לחזה עוף" — ל מחובר
+                ml = re.search(r'^(.+?)\s+ל([א-ת].+)$', fb)
+                if ml:
+                    new_food, group_hint = ml.group(1).strip(), ml.group(2).strip()
+                else:
+                    new_food = fb
     if new_food:
         change_str = f"הוסף ({new_food})"
         if group_hint:
