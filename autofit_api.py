@@ -247,23 +247,34 @@ def format_menu(user_id: str, full_name: str) -> str:
     }
 
     lines = [f"📋 תפריט של *{full_name}*:\n"]
+    total_calories = 0
+
     for meal in meals:
         meal_name = meal.get("meal_name", "ארוחה").strip()
         emoji = MEAL_EMOJI.get(meal_name, "🍽")
-        lines.append(f"{emoji} *{meal_name}*")
+        meal_cals = meal.get("meal_totals", {}).get("calories") or 0
+        try: meal_cals = int(round(float(meal_cals)))
+        except: meal_cals = 0
+        total_calories += meal_cals
+        cal_str = f" _{meal_cals} קל'_" if meal_cals else ""
+        lines.append(f"{emoji} *{meal_name}*{cal_str}")
 
         foods = meal.get("mealFoods") or meal.get("new_meal_food") or []
         if not foods:
-            lines.append("  (ריקה)")
+            lines.append("_(ריקה)_")
         for food in foods:
             fname = food.get("food_name", "?")
-            lines.append(f"• {fname}{_fmt_grams(food)}")
-            # תחליפים/אופציות ב-italic (WhatsApp: _text_)
+            # מזון ראשי — מודגש
+            lines.append(f"*• {fname}*{_fmt_grams(food)}")
+            # אופציות — italic קטן עם כניסה
             subs = food.get("subFoods") or []
             for sub in subs:
                 sname = sub.get("food_name", "?")
                 lines.append(f"_  ↳ {sname}{_fmt_grams(sub)}_")
         lines.append("")
+
+    if total_calories:
+        lines.append(f"🔥 *סה\"כ יומי: {total_calories} קלוריות*")
 
     return "\n".join(lines).strip()
 
