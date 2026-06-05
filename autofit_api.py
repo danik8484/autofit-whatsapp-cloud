@@ -356,6 +356,8 @@ def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict) -> 
     """
     if food_row:
         # תחליף — מוסיף כאופציה חלופית בקבוצה הקיימת
+        # גרמים: לקחת מהמזון המוחלף (כמות אמיתית מהתפריט), לא default של מאגר
+        actual_grams = str(food_row.get("gram_value") or food_row.get("grams") or food.get("grams") or food.get("gram_value") or "100")
         body = {
             "mavap_status": "0",
             "user_id": str(user_id),
@@ -367,7 +369,7 @@ def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict) -> 
             "sub_new_user_food_carb": food.get("carbs", 0),
             "sub_new_user_food_protein": food.get("protein", 0),
             "sub_new_user_food_calories": food.get("calories", 0),
-            "sub_new_user_food_gram_value": str(food.get("grams") or food.get("gram_value") or "100"),
+            "sub_new_user_food_gram_value": actual_grams,
             "sub_new_user_food_cup_value": str(food.get("cups") or food.get("cup_value") or "0.00"),
             "new_meal_food_measure": "grams",
         }
@@ -822,14 +824,15 @@ def execute_request(request_text: str, force: bool = False,
             add_result = add_food_to_meal(user_id, meal_id, best_food, food_row)
             if add_result.startswith("✅"):
                 food_name = best_food.get("food_name", "")
-                new_grams = best_food.get("grams") or best_food.get("gram_value") or ""
-                grams_str = f" ({new_grams} גרם)" if new_grams else ""
                 if food_row:
                     replaced = food_row.get("food_name", "")
-                    old_grams = food_row.get("gram_value") or food_row.get("grams") or ""
-                    old_grams_str = f" ({old_grams} גרם)" if old_grams else ""
-                    all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{old_grams_str}")
+                    # גרמים מהמנה האמיתית (לא default מאגר)
+                    meal_grams = food_row.get("gram_value") or food_row.get("grams") or ""
+                    grams_str = f" ({meal_grams} גרם)" if meal_grams else ""
+                    all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{grams_str}")
                 else:
+                    new_grams = best_food.get("grams") or best_food.get("gram_value") or ""
+                    grams_str = f" ({new_grams} גרם)" if new_grams else ""
                     all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}")
             else:
                 all_results.append(add_result)
