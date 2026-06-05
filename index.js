@@ -27,6 +27,8 @@ const pendingConfirmations = new Map();
 const foodPrefs = new Map();
 // זיכרון בחירת hint: hintQuery → chosen food row name
 const hintPrefs = new Map();
+// זיכרון שמות: rawName → correctedName (למניעת CONFIRM חוזר)
+const namePrefs = new Map();
 
 // ─── שליחת הודעה ─────────────────────────────────────────────
 async function sendMessage(phone, text) {
@@ -80,7 +82,17 @@ function runAutofit(phone, text, opts = {}) {
       const sepIdx = rest.indexOf('|||');
       const correctedName = rest.slice(0, sepIdx).trim();
       const summary = rest.slice(sepIdx + 3);
-      pendingConfirmations.set(phone, { originalText: text, correctedName, type: 'confirm_with_name', timestamp: Date.now() });
+      // חלץ את השם המקורי מה-summary
+      const rawMatch = summary.match(/מצאתי עבור "([^"]+)"/);
+      const rawName = rawMatch ? rawMatch[1] : '';
+      // יש name preference? בצע ישירות
+      if (rawName && namePrefs.get(rawName.toLowerCase()) === correctedName) {
+        console.log(`[name-pref] "${rawName}" → "${correctedName}" (auto)`);
+        await sendMessage(phone, '⏳ מבצע...');
+        runAutofit(phone, text, { force: true, nameOverride: correctedName });
+        return;
+      }
+      pendingConfirmations.set(phone, { originalText: text, correctedName, rawName, type: 'confirm_with_name', timestamp: Date.now() });
       await sendMessage(phone, `❓ הבנתי:\n${summary}\n\nנכון? שלח *כן* לאישור או *לא* לביטול`);
       return;
     }
@@ -283,6 +295,11 @@ app.post('/webhook', async (req, res) => {
         pendingConfirmations.delete(sender);
         await sendMessage(sender, '⏳ מבצע...');
         if (pending.type === 'fuzzy' || pending.type === 'confirm_with_name') {
+          // שמור name preference — לא ישאל שוב על אותו שם
+          if (pending.rawName && pending.correctedName) {
+            namePrefs.set(pending.rawName.toLowerCase(), pending.correctedName);
+            console.log(`[name-pref saved] "${pending.rawName}" → "${pending.correctedName}"`);
+          }
           runAutofit(sender, pending.originalText, { force: true, nameOverride: pending.correctedName });
         } else {
           runAutofit(sender, pending.originalText, { force: true });
