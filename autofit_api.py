@@ -835,27 +835,30 @@ def execute_request(request_text: str, force: bool = False,
         # ניקוי "בערב/בבוקר/בצהריים" שדלף לשם המזון מטקסט חופשי
         new_food_raw = re.sub(r'\s*ב(?:ארוחת\s+)?(?:ערב|בוקר|צהריים|ביניים|לילה)\b', '', new_food_raw).strip()
 
-        # גרמים: מה-op / "עוד X גרם" / "X גרם [ל]FOOD" / "FOOD X גרם"
-        extra_grams = op.get("extra_grams")
-        grams_in_food = re.search(r'\bעוד\s+(\d+)\s*גרם\b', new_food_raw)
-        if grams_in_food:
-            extra_grams = grams_in_food.group(1)
-            new_food_raw = re.sub(r'\bעוד\s+\d+\s*גרם\s*', '', new_food_raw).strip()
-        elif not extra_grams:
-            m_gs2 = re.match(r'^(\d+)\s*גרם\s+ל?\s*', new_food_raw)  # "50 גרם [ל]אורז"
-            if m_gs2:
-                extra_grams = m_gs2.group(1)
-                new_food_raw = new_food_raw[m_gs2.end():].strip()
-            else:
-                m_ge2 = re.search(r'^(.+?)\s+(\d+)\s*גרם\s*$', new_food_raw)  # "אורז 50 גרם"
-                if m_ge2:
-                    extra_grams = m_ge2.group(2)
-                    new_food_raw = m_ge2.group(1).strip()
-
+        # חלץ מסוגריים תחילה — כדי שזיהוי הגרמים יעבוד גם על "(50 גרם אורז)"
         paren = re.search(r'\(([^)]+)\)', new_food_raw)
-        new_food_query = normalize_food_query(paren.group(1).strip() if paren else new_food_raw)
+        new_food_clean = paren.group(1).strip() if paren else new_food_raw
         paren2 = re.search(r'\(([^)]+)\)', group_hint_raw)
         group_hint = paren2.group(1).strip() if paren2 else group_hint_raw
+
+        # גרמים: מה-op / "עוד X גרם" / "X גרם [ל]FOOD" / "FOOD X גרם"
+        extra_grams = op.get("extra_grams")
+        grams_in_food = re.search(r'\bעוד\s+(\d+)\s*גרם\b', new_food_clean)
+        if grams_in_food:
+            extra_grams = grams_in_food.group(1)
+            new_food_clean = re.sub(r'\bעוד\s+\d+\s*גרם\s*', '', new_food_clean).strip()
+        elif not extra_grams:
+            m_gs2 = re.match(r'^(\d+)\s*גרם\s+ל?\s*', new_food_clean)  # "50 גרם [ל]אורז"
+            if m_gs2:
+                extra_grams = m_gs2.group(1)
+                new_food_clean = new_food_clean[m_gs2.end():].strip()
+            else:
+                m_ge2 = re.search(r'^(.+?)\s+(\d+)\s*גרם\s*$', new_food_clean)  # "אורז 50 גרם"
+                if m_ge2:
+                    extra_grams = m_ge2.group(2)
+                    new_food_clean = m_ge2.group(1).strip()
+
+        new_food_query = normalize_food_query(new_food_clean)
 
         if hint_override and op_idx == 0:
             group_hint = hint_override
