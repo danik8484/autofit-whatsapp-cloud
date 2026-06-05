@@ -25,6 +25,8 @@ const pendingConfirmations = new Map();
 
 // זיכרון בחירת מזון: query → chosen food name (נשמר בזיכרון עד restart)
 const foodPrefs = new Map();
+// זיכרון בחירת hint: hintQuery → chosen food row name
+const hintPrefs = new Map();
 
 // ─── שליחת הודעה ─────────────────────────────────────────────
 async function sendMessage(phone, text) {
@@ -104,10 +106,23 @@ function runAutofit(phone, text, opts = {}) {
     // HINT_OPTIONS — מזון להחלפה לא נמצא, רשימה ממוספרת
     if (raw.startsWith('HINT_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
-      const alts = header.slice('HINT_OPTIONS:'.length).split('|');
+      const headerBody = header.slice('HINT_OPTIONS:'.length);
+      const sepIdx = headerBody.indexOf('||');
+      const hintQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const userMsg = rest.join('\n');
+
+      // יש העדפה שמורה? בחר אוטומטית
+      const pref = hintQuery && hintPrefs.get(hintQuery.toLowerCase());
+      if (pref && alts.includes(pref)) {
+        console.log(`[hint-pref] ${hintQuery} → ${pref} (auto)`);
+        await sendMessage(phone, '⏳ מבצע...');
+        runAutofit(phone, text, { force: true, hintOverride: pref, nameOverride: opts.nameOverride || '', foodOverride: opts.foodOverride || '' });
+        return;
+      }
+
       // שמור גם foodOverride שכבר נבחר — כדי לא לשכוח אותו
-      pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', foodOverride: opts.foodOverride || '', timestamp: Date.now() });
+      pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, hintQuery, nameOverride: opts.nameOverride || '', foodOverride: opts.foodOverride || '', timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -233,6 +248,11 @@ app.post('/webhook', async (req, res) => {
           pendingCorrections.delete(sender);
           await sendMessage(sender, '⏳ מבצע...');
           if (corr.type === 'hint') {
+            // שמור hint preference לפעם הבאה
+            if (corr.hintQuery) {
+              hintPrefs.set(corr.hintQuery.toLowerCase(), chosen);
+              console.log(`[hint-pref saved] "${corr.hintQuery}" → "${chosen}"`);
+            }
             // זכור גם foodOverride שנבחר קודם
             runAutofit(sender, corr.originalText, { force: true, hintOverride: chosen, nameOverride: corr.nameOverride || '', foodOverride: corr.foodOverride || '' });
           } else {

@@ -812,7 +812,7 @@ def execute_request(request_text: str, force: bool = False,
                         if meal_foods:
                             opts = "\n".join(f"{i+1}. {f.get('food_name','')}" for i, f in enumerate(meal_foods))
                             foods_list = "|".join(f.get("food_name","") for f in meal_foods)
-                            return (f"HINT_OPTIONS:{foods_list}\n{prefix}"
+                            return (f"HINT_OPTIONS:{group_hint}||{foods_list}\n{prefix}"
                                     f"לא מצאתי {group_hint} ב{full_meal}, במה תרצה להחליף את {new_food_query}?\n"
                                     f"המזונות שיש בארוחה:\n{opts}\n\n"
                                     f"שלח מספר או שם.")
