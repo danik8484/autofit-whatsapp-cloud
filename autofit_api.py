@@ -400,7 +400,24 @@ def find_best_food(query: str, coach_id: str = ""):
     elif len(contains_list) == 1:
         best = contains_list[0]
     else:
-        best = None  # מרובה אפשרויות — לא בוחרים אוטומטית
+        best = None
+
+    # אם לא נמצא — נסה עם השם המקורי (לפני נרמול "לאחר בישול"→"מבושל")
+    if best is None and norm_query != query:
+        foods2 = search_food(query, coach_id)
+        if foods2:
+            q2 = query.lower()
+            exact2    = next((f for f in foods2 if f.get("food_name","").lower() == q2), None)
+            starts2   = [f for f in foods2 if f.get("food_name","").lower().startswith(q2)]
+            contains2 = [f for f in foods2 if q2 in f.get("food_name","").lower()]
+            if exact2:
+                return exact2, foods2[:5]
+            elif len(starts2) == 1:
+                return starts2[0], foods2[:5]
+            elif len(contains2) == 1:
+                return contains2[0], foods2[:5]
+            elif contains2:
+                foods = contains2  # עדיף תוצאות מקוריות על פני תוצאות מנורמלות רעות
 
     return best, foods[:5]
 
@@ -520,8 +537,8 @@ def parse_message(text: str) -> dict:
     # ── pre-process: פסיק/רווח לפני מילת מפתח → שורה חדשה ─────────────────
     # פסיק: "שם: X, ארוחה: Y" → שורות
     text = re.sub(r'[,،]\s*(?=(?:שם|ארוחה|הוספה|שנה|החלף|הוסף|תחליף|פעולה|בקשה)\s*:)', '\n', text)
-    # רווח: "ארוחה: X הוספה: Y" → שורות (כשאין newline)
-    text = re.sub(r'(?<=[^\n])\s+(?=(?:הוספה|שנה|החלף|הוסף|תחליף|פעולה|בקשה)\s*:)', '\n', text)
+    # רווח: "ארוחה: X הוספה: Y" → שורות (כשאין newline) — כולל "ארוחה:"
+    text = re.sub(r'(?<=[^\n])\s+(?=(?:הוספה|שנה|ארוחה|החלף|הוסף|תחליף|פעולה|בקשה)\s*:)', '\n', text)
     # "הוספה:\nX" → "הוספה: X" (ריווח לפני תוכן בשורה הבאה)
     _KEYS_PAT = r'(?:הוספה|שנה|תחליף|change|פעולה|בקשה)'
     lines = text.split('\n')
@@ -681,9 +698,10 @@ def parse_message(text: str) -> dict:
     full = " ".join(text.strip().split("\n"))
 
     _NOT_NAME_VERBS = frozenset({"הוסיף", "הוסיפי", "תוסיפי", "תוסיף", "החלף",
-                                  "תחליפי", "תחליף", "הכנס", "עדכן", "שנה", "בצע",
-                                  "שלח", "עשה", "עשי", "הוציא", "מחק", "הסר",
-                                  "החליף", "תחליפ", "ארוחת", "ארוחה"})
+                                  "תחליפי", "תחליף", "הכנס", "הכניס", "להכניס",
+                                  "עדכן", "שנה", "בצע", "שלח", "עשה", "עשי",
+                                  "הוציא", "מחק", "הסר", "החליף", "תחליפ",
+                                  "ארוחת", "ארוחה", "נוסיף", "נוסיפי"})
 
     _MEAL_MAP_FT = {"ערב": "ערב", "לילה": "ערב", "בוקר": "בוקר",
                     "צהריים": "צהריים", "צהרים": "צהריים", "ביניים": "ביניים"}
@@ -752,6 +770,10 @@ def parse_message(text: str) -> dict:
         fb = re.sub(r'[^א-ת\s\d%\'\"]+', ' ', fb).strip()
         fb = re.sub(r'\s+', ' ', fb).strip()
         if len(fb) >= 2:
+            # נקה "כדאי ש...", "אפשר ש...", "תנסי ל...", "בוודאי ל..."
+            fb = re.sub(r'^(?:כדאי\s+ש|אפשר\s+(?:ל|ש)?|בוודאי\s+ל?|תנסי\s+ל?|מה\s+אם\s+ל?)\s*', '', fb)
+            fb = re.sub(r'^(?:נוסיף|נוסיפי|להוסיף|להכניס|הכניס|הכנס)\s+', '', fb)
+            fb = fb.strip()
             # extra_grams: "50 גרם לAFOOD"
             gm = re.match(r'^(\d+)\s*גרם\s+ל?\s*', fb)
             if gm:
@@ -827,8 +849,8 @@ def execute_request(request_text: str, force: bool = False,
         if not uid_check:
             return f"NAME_NOT_FOUND:{raw_name}"
 
-        # confidence >= 90 + שם מדויק → בצע ישירות, ללא אישור
-        if parsed.get("confidence", 100) >= 90 and not is_fuzzy:
+        # שם מדויק (לא fuzzy) → בצע ישירות, ללא אישור (גם free text)
+        if not is_fuzzy and parsed.get("change"):
             return execute_request(request_text, force=True, name_override=found_name,
                                    meal_override=meal_override, food_override=food_override,
                                    hint_override=hint_override)
