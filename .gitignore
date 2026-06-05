@@ -5,3 +5,4 @@ __pycache__/
 baileys_session/
 session.json
 test_*.py
+user_cache.json
