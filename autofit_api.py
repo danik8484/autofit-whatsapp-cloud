@@ -258,11 +258,11 @@ def format_menu(user_id: str, full_name: str) -> str:
         for food in foods:
             fname = food.get("food_name", "?")
             lines.append(f"• {fname}{_fmt_grams(food)}")
-            # תחליפים/אופציות — subFoods (שם השדה האמיתי)
+            # תחליפים/אופציות ב-italic (WhatsApp: _text_)
             subs = food.get("subFoods") or []
             for sub in subs:
                 sname = sub.get("food_name", "?")
-                lines.append(f"  ↳ {sname}{_fmt_grams(sub)}")
+                lines.append(f"_  ↳ {sname}{_fmt_grams(sub)}_")
         lines.append("")
 
     return "\n".join(lines).strip()
@@ -596,12 +596,22 @@ def parse_message(text: str) -> dict:
                 v = re.sub(r'בנוסף\s+ל', 'ל ', v)  # "בנוסף ל X" → "ל X"
                 v = re.sub(r'במקום\s+של', 'ל ', v)   # "במקום של X" → "ל X"
                 v = re.sub(r'במקום', 'ל ', v)         # "במקום X" → "ל X"
-                # "עוד X גרם" — שמור גרמים ונקה מהטקסט
+                # גרמים: "עוד X גרם FOOD" / "X גרם [ל]FOOD" / "FOOD X גרם"
                 extra_grams = None
                 grams_m = re.search(r'\bעוד\s+(\d+)\s*גרם\b', v)
                 if grams_m:
                     extra_grams = grams_m.group(1)
                     v = re.sub(r'\bעוד\s+\d+\s*גרם\s*', '', v).strip()
+                else:
+                    m_gs = re.match(r'^(\d+)\s*גרם\s+ל?\s*', v)  # "50 גרם [ל]אורז"
+                    if m_gs:
+                        extra_grams = m_gs.group(1)
+                        v = v[m_gs.end():].strip()
+                    else:
+                        m_ge = re.search(r'^(.+?)\s+(\d+)\s*גרם\s*$', v)  # "אורז 50 גרם"
+                        if m_ge:
+                            extra_grams = m_ge.group(2)
+                            v = m_ge.group(1).strip()
                 # זהה ארוחה ספציפית בתוך הפעולה ("בבוקר", "בצהריים")
                 op_meal = _extract_meal(v)
                 if op_meal:
@@ -822,12 +832,25 @@ def execute_request(request_text: str, force: bool = False,
         new_food_raw = add_match.group(1).strip()
         group_hint_raw = (add_match.group(2) or "").strip() if add_match.lastindex and add_match.lastindex >= 2 else ""
 
-        # "עוד X גרם" — מה-op (מובנה) או מהטקסט החופשי
+        # ניקוי "בערב/בבוקר/בצהריים" שדלף לשם המזון מטקסט חופשי
+        new_food_raw = re.sub(r'\s*ב(?:ארוחת\s+)?(?:ערב|בוקר|צהריים|ביניים|לילה)\b', '', new_food_raw).strip()
+
+        # גרמים: מה-op / "עוד X גרם" / "X גרם [ל]FOOD" / "FOOD X גרם"
         extra_grams = op.get("extra_grams")
         grams_in_food = re.search(r'\bעוד\s+(\d+)\s*גרם\b', new_food_raw)
         if grams_in_food:
             extra_grams = grams_in_food.group(1)
             new_food_raw = re.sub(r'\bעוד\s+\d+\s*גרם\s*', '', new_food_raw).strip()
+        elif not extra_grams:
+            m_gs2 = re.match(r'^(\d+)\s*גרם\s+ל?\s*', new_food_raw)  # "50 גרם [ל]אורז"
+            if m_gs2:
+                extra_grams = m_gs2.group(1)
+                new_food_raw = new_food_raw[m_gs2.end():].strip()
+            else:
+                m_ge2 = re.search(r'^(.+?)\s+(\d+)\s*גרם\s*$', new_food_raw)  # "אורז 50 גרם"
+                if m_ge2:
+                    extra_grams = m_ge2.group(2)
+                    new_food_raw = m_ge2.group(1).strip()
 
         paren = re.search(r'\(([^)]+)\)', new_food_raw)
         new_food_query = normalize_food_query(paren.group(1).strip() if paren else new_food_raw)
@@ -910,6 +933,7 @@ def execute_request(request_text: str, force: bool = False,
                     try:
                         replaced_q_f = float(replaced_q)
                         replaced_q_str = str(int(replaced_q_f)) if replaced_q_f == int(replaced_q_f) else f"{replaced_q_f:.2f}"
+                        if replaced_q_f <= 0: replaced_q_str = ""
                     except: replaced_q_str = str(replaced_q) if replaced_q else ""
                     if replaced_measure == "units" and replaced_q_str:
                         replaced_disp = f" ({replaced_q_str} יחידות)"
