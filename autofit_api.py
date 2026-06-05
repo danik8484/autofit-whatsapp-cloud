@@ -643,6 +643,12 @@ def execute_request(request_text: str, force: bool = False,
         if not uid_check:
             return f"NAME_NOT_FOUND:{raw_name}"
 
+        # confidence >= 90 + שם מדויק → בצע ישירות, ללא אישור
+        if parsed.get("confidence", 100) >= 90 and not is_fuzzy:
+            return execute_request(request_text, force=True, name_override=found_name,
+                                   meal_override=meal_override, food_override=food_override,
+                                   hint_override=hint_override)
+
         # שם להצגה — אם fuzzy → מציין את התיקון
         if is_fuzzy:
             display_name = f"{found_name} (מצאתי עבור \"{raw_name}\")"
