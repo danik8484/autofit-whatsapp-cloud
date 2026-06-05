@@ -604,9 +604,12 @@ def parse_message(text: str) -> dict:
             def _parse_one_op(raw):
                 v = raw.strip()
                 v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
-                v = re.sub(r'בנוסף\s+ל', 'ל ', v)  # "בנוסף ל X" → "ל X"
-                v = re.sub(r'במקום\s+של', 'ל ', v)   # "במקום של X" → "ל X"
-                v = re.sub(r'במקום', 'ל ', v)         # "במקום X" → "ל X"
+                v = re.sub(r'בנוסף\s+ל', 'ל ', v)         # "בנוסף ל X" → "ל X"
+                v = re.sub(r'במקום\s+של', 'ל ', v)      # "במקום של X" → "ל X"
+                v = re.sub(r'במקום', 'ל ', v)            # "במקום X" → "ל X"
+                v = re.sub(r'באופציות\s+של', 'ל ', v)   # "באופציות של X" → "ל X"
+                v = re.sub(r'כאופציה\s+ל', 'ל ', v)     # "כאופציה ל X" → "ל X"
+                v = re.sub(r'כתחליף\s+ל', 'ל ', v)      # "כתחליף ל X" → "ל X"
                 # גרמים: "עוד X גרם FOOD" / "X גרם [ל]FOOD" / "FOOD X גרם"
                 extra_grams = None
                 grams_m = re.search(r'\bעוד\s+(\d+)\s*גרם\b', v)
@@ -678,14 +681,18 @@ def parse_message(text: str) -> dict:
         # שם עדיין לא נמצא — חפש בfree text
         name_match = None
         for _m in re.finditer(
-            r"(?:של\s+|עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,})",
+            r"(?:של\s+|עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+\u05D5[\u05D0-\u05EA]{2,})?)",
             full,
         ):
-            if _m.group(1).strip() not in _NOT_NAME_VERBS:
+            words = _m.group(1).strip().split()
+            if words[0] not in _NOT_NAME_VERBS:
+                if len(words) == 2 and words[1] in _NOT_NAME_VERBS:
+                    result["name"] = words[0]
+                else:
+                    result["name"] = _m.group(1).strip()
                 name_match = _m
                 break
         if name_match:
-            result["name"] = name_match.group(1).strip()
             conf = 85
             clean_full = full[:name_match.start()] + full[name_match.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
@@ -698,6 +705,12 @@ def parse_message(text: str) -> dict:
     else:
         # שם נמצא בפורמט מובנה — אל תדרוס, חפש מזון מהטקסט המלא
         clean_full = full
+
+    # נרמול synonyms לפני חילוץ מזון
+    clean_full = re.sub(r'באופציות\s+של', 'במקום', clean_full)
+    clean_full = re.sub(r'כאופציה\s+ל', 'במקום', clean_full)
+    clean_full = re.sub(r'כתחליף\s+ל', 'במקום', clean_full)
+    clean_full = re.sub(r'בנוסף\s+ל', 'במקום', clean_full)
 
     # מזון — על הטקסט ללא השם
     new_food, group_hint = _extract_foods(clean_full)
