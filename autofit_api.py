@@ -222,6 +222,18 @@ def get_user_meals(user_id: str) -> list:
     data = _post("/coach/v2-getAllUserMeals", {"user_id": user_id})
     return data.get("data", {}).get("new_meals", [])
 
+def _fmt_grams(food: dict) -> str:
+    """מחזיר מחרוזת גרמים מפורמטת — משתמש ב-quantity (הכמות האמיתית בתפריט)."""
+    q = food.get("quantity") or food.get("gram_value") or ""
+    if not q:
+        return ""
+    try:
+        q = int(round(float(q)))
+    except (ValueError, TypeError):
+        pass
+    return f" — {q} גרם"
+
+
 def format_menu(user_id: str, full_name: str) -> str:
     """מחזיר תפריט מלא של מתאמן כטקסט מפורמט ל-WhatsApp."""
     meals = get_user_meals(user_id)
@@ -245,18 +257,12 @@ def format_menu(user_id: str, full_name: str) -> str:
             lines.append("  (ריקה)")
         for food in foods:
             fname = food.get("food_name", "?")
-            grams = food.get("gram_value") or food.get("grams") or ""
-            grams_str = f" — {grams} גרם" if grams else ""
-            lines.append(f"• {fname}{grams_str}")
-            # תחליפים/אופציות (sub-foods)
-            subs = (food.get("sub_meal_food") or food.get("subMealFood") or
-                    food.get("sub_foods") or food.get("alternatives") or
-                    food.get("submealFoods") or [])
+            lines.append(f"• {fname}{_fmt_grams(food)}")
+            # תחליפים/אופציות — subFoods (שם השדה האמיתי)
+            subs = food.get("subFoods") or []
             for sub in subs:
                 sname = sub.get("food_name", "?")
-                sgrams = sub.get("gram_value") or sub.get("grams") or ""
-                sgrams_str = f" — {sgrams} גרם" if sgrams else ""
-                lines.append(f"  ↳ {sname}{sgrams_str}")
+                lines.append(f"  ↳ {sname}{_fmt_grams(sub)}")
         lines.append("")
 
     return "\n".join(lines).strip()
@@ -338,6 +344,7 @@ def search_food(query: str, coach_id: str = "") -> list:
     return []
 
 _PROTECT_L = frozenset({"לפני", "לאחר"})  # מילות עזר שלא מנקים את ל' שלהן
+_PROTECT_H = frozenset({"הודו"})  # מילים שה' חלק מהמילה (לא ה' הידיעה)
 
 def normalize_food_query(q: str) -> str:
     """מסיר ה' הידיעה, תווי תבנית (<>), ומנרמל ביטויי בישול נפוצים."""
@@ -347,7 +354,8 @@ def normalize_food_query(q: str) -> str:
     q = re.sub(r'(?:אחרי|לאחר)\s+ה?(?:בישול|בשול)\b', 'מבושל', q)
     q = re.sub(r'לא\s+מבושל\b', 'לפני בישול', q)
     words = re.split(r'\s+', q.strip())
-    words = [re.sub(r'^ה(?=[א-ת])', '', w) for w in words if w]
+    # ה' הידיעה — אל תסיר אם המילה ב-_PROTECT_H (ה' חלק מהשם)
+    words = [w if w in _PROTECT_H else re.sub(r'^ה(?=[א-ת])', '', w) for w in words if w]
     # ל' מיידית: "לאורז"→"אורז" — רק כשנשאר ≥3 תווים, ולא מילות עזר כמו "לפני"/"לאחר"
     words = [w if w in _PROTECT_L else re.sub(r'^ל(?=[א-ת]{3,})', '', w) for w in words]
     return " ".join(words)
@@ -880,7 +888,11 @@ def execute_request(request_text: str, force: bool = False,
                 food_name = best_food.get("food_name", "")
                 if food_row:
                     replaced = food_row.get("food_name", "")
-                    meal_grams = extra_grams or food_row.get("gram_value") or food_row.get("grams") or ""
+                    # quantity = גרמים אמיתיים בתפריט; gram_value = יחידת מידה (לרוב 100)
+                    real_q = food_row.get("quantity") or food_row.get("gram_value") or ""
+                    try: real_q = int(round(float(real_q)))
+                    except: pass
+                    meal_grams = extra_grams or (str(real_q) if real_q else "")
                     grams_str = f" ({meal_grams} גרם)" if meal_grams else ""
                     all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{grams_str}")
                 else:
