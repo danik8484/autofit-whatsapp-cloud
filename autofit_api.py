@@ -511,6 +511,22 @@ def parse_message(text: str) -> dict:
     text = re.sub(r'[,،]\s*(?=(?:שם|ארוחה|הוספה|שנה|החלף|הוסף|תחליף|פעולה|בקשה)\s*:)', '\n', text)
     # רווח: "ארוחה: X הוספה: Y" → שורות (כשאין newline)
     text = re.sub(r'(?<=[^\n])\s+(?=(?:הוספה|שנה|החלף|הוסף|תחליף|פעולה|בקשה)\s*:)', '\n', text)
+    # "הוספה:\nX" → "הוספה: X" (ריווח לפני תוכן בשורה הבאה)
+    _KEYS_PAT = r'(?:הוספה|שנה|תחליף|change|פעולה|בקשה)'
+    lines = text.split('\n')
+    merged = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(rf'^\s*{_KEYS_PAT}\s*:\s*$', line) and i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if nxt and not re.match(r'^(?:שם|ארוחה|הוספה|שנה|תחליף|change)\s*:', nxt):
+                merged.append(line.rstrip(':').rstrip() + ': ' + nxt)
+                i += 2
+                continue
+        merged.append(line)
+        i += 1
+    text = '\n'.join(merged)
 
     # ── תבנית מובנית (שם: / ארוחה: / שנה:) ───────────────────────────────
     for line in text.strip().split("\n"):
@@ -888,13 +904,33 @@ def execute_request(request_text: str, force: bool = False,
                 food_name = best_food.get("food_name", "")
                 if food_row:
                     replaced = food_row.get("food_name", "")
-                    # quantity = גרמים אמיתיים בתפריט; gram_value = יחידת מידה (לרוב 100)
-                    real_q = food_row.get("quantity") or food_row.get("gram_value") or ""
-                    try: real_q = int(round(float(real_q)))
-                    except: pass
-                    meal_grams = extra_grams or (str(real_q) if real_q else "")
-                    grams_str = f" ({meal_grams} גרם)" if meal_grams else ""
-                    all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{grams_str}")
+                    # כמות המזון המוחלף (quantity = גרמים/יחידות אמיתיים)
+                    replaced_q = food_row.get("quantity") or food_row.get("quantity_to_calculate") or ""
+                    replaced_measure = food_row.get("measure", "grams")
+                    try:
+                        replaced_q_f = float(replaced_q)
+                        replaced_q_str = str(int(replaced_q_f)) if replaced_q_f == int(replaced_q_f) else f"{replaced_q_f:.2f}"
+                    except: replaced_q_str = str(replaced_q) if replaced_q else ""
+                    if replaced_measure == "units" and replaced_q_str:
+                        replaced_disp = f" ({replaced_q_str} יחידות)"
+                    elif replaced_q_str:
+                        replaced_disp = f" ({replaced_q_str} גרם)"
+                    else:
+                        replaced_disp = ""
+                    # כמות המזון החדש — חישוב לפי יחס קלוריות
+                    if extra_grams:
+                        new_disp = f" ({extra_grams} גרם)"
+                    else:
+                        try:
+                            cal_target = float(food_row.get("calories") or 0)
+                            cal_per_100 = float(best_food.get("calories") or 0)
+                            if cal_target > 0 and cal_per_100 > 0:
+                                new_q = round(cal_target * 100 / cal_per_100, 2)
+                                new_disp = f" ({new_q} גרם)"
+                            else:
+                                new_disp = ""
+                        except: new_disp = ""
+                    all_results.append(f"✅ נוסף: *{food_name}*{new_disp} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{replaced_disp}")
                 else:
                     disp_grams = extra_grams or best_food.get("grams") or best_food.get("gram_value") or ""
                     grams_str = f" ({disp_grams} גרם)" if disp_grams else ""
