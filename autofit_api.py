@@ -670,47 +670,68 @@ def parse_message(text: str) -> dict:
     # ── שפה חופשית ───────────────────────────────────────────────────────────
     full = " ".join(text.strip().split("\n"))
 
-    # שם מתאמן — מחלצים ראשון ומנקים מהטקסט לפני חילוץ מזון
-    # (?<!\S) = ל חייב להיות בתחילת מילה; capture: מילה אחת בלבד
-    # blacklist: פעלים ומילות ארוחה שלא ייתפסו כשם
     _NOT_NAME_VERBS = frozenset({"הוסיף", "הוסיפי", "תוסיפי", "תוסיף", "החלף",
                                   "תחליפי", "תחליף", "הכנס", "עדכן", "שנה", "בצע",
                                   "שלח", "עשה", "עשי", "הוציא", "מחק", "הסר",
                                   "החליף", "תחליפ", "ארוחת", "ארוחה"})
+
+    _MEAL_MAP_FT = {"ערב": "ערב", "לילה": "ערב", "בוקר": "בוקר",
+                    "צהריים": "צהריים", "צהרים": "צהריים", "ביניים": "ביניים"}
+
+    # חלץ ארוחות ראשון (לפני שם/מזון) — תומך בריבוי ארוחות
+    if "meal" not in result and "meals" not in result:
+        _meal_hits = []
+        for w, k in _MEAL_MAP_FT.items():
+            if re.search(r'ב(?:ארוחת\s+)?' + w + r'\b', full):
+                if k not in _meal_hits:
+                    _meal_hits.append(k)
+        # "X וY" כריבוי ארוחות
+        for w1, k1 in _MEAL_MAP_FT.items():
+            for w2, k2 in _MEAL_MAP_FT.items():
+                if w1 != w2 and re.search(rf'\b{w1}\s+[וV]\s*{w2}\b', full):
+                    for k in [k1, k2]:
+                        if k not in _meal_hits:
+                            _meal_hits.append(k)
+        _meal_hits = list(dict.fromkeys(_meal_hits))
+        if len(_meal_hits) > 1:
+            result["meals"] = _meal_hits
+        elif _meal_hits:
+            result["meal"] = _meal_hits[0]
+
+    # נקה ביטויי ארוחה לפני חילוץ שם/מזון
+    _meal_re = r'ב(?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b'
+    full_no_meal = re.sub(_meal_re, '', full)
+    # גם "ו+ארוחה" (כמו "וערב")
+    full_no_meal = re.sub(r'\s+[וV]\s*(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
+    full_no_meal = re.sub(r'\b(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\s+[וV]\s*(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
+    full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
+
     if "name" not in result:
-        # שם עדיין לא נמצא — חפש בfree text
         name_match = None
         for _m in re.finditer(
             r"(?:של\s+|עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+\u05D5[\u05D0-\u05EA]{2,})?)",
-            full,
+            full_no_meal,
         ):
             words = _m.group(1).strip().split()
             if words[0] not in _NOT_NAME_VERBS:
-                if len(words) == 2 and words[1] in _NOT_NAME_VERBS:
-                    result["name"] = words[0]
-                else:
-                    result["name"] = _m.group(1).strip()
+                result["name"] = _m.group(1).strip()  # מילה שנייה רק אם מתחילה ב-ו
                 name_match = _m
                 break
         if name_match:
             conf = 85
-            clean_full = full[:name_match.start()] + full[name_match.end():]
-            clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-            clean_full = re.sub(r'ב?(?:ארוחת|ארוחה)\s+[\u05D0-\u05EA]+', '', clean_full)
-            clean_full = re.sub(r'\bב(?:ערב|בוקר|צהריים|ביניים)\b', '', clean_full)
+            clean_full = full_no_meal[:name_match.start()] + full_no_meal[name_match.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
         else:
             conf = 40
-            clean_full = full
+            clean_full = full_no_meal
     else:
-        # שם נמצא בפורמט מובנה — אל תדרוס, חפש מזון מהטקסט המלא
-        clean_full = full
+        clean_full = full_no_meal
 
     # נרמול synonyms לפני חילוץ מזון
     clean_full = re.sub(r'באופציות\s+של', 'במקום', clean_full)
-    clean_full = re.sub(r'כאופציה\s+ל', 'במקום', clean_full)
-    clean_full = re.sub(r'כתחליף\s+ל', 'במקום', clean_full)
-    clean_full = re.sub(r'בנוסף\s+ל', 'במקום', clean_full)
+    clean_full = re.sub(r'כאופציה\s+ל', 'במקום ', clean_full)
+    clean_full = re.sub(r'כתחליף\s+ל', 'במקום ', clean_full)
+    clean_full = re.sub(r'בנוסף\s+ל', 'במקום ', clean_full)
 
     # מזון — על הטקסט ללא השם
     new_food, group_hint = _extract_foods(clean_full)
