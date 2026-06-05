@@ -794,11 +794,15 @@ def execute_request(request_text: str, force: bool = False,
             add_result = add_food_to_meal(user_id, meal_id, best_food, food_row)
             if add_result.startswith("✅"):
                 food_name = best_food.get("food_name", "")
+                new_grams = best_food.get("grams") or best_food.get("gram_value") or ""
+                grams_str = f" ({new_grams} גרם)" if new_grams else ""
                 if food_row:
                     replaced = food_row.get("food_name", "")
-                    all_results.append(f"✅ נוסף: *{food_name}* ב{full_meal} של {full_name}\nכתחליף ל: {replaced}")
+                    old_grams = food_row.get("gram_value") or food_row.get("grams") or ""
+                    old_grams_str = f" ({old_grams} גרם)" if old_grams else ""
+                    all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{old_grams_str}")
                 else:
-                    all_results.append(f"✅ נוסף: *{food_name}* ב{full_meal} של {full_name}")
+                    all_results.append(f"✅ נוסף: *{food_name}*{grams_str} ב{full_meal} של {full_name}")
             else:
                 all_results.append(add_result)
 
