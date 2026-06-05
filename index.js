@@ -59,7 +59,18 @@ function runAutofit(phone, text, opts = {}) {
     const raw = output.trim() || (code === 0 ? 'בוצע!' : 'משהו השתבש');
     console.log(`[py→] ${raw.slice(0,80).replace(/\n/g,' | ')}`);
 
-    // confidence נמוך — שאל אישור
+    // CONFIRM עם fuzzy name — שם מתוקן כלול בsummary
+    if (raw.startsWith('CONFIRM_WITH_NAME:')) {
+      const rest = raw.slice('CONFIRM_WITH_NAME:'.length);
+      const sepIdx = rest.indexOf('|||');
+      const correctedName = rest.slice(0, sepIdx).trim();
+      const summary = rest.slice(sepIdx + 3);
+      pendingConfirmations.set(phone, { originalText: text, correctedName, type: 'confirm_with_name', timestamp: Date.now() });
+      await sendMessage(phone, `❓ הבנתי:\n${summary}\n\nנכון? שלח *כן* לאישור או *לא* לביטול`);
+      return;
+    }
+
+    // CONFIRM רגיל
     if (raw.startsWith('CONFIRM:')) {
       const summary = raw.slice('CONFIRM:'.length).trim();
       pendingConfirmations.set(phone, { originalText: text, type: 'confirm', timestamp: Date.now() });
@@ -67,22 +78,12 @@ function runAutofit(phone, text, opts = {}) {
       return;
     }
 
-    // שם עמום — שאל אישור
-    if (raw.startsWith('CONFIRM_FUZZY:')) {
-      const foundName = raw.slice('CONFIRM_FUZZY:'.length).trim();
-      pendingConfirmations.set(phone, { originalText: text, correctedName: foundName, type: 'fuzzy', timestamp: Date.now() });
-      await sendMessage(phone, `❓ האם התכוונת ל: *${foundName}*?\n\nשלח *כן* לאישור או *לא* לביטול`);
-      return;
-    }
-
-    const msg = code === 0 ? raw : `❌ ${raw}`;
-
     // MEAL_OPTIONS — ארוחה לא נמצאה, רשימה ממוספרת
     if (raw.startsWith('MEAL_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
       const alts = header.slice('MEAL_OPTIONS:'.length).split('|').slice(1);
       const userMsg = rest.join('\n');
-      pendingCorrections.set(phone, { type: 'meal', originalText: text, alternatives: alts, timestamp: Date.now() });
+      pendingCorrections.set(phone, { type: 'meal', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -92,7 +93,7 @@ function runAutofit(phone, text, opts = {}) {
       const [header, ...rest] = raw.split('\n');
       const alts = header.slice('HINT_OPTIONS:'.length).split('|');
       const userMsg = rest.join('\n');
-      pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, timestamp: Date.now() });
+      pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -105,13 +106,17 @@ function runAutofit(phone, text, opts = {}) {
       return;
     }
 
-    // אפשרויות מזון חדש — המתן לבחירה
-    if (raw.startsWith('❓ מצאתי כמה אפשרויות')) {
-      const alternatives = raw.split('\n')
-        .filter(l => /^\d+\./.test(l))
-        .map(l => l.replace(/^\d+\.\s*/, '').trim());
-      pendingCorrections.set(phone, { type: 'food', originalText: text, alternatives, timestamp: Date.now() });
-    } else if (!raw.startsWith('CONFIRM')) {
+    // FOOD_OPTIONS — מזון חדש עמום, רשימה ממוספרת
+    if (raw.startsWith('FOOD_OPTIONS:')) {
+      const [header, ...rest] = raw.split('\n');
+      const alts = header.slice('FOOD_OPTIONS:'.length).split('|');
+      const userMsg = rest.join('\n');
+      pendingCorrections.set(phone, { type: 'food', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', timestamp: Date.now() });
+      await sendMessage(phone, userMsg);
+      return;
+    }
+
+    if (!raw.startsWith('CONFIRM')) {
       pendingCorrections.delete(phone);
     }
 
@@ -156,6 +161,16 @@ app.post('/webhook', async (req, res) => {
   console.log(`📨 מ: ${sender} | "${text.slice(0,50).replace(/\n/g,'↵')}"`);
   console.log(`[state] conf=${pendingConfirmations.has(sender)} corr=${pendingCorrections.has(sender)}`);
 
+  // ─── ביטול גלובלי ─────────────────────────────────────────────
+  const lower_cancel = text.trim().toLowerCase();
+  if (['בטל', 'ביטול', 'cancel', 'לבטל'].includes(lower_cancel)) {
+    const hadPending = pendingConfirmations.has(sender) || pendingCorrections.has(sender);
+    pendingConfirmations.delete(sender);
+    pendingCorrections.delete(sender);
+    await sendMessage(sender, hadPending ? '❌ הפעולה בוטלה' : 'אין פעולה פעילה לביטול');
+    return;
+  }
+
   // בדוק אם יש תיקון ממתין (ארוחה / בחירת מזון)
   if (pendingCorrections.has(sender)) {
     const corr = pendingCorrections.get(sender);
@@ -163,34 +178,39 @@ app.post('/webhook', async (req, res) => {
       pendingCorrections.delete(sender);
     } else if (corr.type === 'meal') {
       pendingCorrections.delete(sender);
-      runAutofit(sender, corr.originalText, { force: true, mealOverride: text.trim() });
+      await sendMessage(sender, '⏳ מבצע...');
+      runAutofit(sender, corr.originalText, { force: true, mealOverride: text.trim(), nameOverride: corr.nameOverride || '' });
       return;
     } else if (corr.type === 'name') {
-      // תיקון שם — כל תשובה קצרה נחשבת לשם חדש
       if (text.trim().length >= 2) {
         pendingCorrections.delete(sender);
+        await sendMessage(sender, '⏳ מבצע...');
         runAutofit(sender, corr.originalText, { force: true, nameOverride: text.trim() });
         return;
       }
-    } else if (corr.type === 'food' || corr.type === 'meal' || corr.type === 'hint') {
-      const numMatch = text.trim().match(/^(\d+)$/);
-      let chosen = null;
-      if (numMatch) {
-        const idx = parseInt(numMatch[1]) - 1;
-        if (idx >= 0 && idx < corr.alternatives.length) chosen = corr.alternatives[idx];
-      } else if (text.trim().length >= 2) {
-        chosen = text.trim();
-      }
-      if (chosen) {
+    } else if (corr.type === 'food' || corr.type === 'hint') {
+      // פקודה חדשה מובנית — נקה state ועבד מחדש
+      if (/שם\s*:|ארוחה\s*:/i.test(text)) {
         pendingCorrections.delete(sender);
-        if (corr.type === 'meal') {
-          runAutofit(sender, corr.originalText, { force: true, mealOverride: chosen });
-        } else if (corr.type === 'hint') {
-          runAutofit(sender, corr.originalText, { force: true, hintOverride: chosen });
-        } else {
-          runAutofit(sender, corr.originalText, { force: true, foodOverride: chosen });
+      } else {
+        const numMatch = text.trim().match(/^(\d+)$/);
+        let chosen = null;
+        if (numMatch) {
+          const idx = parseInt(numMatch[1]) - 1;
+          if (idx >= 0 && idx < corr.alternatives.length) chosen = corr.alternatives[idx];
+        } else if (text.trim().length >= 2) {
+          chosen = text.trim();
         }
-        return;
+        if (chosen) {
+          pendingCorrections.delete(sender);
+          await sendMessage(sender, '⏳ מבצע...');
+          if (corr.type === 'hint') {
+            runAutofit(sender, corr.originalText, { force: true, hintOverride: chosen, nameOverride: corr.nameOverride || '' });
+          } else {
+            runAutofit(sender, corr.originalText, { force: true, foodOverride: chosen, nameOverride: corr.nameOverride || '' });
+          }
+          return;
+        }
       }
     }
   }
@@ -206,8 +226,8 @@ app.post('/webhook', async (req, res) => {
       const lower = text.trim();
       if (lower === 'כן' || lower === 'yes') {
         pendingConfirmations.delete(sender);
-        if (pending.type === 'fuzzy') {
-          // חזור על הבקשה עם השם המתוקן
+        await sendMessage(sender, '⏳ מבצע...');
+        if (pending.type === 'fuzzy' || pending.type === 'confirm_with_name') {
           runAutofit(sender, pending.originalText, { force: true, nameOverride: pending.correctedName });
         } else {
           runAutofit(sender, pending.originalText, { force: true });
