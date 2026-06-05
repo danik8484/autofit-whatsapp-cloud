@@ -23,6 +23,9 @@ const processedIds = new Set();
 // type: 'confirm' (confidence) | 'fuzzy' (שם עמום)
 const pendingConfirmations = new Map();
 
+// זיכרון בחירת מזון: query → chosen food name (נשמר בזיכרון עד restart)
+const foodPrefs = new Map();
+
 // ─── שליחת הודעה ─────────────────────────────────────────────
 async function sendMessage(phone, text) {
   const chatId = phone.includes('@') ? phone : `${phone}@c.us`;
@@ -51,11 +54,21 @@ function runAutofit(phone, text, opts = {}) {
 
   const proc = spawn('python3', [script, ...args]);
   let output = '';
+  let timedOut = false;
+
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    proc.kill();
+    console.error('[timeout] Python process killed after 30s');
+    sendMessage(phone, '❌ הבקשה לקחה יותר מדי זמן. נסה שוב.');
+  }, 30000);
 
   proc.stdout.on('data', d => { output += d.toString(); });
   proc.stderr.on('data', d => console.error('[autofit err]', d.toString().trim()));
 
   proc.on('close', async code => {
+    clearTimeout(killTimer);
+    if (timedOut) return;
     const raw = output.trim() || (code === 0 ? 'בוצע!' : 'משהו השתבש');
     console.log(`[py→] ${raw.slice(0,80).replace(/\n/g,' | ')}`);
 
@@ -110,10 +123,23 @@ function runAutofit(phone, text, opts = {}) {
     // FOOD_OPTIONS — מזון חדש עמום, רשימה ממוספרת
     if (raw.startsWith('FOOD_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
-      const alts = header.slice('FOOD_OPTIONS:'.length).split('|');
+      const headerBody = header.slice('FOOD_OPTIONS:'.length);
+      const sepIdx = headerBody.indexOf('||');
+      const foodQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const userMsg = rest.join('\n');
+
+      // יש העדפה שמורה? בחר אוטומטית
+      const pref = foodQuery && foodPrefs.get(foodQuery.toLowerCase());
+      if (pref && alts.includes(pref)) {
+        console.log(`[pref] ${foodQuery} → ${pref} (auto)`);
+        await sendMessage(phone, '⏳ מבצע...');
+        runAutofit(phone, text, { force: true, foodOverride: pref, nameOverride: opts.nameOverride || '', hintOverride: opts.hintOverride || '' });
+        return;
+      }
+
       // שמור גם hintOverride שכבר נבחר — כדי לא לשכוח אותו
-      pendingCorrections.set(phone, { type: 'food', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', hintOverride: opts.hintOverride || '', timestamp: Date.now() });
+      pendingCorrections.set(phone, { type: 'food', originalText: text, alternatives: alts, foodQuery, nameOverride: opts.nameOverride || '', hintOverride: opts.hintOverride || '', timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -210,6 +236,11 @@ app.post('/webhook', async (req, res) => {
             // זכור גם foodOverride שנבחר קודם
             runAutofit(sender, corr.originalText, { force: true, hintOverride: chosen, nameOverride: corr.nameOverride || '', foodOverride: corr.foodOverride || '' });
           } else {
+            // שמור העדפה לפעם הבאה
+            if (corr.foodQuery) {
+              foodPrefs.set(corr.foodQuery.toLowerCase(), chosen);
+              console.log(`[pref saved] "${corr.foodQuery}" → "${chosen}"`);
+            }
             // זכור גם hintOverride שנבחר קודם
             runAutofit(sender, corr.originalText, { force: true, foodOverride: chosen, nameOverride: corr.nameOverride || '', hintOverride: corr.hintOverride || '' });
           }

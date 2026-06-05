@@ -10,13 +10,16 @@ import base64
 import urllib.parse
 import re
 import os
+import time
 from pathlib import Path
 
 BACKEND    = "https://chat.auto-fit.co.il"
 FOOD_API   = "https://food.we-site.co.il/api"
 FOOD_TOKEN = "eb8b0f58c895019fcbc3bb17480ced3a2d1e12a346d6ed0f0d0267a24587a203"
-SESSION_FILE = Path(__file__).parent / "session.json"
-PHONES_FILE  = Path(__file__).parent / "phones.json"
+SESSION_FILE   = Path(__file__).parent / "session.json"
+PHONES_FILE    = Path(__file__).parent / "phones.json"
+USER_CACHE_FILE = Path(__file__).parent / "user_cache.json"
+USER_CACHE_TTL  = 300  # 5 דקות
 
 _uid_cache: dict = {}
 
@@ -125,16 +128,34 @@ def find_user(query: str):
     if not terms:
         return None, None, False
     first_term = terms[0]
+
+    # cache לקובץ — מונע סריקה מחדש בכל קריאה (TTL=5 דק')
     all_users = []
-    page, per_page = 1, 100
-    while True:
-        data = _post("/coach/get-coach-users", {"page": page, "limit": per_page})
-        users = data.get("data", [])
-        all_users.extend(users)
-        total = data.get("pagination", {}).get("total", 0)
-        if page * per_page >= total:
-            break
-        page += 1
+    try:
+        if USER_CACHE_FILE.exists():
+            cached = json.loads(USER_CACHE_FILE.read_text(encoding="utf-8"))
+            if time.time() - cached.get("ts", 0) < USER_CACHE_TTL:
+                all_users = cached["users"]
+    except:
+        pass
+
+    if not all_users:
+        page, per_page = 1, 100
+        while True:
+            data = _post("/coach/get-coach-users", {"page": page, "limit": per_page})
+            users = data.get("data", [])
+            all_users.extend(users)
+            total = data.get("pagination", {}).get("total", 0)
+            if page * per_page >= total:
+                break
+            page += 1
+        try:
+            USER_CACHE_FILE.write_text(
+                json.dumps({"ts": time.time(), "users": all_users}, ensure_ascii=False),
+                encoding="utf-8"
+            )
+        except:
+            pass
 
     # נרמול גרש לצורך השוואה (קגנוביץ = קגנוביץ')
     def _ng(s):
@@ -751,7 +772,8 @@ def execute_request(request_text: str, force: bool = False,
                     if alternatives:
                         options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:5]))
                         alts_pipe = "|".join(f.get("food_name","") for f in alternatives[:5])
-                        return (f"FOOD_OPTIONS:{alts_pipe}\n"
+                        # כולל את השאילתה המקורית כדי שindex.js יוכל לזכור את הבחירה
+                        return (f"FOOD_OPTIONS:{new_food_query}||{alts_pipe}\n"
                                 f"לא מצאתי {new_food_query} כאופציה, מה שכן מצאתי זה:\n"
                                 f"{options}\n\n"
                                 f"שלח מספר לבחירה, או שם מדויק יותר.")
