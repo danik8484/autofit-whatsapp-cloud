@@ -648,6 +648,8 @@ def parse_message(text: str) -> dict:
                 # strip outer parens: "(80 גרם אורז)" → "80 גרם אורז"
                 if v.startswith('(') and v.endswith(')'):
                     v = v[1:-1].strip()
+                _op_reduce = bool(re.match(r'^(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|הורידי)\s+', v))
+                v = re.sub(r'^(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|הורידי)\s+', '', v)
                 v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
                 v = re.sub(r'בנוסף\s+ל', 'ל ', v)         # "בנוסף ל X" → "ל X"
                 v = re.sub(r'במקום\s+של', 'ל ', v)      # "במקום של X" → "ל X"
@@ -662,7 +664,9 @@ def parse_message(text: str) -> dict:
                     extra_grams = grams_m.group(1)
                     v = re.sub(r'\bעוד\s+\d+\s*גרם\s*', '', v).strip()
                 else:
-                    m_gs = re.match(r'^(\d+)\s*גרם\s+ל?\s*', v)  # "50 גרם [ל]אורז"
+                    m_gs = re.match(r'^(\d+)\s*גרם\s+מה?\s*', v)  # "50 גרם מ/מה-FOOD" (reduce)
+                    if not m_gs:
+                        m_gs = re.match(r'^(\d+)\s*גרם\s+ל?\s*', v)  # "50 גרם [ל]אורז"
                     if m_gs:
                         extra_grams = m_gs.group(1)
                         v = v[m_gs.end():].strip()
@@ -686,7 +690,10 @@ def parse_message(text: str) -> dict:
                         nf, ht = v, ""
                 _cl = lambda s: re.sub(r'[.\s:,]+$', '', s).strip()
                 change = f"הוסף ({_cl(nf)}) במקום ({_cl(ht)})" if _cl(ht) else f"הוסף ({_cl(nf)})"
-                return {"change": change, "meal": op_meal, "extra_grams": extra_grams}
+                op_dict = {"change": change, "meal": op_meal, "extra_grams": extra_grams}
+                if _op_reduce:
+                    op_dict["reduce"] = True
+                return op_dict
 
             # פצל ב-comma לפעולות מרובות
             raw_ops = [s.strip() for s in re.split(r',\s*', val) if s.strip()]
@@ -731,12 +738,20 @@ def parse_message(text: str) -> dict:
         full = re.sub(r'\bמזון\s+חדש\b', '', full)
         full = re.sub(r'\s+', ' ', full).strip()
 
+    # "הורד/הפחת X גרם" = פקודת הפחתה
+    _reduce = bool(re.search(r'\b(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|הורידי)\b', full))
+    if _reduce:
+        full = re.sub(r'\b(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|הורידי)\s+', '', full)
+        # "מ-FOOD" / "מה-FOOD" אחרי גרמים — strip prefix מ/מה לפני שם מזון
+        full = re.sub(r'(\d+\s*גרם\s+)מה?\s*', r'\1', full)
+        full = re.sub(r'\s+', ' ', full).strip()
+
     _NOT_NAME_VERBS = frozenset({"הוסיף", "הוסיפי", "תוסיפי", "תוסיף", "החלף",
                                   "תחליפי", "תחליף", "הכנס", "הכניס", "להכניס",
                                   "עדכן", "שנה", "בצע", "שלח", "עשה", "עשי",
                                   "הוציא", "מחק", "הסר", "החליף", "תחליפ",
                                   "ארוחת", "ארוחה", "נוסיף", "נוסיפי",
-                                  "מזון", "חדש"})
+                                  "מזון", "חדש", "הורד", "הפחת", "תוריד", "תורידי"})
 
     _MEAL_MAP_FT = {"ערב": "ערב", "לילה": "ערב", "בוקר": "בוקר",
                     "צהריים": "צהריים", "צהרים": "צהריים", "ביניים": "ביניים"}
@@ -745,7 +760,7 @@ def parse_message(text: str) -> dict:
     if "meal" not in result and "meals" not in result:
         _meal_hits = []
         for w, k in _MEAL_MAP_FT.items():
-            if re.search(r'ב(?:ארוחת\s+)?' + w + r'\b', full):
+            if re.search(r'[בו](?:ארוחת\s+)?' + w + r'\b', full):
                 if k not in _meal_hits:
                     _meal_hits.append(k)
         # "X וY" כריבוי ארוחות
@@ -765,7 +780,7 @@ def parse_message(text: str) -> dict:
     _meal_re = r'ב(?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b'
     full_no_meal = re.sub(_meal_re, '', full)
     # גם "ו+ארוחה" (כמו "וערב")
-    full_no_meal = re.sub(r'\s+[וV]\s*(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
+    full_no_meal = re.sub(r'\s+[וV](?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     full_no_meal = re.sub(r'\b(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\s+[וV]\s*(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
 
@@ -813,6 +828,7 @@ def parse_message(text: str) -> dict:
             # extra_grams: "50 גרם לAFOOD"
             gm = re.match(r'^(\d+)\s*גרם\s+ל?\s*', fb)
             if gm:
+                result["extra_grams"] = gm.group(1)
                 fb = fb[gm.end():].strip()
             # בדוק hint
             if ' במקום ' in fb:
@@ -846,6 +862,8 @@ def parse_message(text: str) -> dict:
     result["confidence"] = conf
     if _force_new:
         result["force_new"] = True
+    if _reduce:
+        result["reduce"] = True
     return result
 
 
@@ -1020,6 +1038,10 @@ def execute_request(request_text: str, force: bool = False,
                     extra_grams = m_ge2.group(2)
                     new_food_clean = m_ge2.group(1).strip()
 
+        # בפקודת הפחתה: strip prefix "מ/מה" אחרי גרמים ("50 גרם מהאורז" → "אורז")
+        if op.get("reduce") or parsed.get("reduce"):
+            new_food_clean = re.sub(r'^מה?', '', new_food_clean).strip()
+
         new_food_query = normalize_food_query(new_food_clean)
 
         if hint_override and op_idx == 0:
@@ -1073,17 +1095,25 @@ def execute_request(request_text: str, force: bool = False,
 
             # ─── גרמים ללא group_hint → UPDATE כמות קיימת ────────────────────
             # force_new=True (בקשת "מזון חדש") → תמיד ADD, לא UPDATE
-            if extra_grams and not group_hint and not parsed.get("force_new"):
+            _is_reduce = op.get("reduce") or parsed.get("reduce")
+            if extra_grams and not group_hint and (not parsed.get("force_new") or _is_reduce):
                 _, upd_row, _ = find_meal_and_food(all_meals, full_meal, new_food_query)
                 if upd_row:
                     curr_q = float(upd_row.get("quantity") or upd_row.get("quantity_to_calculate") or 0)
-                    new_q = curr_q + float(extra_grams)
+                    if _is_reduce:
+                        new_q = max(0.0, curr_q - float(extra_grams))
+                        action_label = "הופחת"
+                        arrow = "↓"
+                    else:
+                        new_q = curr_q + float(extra_grams)
+                        action_label = "עודכן"
+                        arrow = "→"
                     upd = update_food_quantity(user_id, upd_row["id"], new_q)
                     fname = upd_row.get("food_name", "")
                     if upd.get("status"):
                         all_results.append(
-                            f"✅ עודכן: *{fname}* "
-                            f"{int(round(curr_q))}→{int(round(new_q))} גרם "
+                            f"✅ {action_label}: *{fname}* "
+                            f"{int(round(curr_q))}{arrow}{int(round(new_q))} גרם "
                             f"ב{full_meal} של {full_name}"
                         )
                     else:
