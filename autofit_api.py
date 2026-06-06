@@ -375,7 +375,7 @@ def find_best_food(query: str, coach_id: str = ""):
     """
     מחזיר (best_match, alternatives).
     best_match: התאמה מדויקת/הכי קרובה.
-    alternatives: עד 5 תוצאות אם אין התאמה מדויקת.
+    alternatives: עד 10 תוצאות אם אין התאמה מדויקת.
     """
     norm_query = normalize_food_query(query)
     foods = search_food(norm_query, coach_id)
@@ -411,15 +411,15 @@ def find_best_food(query: str, coach_id: str = ""):
             starts2   = [f for f in foods2 if f.get("food_name","").lower().startswith(q2)]
             contains2 = [f for f in foods2 if q2 in f.get("food_name","").lower()]
             if exact2:
-                return exact2, foods2[:5]
+                return exact2, foods2[:10]
             elif len(starts2) == 1:
-                return starts2[0], foods2[:5]
+                return starts2[0], foods2[:10]
             elif len(contains2) == 1:
-                return contains2[0], foods2[:5]
+                return contains2[0], foods2[:10]
             elif contains2:
                 foods = contains2  # עדיף תוצאות מקוריות על פני תוצאות מנורמלות רעות
 
-    return best, foods[:5]
+    return best, foods[:10]
 
 
 # ─── Update / Add food to meal ───────────────────────────────────────────────
