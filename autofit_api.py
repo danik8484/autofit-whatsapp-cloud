@@ -725,12 +725,18 @@ def parse_message(text: str) -> dict:
 
     # ── שפה חופשית ───────────────────────────────────────────────────────────
     full = " ".join(text.strip().split("\n"))
+    # "מזון חדש" = פקודה, לא שם/מזון — נסיר לפני חילוץ
+    _force_new = bool(re.search(r'\bמזון\s+חדש\b', full))
+    if _force_new:
+        full = re.sub(r'\bמזון\s+חדש\b', '', full)
+        full = re.sub(r'\s+', ' ', full).strip()
 
     _NOT_NAME_VERBS = frozenset({"הוסיף", "הוסיפי", "תוסיפי", "תוסיף", "החלף",
                                   "תחליפי", "תחליף", "הכנס", "הכניס", "להכניס",
                                   "עדכן", "שנה", "בצע", "שלח", "עשה", "עשי",
                                   "הוציא", "מחק", "הסר", "החליף", "תחליפ",
-                                  "ארוחת", "ארוחה", "נוסיף", "נוסיפי"})
+                                  "ארוחת", "ארוחה", "נוסיף", "נוסיפי",
+                                  "מזון", "חדש"})
 
     _MEAL_MAP_FT = {"ערב": "ערב", "לילה": "ערב", "בוקר": "בוקר",
                     "צהריים": "צהריים", "צהרים": "צהריים", "ביניים": "ביניים"}
@@ -838,6 +844,8 @@ def parse_message(text: str) -> dict:
 
     result.setdefault("meal", "ערב")
     result["confidence"] = conf
+    if _force_new:
+        result["force_new"] = True
     return result
 
 
@@ -876,6 +884,15 @@ def execute_request(request_text: str, force: bool = False,
         # בדוק שם לפני CONFIRM — מזהה fuzzy match כבר כאן
         raw_name = parsed["name"]
         uid_check, found_name, is_fuzzy = find_user(raw_name)
+        # fallback: שם 2 מילים לא נמצא → נסה מילה ראשונה, שאר המילים → לשם המזון
+        if not uid_check and ' ' in raw_name:
+            parts = raw_name.split(None, 1)
+            uid_check, found_name, is_fuzzy = find_user(parts[0])
+            if uid_check:
+                parsed["name"] = parts[0]
+                leftover = parts[1]
+                ch = parsed.get("change", "")
+                parsed["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', ch, count=1)
         if not uid_check:
             return f"NAME_NOT_FOUND:{raw_name}"
 
@@ -924,6 +941,19 @@ def execute_request(request_text: str, force: bool = False,
 
     # מצא מתאמן (פעם אחת)
     user_id, full_name, is_fuzzy = find_user(name)
+    # fallback: שם 2 מילים לא נמצא → נסה מילה ראשונה
+    if not user_id and not name_override and ' ' in name:
+        parts = name.split(None, 1)
+        user_id2, full_name2, is_fuzzy2 = find_user(parts[0])
+        if user_id2:
+            leftover = parts[1]
+            user_id, full_name, is_fuzzy = user_id2, full_name2, is_fuzzy2
+            parsed["name"] = parts[0]
+            ch = parsed.get("change", "")
+            parsed["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', ch, count=1)
+            # עדכן ops אם קיים
+            for _op in parsed.get("ops", []):
+                _op["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', _op.get("change",""), count=1)
     if not user_id:
         return f"NAME_NOT_FOUND:{name}"
     # safety: אם עדיין fuzzy אחרי name_override — שלח שגיאה
@@ -1042,7 +1072,8 @@ def execute_request(request_text: str, force: bool = False,
             full_meal = meal_map.get(meal_item, meal_item if "ארוחת" in meal_item else f"ארוחת {meal_item}")
 
             # ─── גרמים ללא group_hint → UPDATE כמות קיימת ────────────────────
-            if extra_grams and not group_hint:
+            # force_new=True (בקשת "מזון חדש") → תמיד ADD, לא UPDATE
+            if extra_grams and not group_hint and not parsed.get("force_new"):
                 _, upd_row, _ = find_meal_and_food(all_meals, full_meal, new_food_query)
                 if upd_row:
                     curr_q = float(upd_row.get("quantity") or upd_row.get("quantity_to_calculate") or 0)
