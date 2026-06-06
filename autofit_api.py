@@ -1097,7 +1097,7 @@ def execute_request(request_text: str, force: bool = False,
             # force_new=True (בקשת "מזון חדש") → תמיד ADD, לא UPDATE
             _is_reduce = op.get("reduce") or parsed.get("reduce")
             if extra_grams and not group_hint and (not parsed.get("force_new") or _is_reduce):
-                _, upd_row, _ = find_meal_and_food(all_meals, full_meal, new_food_query)
+                _, upd_row, upd_err = find_meal_and_food(all_meals, full_meal, new_food_query)
                 if upd_row:
                     curr_q = float(upd_row.get("quantity") or upd_row.get("quantity_to_calculate") or 0)
                     if _is_reduce:
@@ -1118,6 +1118,16 @@ def execute_request(request_text: str, force: bool = False,
                         )
                     else:
                         all_results.append(f"❌ שגיאת עדכון: {upd.get('message','')}")
+                    continue
+                elif _is_reduce:
+                    # מזון לא נמצא בארוחה — לא לעשות ADD, לדווח שגיאה
+                    avail = [f.get("food_name","") for meal in all_meals
+                             if (meal_name_norm := re.sub(r'(?<=\s)ה(?=[א-ת])','',full_meal).strip()) in meal.get("meal_name","")
+                             for f in (meal.get("mealFoods") or [])]
+                    if avail:
+                        all_results.append(f"❌ לא מצאתי '{new_food_query}' ב{full_meal}.\nמזונות בארוחה: {', '.join(avail)}")
+                    else:
+                        all_results.append(f"❌ לא מצאתי '{new_food_query}' ב{full_meal}.")
                     continue
 
             meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint)
