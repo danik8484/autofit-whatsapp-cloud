@@ -422,6 +422,17 @@ def find_best_food(query: str, coach_id: str = ""):
     return best, foods[:5]
 
 
+# ─── Update / Add food to meal ───────────────────────────────────────────────
+
+def update_food_quantity(user_id: str, meal_food_id: int, new_quantity: float) -> dict:
+    """מעדכן כמות (גרמים) של מזון קיים בארוחה — v2-updateMealFoodQuantity."""
+    body = {
+        "user_id": str(user_id),
+        "food_id": str(meal_food_id),   # = id של רשומת meal_food, לא food_id מהDB
+        "quantity": str(int(round(new_quantity))),
+    }
+    return _post("/coach/v2-updateMealFoodQuantity", body)
+
 # ─── Add food to meal ─────────────────────────────────────────────────────────
 
 def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict, grams_override: str = None) -> str:
@@ -1007,6 +1018,24 @@ def execute_request(request_text: str, force: bool = False,
         # עבד כל ארוחה
         for meal_item in op_meals:
             full_meal = meal_map.get(meal_item, meal_item if "ארוחת" in meal_item else f"ארוחת {meal_item}")
+
+            # ─── גרמים ללא group_hint → UPDATE כמות קיימת ────────────────────
+            if extra_grams and not group_hint:
+                _, upd_row, _ = find_meal_and_food(all_meals, full_meal, new_food_query)
+                if upd_row:
+                    curr_q = float(upd_row.get("quantity") or upd_row.get("quantity_to_calculate") or 0)
+                    new_q = curr_q + float(extra_grams)
+                    upd = update_food_quantity(user_id, upd_row["id"], new_q)
+                    fname = upd_row.get("food_name", "")
+                    if upd.get("status"):
+                        all_results.append(
+                            f"✅ עודכן: *{fname}* "
+                            f"{int(round(curr_q))}→{int(round(new_q))} גרם "
+                            f"ב{full_meal} של {full_name}"
+                        )
+                    else:
+                        all_results.append(f"❌ שגיאת עדכון: {upd.get('message','')}")
+                    continue
 
             meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint)
             if err:
