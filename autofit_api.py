@@ -527,7 +527,19 @@ def _extract_foods(text: str):
         text,
     )
     if m2:
-        return m2.group(1).strip(), ""
+        food = m2.group(1).strip()
+        # סדר הפוך: "הוסף במקום [hint] [new_food]" → restructure
+        if food.startswith("במקום "):
+            rest = food[6:].strip()
+            _COOK = {'לאחר', 'אחרי', 'בישול', 'לפני', 'מבושל', 'גולמי', 'חי', 'קלוי', 'מאודה', 'טחון', 'מטוגן', 'אפוי'}
+            words = rest.split()
+            i = 1
+            while i < len(words) and words[i] in _COOK:
+                i += 1
+            if 0 < i < len(words):
+                return ' '.join(words[i:]).strip(), ' '.join(words[:i]).strip()
+            return "", rest
+        return food, ""
 
     # "X במקום Y" ללא פועל מפורש
     m3 = re.search(r"([^\n]{2,30})\s+במקום(?:\s+של)?\s+([^\n]{2,40})", text)
@@ -753,8 +765,9 @@ def parse_message(text: str) -> dict:
 
     if "name" not in result:
         name_match = None
+        _NAME_STOP = r'(?:במקום|בנוסף|כאופציה|כתחליף|ובמקום)\b'
         for _m in re.finditer(
-            r"(?:של\s+|עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+[\u05D0-\u05EA]{2,})?)",
+            r"(?:של\s+|עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+(?!" + _NAME_STOP + r")[\u05D0-\u05EA]{2,})?)",
             full_no_meal,
         ):
             words = _m.group(1).strip().split()
