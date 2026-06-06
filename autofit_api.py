@@ -1021,8 +1021,8 @@ def execute_request(request_text: str, force: bool = False,
         paren2 = re.search(r'\(([^)]+)\)', group_hint_raw)
         group_hint = paren2.group(1).strip() if paren2 else group_hint_raw
 
-        # גרמים: מה-op / "עוד X גרם" / "X גרם [ל]FOOD" / "FOOD X גרם"
-        extra_grams = op.get("extra_grams")
+        # גרמים: מה-op / מה-parsed (free-text) / "עוד X גרם" / "X גרם [ל]FOOD" / "FOOD X גרם"
+        extra_grams = op.get("extra_grams") or parsed.get("extra_grams")
         grams_in_food = re.search(r'\bעוד\s+(\d+)\s*גרם\b', new_food_clean)
         if grams_in_food:
             extra_grams = grams_in_food.group(1)
