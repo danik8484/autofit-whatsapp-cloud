@@ -620,6 +620,9 @@ def parse_message(text: str) -> dict:
             # גם: "X, Y" בשורה אחת = 2 פעולות, "בנוסף ל" = synonym ל-"ל"
             def _parse_one_op(raw):
                 v = raw.strip()
+                # strip outer parens: "(80 גרם אורז)" → "80 גרם אורז"
+                if v.startswith('(') and v.endswith(')'):
+                    v = v[1:-1].strip()
                 v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
                 v = re.sub(r'בנוסף\s+ל', 'ל ', v)         # "בנוסף ל X" → "ל X"
                 v = re.sub(r'במקום\s+של', 'ל ', v)      # "במקום של X" → "ל X"
@@ -650,7 +653,8 @@ def parse_message(text: str) -> dict:
                 if " ל " in v:
                     nf, ht = v.split(" ל ", 1)
                 else:
-                    m_l = re.search(r'^(.+?)\s+ל([\u05D0-\u05EA].+)$', v)
+                    # לאחר/לפני = מילות בישול, לא separators
+                    m_l = re.search(r'^(.+?)\s+ל(?!אחר\b|פני\b)([\u05D0-\u05EA].+)$', v)
                     if m_l:
                         nf, ht = m_l.group(1), m_l.group(2)
                     else:
@@ -737,12 +741,12 @@ def parse_message(text: str) -> dict:
     if "name" not in result:
         name_match = None
         for _m in re.finditer(
-            r"(?:של\s+|עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+\u05D5[\u05D0-\u05EA]{2,})?)",
+            r"(?:של\s+|עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+[\u05D0-\u05EA]{2,})?)",
             full_no_meal,
         ):
             words = _m.group(1).strip().split()
-            if words[0] not in _NOT_NAME_VERBS:
-                result["name"] = _m.group(1).strip()  # מילה שנייה רק אם מתחילה ב-ו
+            if words[0] not in _NOT_NAME_VERBS and (len(words) < 2 or words[1] not in _NOT_NAME_VERBS):
+                result["name"] = _m.group(1).strip()
                 name_match = _m
                 break
         if name_match:
