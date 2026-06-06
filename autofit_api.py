@@ -939,7 +939,8 @@ def execute_request(request_text: str, force: bool = False,
             of = parens[1] if len(parens) >= 2 else ""
             op_meal = op.get("meal")
             meal_prefix = f"[{meal_map.get(op_meal, op_meal)}] " if op_meal else ""
-            action_lines.append(f"{meal_prefix}➕ {nf}" + (f" ← {of}" if of else ""))
+            icon = "➖" if (parsed.get("reduce") or op.get("reduce")) else "➕"
+            action_lines.append(f"{meal_prefix}{icon} {nf}" + (f" ← {of}" if of else ""))
 
         summary = f"👤 {display_name}\n🍽 {meal_display}\n" + "\n".join(action_lines)
 
