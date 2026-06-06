@@ -1001,16 +1001,25 @@ def execute_request(request_text: str, force: bool = False,
             best_food = next((f for f in foods if f.get("food_name","").lower() == food_override.lower()), None) \
                         or (foods[0] if foods else None)
             if not best_food:
-                all_results.append(f"❓ לא נמצא '{food_override}' במאגר.")
-                continue
+                # fallback: find_best_food עם חיפוש חכם → FOOD_OPTIONS אם יש חלופות
+                best_food, alternatives = find_best_food(normalize_food_query(food_override), coach_id)
+                if not best_food:
+                    if alternatives:
+                        options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:10]))
+                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives[:10])
+                        return (f"FOOD_OPTIONS:{normalize_food_query(food_override)}||{alts_pipe}\n"
+                                f"לא מצאתי {food_override} כאופציה, מה שכן מצאתי זה:\n"
+                                f"{options}\n\n"
+                                f"שלח מספר לבחירה, או שם מדויק יותר.")
+                    all_results.append(f"❓ לא נמצא '{food_override}' במאגר.")
+                    continue
         else:
             best_food, alternatives = find_best_food(new_food_query, coach_id)
             if not best_food:
                 if len(ops_list) == 1:
                     if alternatives:
-                        options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:5]))
-                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives[:5])
-                        # כולל את השאילתה המקורית כדי שindex.js יוכל לזכור את הבחירה
+                        options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:10]))
+                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives[:10])
                         return (f"FOOD_OPTIONS:{new_food_query}||{alts_pipe}\n"
                                 f"לא מצאתי {new_food_query} כאופציה, מה שכן מצאתי זה:\n"
                                 f"{options}\n\n"
@@ -1105,7 +1114,9 @@ def execute_request(request_text: str, force: bool = False,
                                 new_q = round(cal_target * 100 / cal_per_100, 2)
                                 new_disp = f" ({new_q} גרם)"
                             else:
-                                new_disp = ""
+                                # fallback: אותה כמות כמו המזון שמוחלף
+                                fb_q = food_row.get("quantity") or food_row.get("gram_value")
+                                new_disp = f" ({fb_q} גרם)" if fb_q and float(fb_q) > 0 else ""
                         except: new_disp = ""
                     all_results.append(f"✅ נוסף: *{food_name}*{new_disp} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{replaced_disp}")
                 else:
