@@ -209,10 +209,10 @@ app.post('/webhook', async (req, res) => {
   const msg = body.messageData;
   if (!msg || msg.typeMessage !== 'textMessage') return;
 
-  // התעלם מ-webhooks שנשלחו לפני שהשרת עלה (retries אחרי restart)
+  // התעלם מ-webhooks ישנים (מעל 3 דקות לפני start) — retries קצרים אחרי restart עוברים
   const msgTimestamp = body.timestamp;
-  if (msgTimestamp && msgTimestamp < SERVER_START - 10) {
-    console.log(`[skip] webhook לפני start (${Math.round(SERVER_START - msgTimestamp)}s ago)`);
+  if (msgTimestamp && msgTimestamp < SERVER_START - 180) {
+    console.log(`[skip] webhook ישן מדי (${Math.round(SERVER_START - msgTimestamp)}s ago)`);
     return;
   }
 
