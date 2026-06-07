@@ -840,9 +840,9 @@ def parse_message(text: str) -> dict:
         full = re.sub(r'\s+', ' ', full).strip()
 
     # "הורד/הפחת X גרם" = פקודת הפחתה
-    _reduce = bool(re.search(r'\b(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|הורידי)\b', full))
+    _reduce = bool(re.search(r'\b(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|הורידי|הוריד)\b', full))
     if _reduce:
-        full = re.sub(r'\b(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|הורידי)\s+', '', full)
+        full = re.sub(r'\b(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|הורידי|הוריד)\s+', '', full)
         # "מ-FOOD" / "מה-FOOD" אחרי גרמים — strip prefix מ/מה לפני שם מזון
         full = re.sub(r'(\d+\s*גרם\s+)מה?\s*', r'\1', full)
         full = re.sub(r'\s+', ' ', full).strip()
@@ -916,7 +916,17 @@ def parse_message(text: str) -> dict:
 
         # Fix C: שם לפני מפריד בתחילת משפט ("דני - תוסיפי X" / "דני: X")
         _pre_sep = re.match(r'^([\u05D0-\u05EA]{2,6})\s*[-:–]\s*', full_no_meal)
-        if _pre_sep and _pre_sep.group(1) not in _NOT_NAME_VERBS:
+        # Fix E: "NAME צריך/רוצה/מבקש X" — שם בתחילה לפני פועל הקשר
+        _ctx_verb = re.match(
+            r'^([\u05D0-\u05EA]{2,5})\s+(?:צריך|רוצה|מבקש|מקבל|יצטרך|אוכל)\s+',
+            full_no_meal
+        )
+        if _ctx_verb and _ctx_verb.group(1) not in _NOT_NAME_VERBS:
+            result["name"] = _ctx_verb.group(1)
+            conf = max(conf, 70)
+            clean_full = full_no_meal[_ctx_verb.end():]
+            clean_full = re.sub(r'\s+', ' ', clean_full).strip()
+        elif _pre_sep and _pre_sep.group(1) not in _NOT_NAME_VERBS:
             result["name"] = _pre_sep.group(1)
             conf = max(conf, 75)
             clean_full = full_no_meal[_pre_sep.end():]
@@ -951,6 +961,14 @@ def parse_message(text: str) -> dict:
                     else:
                         result["name"] = _m.group(1).strip()
                         _name_cut_end = _m.end()
+                    name_match = _m
+                    break
+                elif (len(words) >= 2 and words[0] in _NOT_NAME_VERBS
+                      and words[1].startswith("ל") and len(words[1]) > 1
+                      and words[1][1:] not in _NOT_NAME_VERBS):
+                    # words[0] הוא פועל ו-words[1] הוא "לשם" — השם האמיתי
+                    result["name"] = words[1][1:]  # strip ל: "לדני" → "דני"
+                    _name_cut_end = _m.end()
                     name_match = _m
                     break
 
