@@ -961,7 +961,7 @@ def parse_message(text: str) -> dict:
         _NAME_STOP = r'(?:במקום|בנוסף|כאופציה|כתחליף|ובמקום|אופציה)\b'
 
         # Detect ל + phone number (e.g., ל0546739981)
-        _phone_lm = re.search(r'(?<!\S)ל(05\d{8})\b', full_no_meal)
+        _phone_lm = re.search(r'(?<!\S)ל(972\d{9}|05[\d\-]{8,})', full_no_meal)
         if _phone_lm:
             result["name"] = _phone_lm.group(1)
             full_no_meal = full_no_meal[:_phone_lm.start()] + full_no_meal[_phone_lm.end():]
