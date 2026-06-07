@@ -251,9 +251,13 @@ app.post('/webhook', async (req, res) => {
   const body = req.body;
 
   // ── V3: הודעות יוצאות מדני ללקוחות ────────────────────────────────────
-  if (body.typeWebhook === 'outgoingMessageReceived' && BIZ_GROUP) {
+  if (body.typeWebhook === 'outgoingMessageReceived') {
+    console.log('[v3-entry] outgoing webhook arrived, BIZ_GROUP=' + BIZ_GROUP);
+    v3Log.push({ ts: Date.now(), step: 'entry', biz_group: !!BIZ_GROUP, type: body.typeWebhook });
+    if (v3Log.length > 50) v3Log.shift();
+    if (!BIZ_GROUP) return;
     const outMsg = body.messageData;
-    if (!outMsg || outMsg.typeMessage !== 'textMessage') return;
+    if (!outMsg || outMsg.typeMessage !== 'textMessage') { console.log('[v3] no textMessage, type=' + outMsg?.typeMessage); return; }
     const outText = outMsg.textMessageData?.textMessage?.trim();
     if (!outText) return;
     const outChatId = body.senderData?.chatId || '';
@@ -268,6 +272,7 @@ app.post('/webhook', async (req, res) => {
     const outName = body.senderData?.chatName || outChatId.replace('@c.us','');
     const outPhone = outChatId.replace('@c.us','');
     console.log(`[v3] פקודה יוצאת: "${outName}" (${outPhone}) | "${outText.slice(0,60)}"`);
+    v3Log.push({ ts: Date.now(), step: 'trigger', name: outName, phone: outPhone, text: outText.slice(0,40) });
     const cachedId = bizNamePrefs.get(outName.toLowerCase());
     runAutofitBiz(outName, outPhone, outText, cachedId ? { userIdOverride: cachedId } : {});
     return;
@@ -717,6 +722,7 @@ async function handleBizGroupResponse(text) {
 
 // ─── Webhook v3 — הודעות יוצאות מהחשבון העסקי ─────────────────
 const bizDebugLog = []; // מאגר webhooks אחרונים לdebug
+const v3Log = []; // לוג V3
 app.post('/webhook-business', async (req, res) => {
   res.sendStatus(200);
   const body = req.body;
@@ -784,6 +790,11 @@ app.post('/webhook-business', async (req, res) => {
   const extraOpts = cachedId ? { userIdOverride: cachedId } : {};
 
   runAutofitBiz(contactName, clientPhone, text, extraOpts);
+});
+
+// ─── Debug V3 log ─────────────────────────────────────────────
+app.get('/debug-v3', (_, res) => {
+  res.json({ count: v3Log.length, log: v3Log.slice(-20).reverse() });
 });
 
 // ─── Debug env ────────────────────────────────────────────────
