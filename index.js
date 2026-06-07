@@ -349,6 +349,14 @@ app.post('/webhook', async (req, res) => {
         return;
       }
     } else if (corr.type === 'name_choice') {
+      const phoneMatch = text.trim().replace(/[\s\-\(\)]/g, '').match(/^0\d{9}$/);
+      if (phoneMatch) {
+        // טלפון לזיהוי מתאמן
+        pendingCorrections.delete(sender);
+        await sendMessage(sender, '⏳ מבצע...');
+        runAutofit(sender, corr.originalText, { force: true, nameOverride: phoneMatch[0] });
+        return;
+      }
       const numMatch = text.trim().match(/^(\d+)$/);
       if (numMatch) {
         const idx = parseInt(numMatch[1]) - 1;

@@ -641,6 +641,8 @@ except Exception:
 
 def _looks_like_surname(word: str) -> bool:
     """בודק אם מילה עשויה להיות שם משפחה (לעומת שם מזון)."""
+    if word in _FOOD_NOT_SURNAME:
+        return False
     if word in _COMMON_SURNAMES:
         return True
     for sfx in _SURNAME_SUFFIXES:
@@ -1270,12 +1272,11 @@ def execute_request(request_text: str, force: bool = False,
                 ch = parsed.get("change", "")
                 parsed["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', ch, count=1)
         if uid_check == "MULTIPLE":
-            # ריבוי מתאמנים — שלח NAME_OPTIONS
+            # ריבוי מתאמנים — בקש טלפון לזיהוי
             options = found_name.split(";")
-            lines = "\n".join(f"{i+1}. {opt.split('|')[1]}" for i, opt in enumerate(options))
             ids_pipe = "|".join(opt.split("|")[0] for opt in options)
             names_pipe = "|".join(opt.split("|")[1] for opt in options)
-            return f"NAME_OPTIONS:{ids_pipe}||{names_pipe}\nמצאתי {len(options)} מתאמנים בשם *{raw_name}*:\n{lines}\n\nשלח מספר לבחירה."
+            return f"NAME_OPTIONS:{ids_pipe}||{names_pipe}\nמצאתי {len(options)} מתאמנים בשם *{raw_name}*.\n\nשלח/י מספר טלפון לזיהוי."
 
         if not uid_check:
             return f"NAME_NOT_FOUND:{raw_name}"
@@ -1362,12 +1363,11 @@ def execute_request(request_text: str, force: bool = False,
             for _op in parsed.get("ops", []):
                 _op["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', _op.get("change",""), count=1)
     if user_id == "MULTIPLE":
-        # ריבוי מתאמנים באותו שם — שלח רשימה לבחירה
+        # ריבוי מתאמנים באותו שם — בקש טלפון לזיהוי
         options = full_name.split(";")
-        lines = "\n".join(f"{i+1}. {opt.split('|')[1]}" for i, opt in enumerate(options))
         ids_pipe = "|".join(opt.split("|")[0] for opt in options)
         names_pipe = "|".join(opt.split("|")[1] for opt in options)
-        return f"NAME_OPTIONS:{ids_pipe}||{names_pipe}\nמצאתי {len(options)} מתאמנים בשם *{name}*:\n{lines}\n\nשלח מספר לבחירה."
+        return f"NAME_OPTIONS:{ids_pipe}||{names_pipe}\nמצאתי {len(options)} מתאמנים בשם *{name}*.\n\nשלח/י מספר טלפון לזיהוי."
     if not user_id:
         return f"NAME_NOT_FOUND:{name}"
     # safety: אם עדיין fuzzy אחרי name_override — שלח שגיאה
@@ -1610,12 +1610,24 @@ if __name__ == "__main__":
             return val
         return ""
 
+    allow_phone      = "--allow-phone" in args
+    args = [a for a in args if a != "--allow-phone"]
+
     name_override    = _pop_arg("--name")
     meal_override    = _pop_arg("--meal")
     food_override    = _pop_arg("--food")
     hint_override    = _pop_arg("--hint")
     menu_name        = _pop_arg("--menu")
     user_id_override = _pop_arg("--user-id")
+
+    # הגנה: חוסם שימוש במספר טלפון ישראלי כ--name ללא דגל --allow-phone
+    # מונע הרצת פקודות בטעות על משתמש אמיתי תוך כדי בדיקות
+    _PHONE_RE = re.compile(r'^(?:972|0)(?:5[0-9]|[23489])\d{7,8}$')
+    if name_override and _PHONE_RE.match(name_override.replace("-","").replace(" ","")) and not allow_phone:
+        import sys as _sys
+        print(f"⛔ BLOCKED: --name '{name_override}' נראה כמו מספר טלפון ישראלי.")
+        print("   הוסף --allow-phone אם אתה בטוח שאתה רוצה לפעול על משתמש זה.")
+        _sys.exit(1)
 
     if menu_name:
         uid, full_name, _ = find_user(menu_name)
