@@ -335,16 +335,12 @@ app.post('/webhook', async (req, res) => {
       if (!isAllowed) return;
     }
     if (!hasTriggerWord(outText)) return;
-    // קבל שם איש קשר: אם ה-webhook לא כולל chatName (כגון polling) — שאל GreenAPI
-    let outName = body.senderData?.chatName || '';
-    if (!outName || /^\d{7,}$/.test(outName)) {
-      outName = await getContactName(outChatId);
-    }
+    // חיפוש לפי טלפון תמיד — מהיר ואמין יותר; שם הצ'אט רק לתצוגה בקבלה
     const outPhone = outChatId.replace('@c.us','');
+    const outName = body.senderData?.chatName || outPhone;
     console.log(`[v3] פקודה יוצאת: "${outName}" (${outPhone}) | "${outText.slice(0,60)}"`);
     v3Log.push({ ts: Date.now(), step: 'trigger', name: outName, phone: outPhone, text: outText.slice(0,40) });
-    const cachedId = bizNamePrefs.get(outName.toLowerCase());
-    runAutofitBiz(outName, outPhone, outText, cachedId ? { userIdOverride: cachedId } : {});
+    runAutofitBiz(outName, outPhone, outText, { nameOverride: outPhone });
     return;
   }
 
@@ -764,11 +760,12 @@ async function getContactName(chatId) {
 }
 
 // ─── פורמט קבלה לקבוצה ───────────────────────────────────────
-function formatBizReceipt(contactName, autofitResult) {
+function formatBizReceipt(clientName, autofitResult, phoneDisplay) {
   const time = new Date().toLocaleTimeString('he-IL', {
     timeZone: 'Asia/Jerusalem', hour: '2-digit', minute: '2-digit'
   });
-  return `👤 *${contactName}* | 🕐 ${time}\n${autofitResult}`;
+  const header = phoneDisplay ? `*${clientName}* (${phoneDisplay})` : `*${clientName}*`;
+  return `👤 ${header} | 🕐 ${time}\n${autofitResult}`;
 }
 
 // ─── הרצת autofit עבור v3 ─────────────────────────────────────
@@ -896,13 +893,13 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
 
     // ── הצלחה או שגיאה ────────────────────────────────────────────────
     bizPending = null;
-    // אם contactName הוא מספר טלפון — נסה לחלץ שם לקוח מתשובת אוטופיט
-    let displayName = contactName;
-    if (/^\d{7,}$/.test(contactName)) {
-      const nm = raw.match(/של ([\u05D0-\u05EA]+(?:\s+[\u05D0-\u05EA]+)*)/);
-      if (nm) displayName = nm[1].trim();
-    }
-    const msg = code === 0 ? formatBizReceipt(displayName, raw) : `❌ *${displayName}*\n${raw}`;
+    // חלץ שם לקוח מתשובת אוטופיט (תמיד — זה השם האמיתי במערכת)
+    const nmMatch = raw.match(/של ([\u05D0-\u05EA]+(?:\s+[\u05D0-\u05EA]+)*)/);
+    const clientName = nmMatch ? nmMatch[1].trim() : contactName;
+    const phoneDisplay = clientPhone.replace(/^972/, '0');
+    const msg = code === 0
+      ? formatBizReceipt(clientName, raw, phoneDisplay)
+      : `❌ *${clientName}* (${phoneDisplay})\n${raw}`;
     await sendBizMessage(BIZ_GROUP, msg);
   });
 }
@@ -1023,13 +1020,11 @@ async function processBizBody(body) {
   if (!hasTriggerWord(text)) return;
   console.log(`[biz] פקודה: chatId=${chatId} | "${text.slice(0,60)}"`);
 
-  const contactName = await getContactName(chatId);
   const clientPhone = chatId.replace('@c.us', '');
+  const contactName = body?.senderData?.chatName || clientPhone; // לתצוגה בקבלה בלבד
   console.log(`[biz] לקוח: "${contactName}" (${clientPhone})`);
-
-  const cachedId = bizNamePrefs.get(contactName.toLowerCase());
-  const extraOpts = cachedId ? { userIdOverride: cachedId } : {};
-  runAutofitBiz(contactName, clientPhone, text, extraOpts);
+  // חיפוש לפי טלפון תמיד — מהיר ואמין יותר
+  runAutofitBiz(contactName, clientPhone, text, { nameOverride: clientPhone });
 }
 
 // ─── BIZ Polling loop — lastOutgoingMessages ──────────────────
