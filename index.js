@@ -1007,9 +1007,11 @@ async function processBizBody(body) {
 
   const BIZ_TEST_PHONE = process.env.BIZ_TEST_PHONE;
   if (BIZ_TEST_PHONE) {
+    const allowed = BIZ_TEST_PHONE.split(',').map(p => p.trim()).filter(Boolean);
     const phone = chatId.replace('@c.us', '').replace(/^972/, '0');
     const phoneAlt = chatId.replace('@c.us', '');
-    if (phone !== BIZ_TEST_PHONE && phoneAlt !== BIZ_TEST_PHONE && phoneAlt !== '972' + BIZ_TEST_PHONE.replace(/^0/, '')) return;
+    const isAllowed = allowed.some(a => phone === a || phoneAlt === a || phoneAlt === '972'+a.replace(/^0/,''));
+    if (!isAllowed) return;
   }
 
   if (!hasTriggerWord(text)) return;
