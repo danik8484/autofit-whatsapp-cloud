@@ -711,7 +711,7 @@ def parse_message(text: str) -> dict:
     text = re.sub(r'מוסיף\s+ל[כךו]', 'הוסף', text)
     # מחליף לך X ב-Y → הוסף Y במקום X (Y = subFood לבחירה, X = מה שמחליפים)
     text = re.sub(
-        r'מחליף\s+ל[כךו]\s+(.+?)\s+ב([^\n]+)',
+        r'מחליף\s+ל[כךו]\s+(.+)\s+ב([^\n]+)',
         lambda m: f'הוסף {m.group(2).strip()} במקום {m.group(1).strip()}',
         text
     )
@@ -1124,7 +1124,7 @@ def parse_message(text: str) -> dict:
                     # strip leading ל (למשל "לדני" → "דני")
                     if _pv_n.startswith("ל") and len(_pv_n) > 1:
                         _pv_n = _pv_n[1:]
-                    if _pv_n not in _NOT_NAME_VERBS:
+                    if _pv_n not in _NOT_NAME_VERBS and _pv_n not in _FOOD_NOT_SURNAME:
                         result["name"] = _pv_n
                         conf = 65
                         _pv_s = _pv.start(1)
@@ -1209,7 +1209,7 @@ def parse_message(text: str) -> dict:
                 result["extra_grams"] = _trail_num.group(2)
     # מספר בתחילת שם מזון ללא "גרם" — "150 אורז" → food="אורז", extra_grams=150
     if new_food and not result.get("extra_grams"):
-        _lead_num = re.match(r'^(\d+)\s+([א-ת].+)$', new_food.strip())
+        _lead_num = re.match(r'^(\d+)\s+(?!גרם\b)([א-ת].+)$', new_food.strip())
         if _lead_num:
             result["extra_grams"] = _lead_num.group(1)
             new_food = _lead_num.group(2).strip()
