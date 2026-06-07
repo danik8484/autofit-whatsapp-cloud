@@ -710,11 +710,14 @@ def parse_message(text: str) -> dict:
     # ל[כךו]: לך (ך = כ סופית 0x5da) + לו — שתי הצורות
     text = re.sub(r'מוסיף\s+ל[כךו]', 'הוסף', text)
     # מחליף לך X ב-Y → הוסף Y במקום X (Y = subFood לבחירה, X = מה שמחליפים)
-    text = re.sub(
-        r'מחליף\s+ל[כךו]\s+(.+)\s+ב([^\n]+)',
+    # protect "לאחר/לפני בישול" then lazy-match to find FIRST ב separator
+    _t = text.replace('לאחר בישול', 'לאחר״בישול').replace('לפני בישול', 'לפני״בישול')
+    _t = re.sub(
+        r'מחליף\s+ל[כךו]\s+(.+?)\s+ב([^\n]+)',
         lambda m: f'הוסף {m.group(2).strip()} במקום {m.group(1).strip()}',
-        text
+        _t
     )
+    text = _t.replace('\u05f4', ' ')
     text = re.sub(r'מחליף\s+ל[כךו]', 'הוסף', text)  # fallback: מחליף ללא "ב"
     # V3: "N גרם לFOOD" → "N גרם FOOD" (ל as preposition, 3+ chars after ל = definitely not לחם)
     text = re.sub(r'(\d+\s*גרם\s+)ל([\u05D0-\u05EA]{3,})', r'\1\2', text)
