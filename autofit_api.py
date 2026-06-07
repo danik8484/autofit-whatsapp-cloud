@@ -890,6 +890,12 @@ def parse_message(text: str) -> dict:
             if re.search(rf'\+\s*{w}\b', full):
                 if k not in _meal_hits:
                     _meal_hits.append(k)
+        # "פועל ערב X" / "ל ערב X" — ארוחה ללא ב' (למשל: "תוסיפי ערב אורז")
+        if not _meal_hits:
+            for w, k in _MEAL_MAP_FT.items():
+                if re.search(rf'(?:^|[\s]){w}\s+[א-ת]', full):
+                    if k not in _meal_hits:
+                        _meal_hits.append(k)
         _meal_hits = list(dict.fromkeys(_meal_hits))
         if len(_meal_hits) > 1:
             result["meals"] = _meal_hits
@@ -905,8 +911,11 @@ def parse_message(text: str) -> dict:
     full_no_meal = re.sub(r'\s+[וV](?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     full_no_meal = re.sub(r'\b(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\s+[וV]\s*(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
-    # מונע "אופציה של X" מלהיות prefix לשם אדם בחיפוש שמות
+    # נרמול מוקדם לפני חיפוש שמות — מונע "ל+מזון" אחרי מילות תחליף מלהיות שם אדם
     full_no_meal = re.sub(r'אופציה\s+של\s+', '', full_no_meal)
+    full_no_meal = re.sub(r'כתחליף\s+ל', 'במקום ', full_no_meal)
+    full_no_meal = re.sub(r'כאופציה\s+(?:ל|של)', 'במקום ', full_no_meal)
+    full_no_meal = re.sub(r'בנוסף\s+ל', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
 
     if "name" not in result:
@@ -1105,6 +1114,19 @@ def execute_request(request_text: str, force: bool = False,
     # ── שלילה: "אל תוסיפי" / "לא להוסיף" ─────────────────────────────────────
     if _NEGATION_PREFIX.search(request_text.strip()):
         return "❓ לא הבנתי — נראה כמו שלילה. אם רצית לבצע פעולה, שלח שוב ללא 'אל' / 'לא'."
+    # ── ריבוי אנשים: "לדני ולרון X" → 2 בקשות נפרדות ──────────────────────────
+    if not name_override and not food_override and not hint_override:
+        _mp = re.search(
+            r'ל([א-ת]{2,}(?:\s+[א-ת]{2,})?)\s+ול([א-ת]{2,}(?:\s+[א-ת]{2,})?)\b',
+            request_text
+        )
+        if _mp:
+            n1, n2 = _mp.group(1), _mp.group(2)
+            req1 = request_text[:_mp.start()] + f'ל{n1} ' + request_text[_mp.end():]
+            req2 = request_text[:_mp.start()] + f'ל{n2} ' + request_text[_mp.end():]
+            r1 = execute_request(req1.strip(), force, name_override, meal_override, food_override, hint_override, user_id_override)
+            r2 = execute_request(req2.strip(), force, name_override, meal_override, food_override, hint_override, user_id_override)
+            return f"{r1}\n\n{r2}"
     # ── ריבוי משימות: "תעלי לדני X ותוסיפי לו Y" / שורות נפרדות ─────────────
     if not name_override and not food_override and not hint_override:
         # פיצוח: "ו+פועל" OR שורה חדשה שמתחילה בפועל
