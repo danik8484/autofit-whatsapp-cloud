@@ -1129,8 +1129,8 @@ def parse_message(text: str) -> dict:
         # Fix G: "NAME GRAMS גרם FOOD" — שם בתחילה ישירות לפני גרמים
         # V3: לא מסיר ל' מהשם (ל' חלק מהשם, כגון ליצקו); V1/V2: מסיר ל' מוביל
         _name_grams = re.match(
-            r'^([א-ת]{2,8})\s+(\d+)\s*גרם\s+' if _v3_triggered else
-            r'^ל?([א-ת]{2,6})\s+(\d+)\s*גרם\s+',
+            r'^([א-ת\u05F3\']{2,8})\s+(\d+)\s*גרם\s+' if _v3_triggered else
+            r'^ל?([א-ת\u05F3\']{2,6})\s+(\d+)\s*גרם\s+',
             full_no_meal
         )
         if "name" not in result and _ctx_verb and _ctx_verb.group(1) not in _NOT_NAME_VERBS:
@@ -1716,14 +1716,26 @@ def execute_request(request_text: str, force: bool = False,
                         all_results.append(f"❌ שגיאת עדכון: {upd.get('message','')}")
                     continue
                 elif _is_reduce:
-                    # מזון לא נמצא בארוחה — לא לעשות ADD, לדווח שגיאה
+                    # מזון לא נמצא בארוחה — חפש בארוחות אחרות ודווח
                     avail = [f.get("food_name","") for meal in all_meals
                              if (meal_name_norm := re.sub(r'(?<=\s)ה(?=[א-ת])','',full_meal).strip()) in meal.get("meal_name","")
                              for f in (meal.get("mealFoods") or [])]
+                    _other_meals: list[str] = []
+                    _nfq_low = new_food_query.lower()
+                    for _om in all_meals:
+                        _om_name = _om.get("meal_name", "")
+                        if full_meal.replace("ארוחת ", "") in _om_name or _om_name in full_meal:
+                            continue
+                        for _of in (_om.get("mealFoods") or []):
+                            _ofn = _of.get("food_name", "")
+                            if _nfq_low in _ofn.lower() or _ofn.lower() in _nfq_low:
+                                _other_meals.append(_om_name)
+                                break
+                    _other_str = f" הוא נמצא ב{'/'.join(_other_meals)}." if _other_meals else ""
                     if avail:
-                        all_results.append(f"❌ לא מצאתי '{new_food_query}' ב{full_meal}.\nמזונות בארוחה: {', '.join(avail)}")
+                        all_results.append(f"❌ לא מצאתי '{new_food_query}' ב{full_meal}.{_other_str}\nמזונות בארוחה: {', '.join(avail)}")
                     else:
-                        all_results.append(f"❌ לא מצאתי '{new_food_query}' ב{full_meal}.")
+                        all_results.append(f"❌ לא מצאתי '{new_food_query}' ב{full_meal}.{_other_str}")
                     continue
 
             meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint)
