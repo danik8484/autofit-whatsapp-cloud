@@ -1008,6 +1008,9 @@ def parse_message(text: str) -> dict:
                                   # מילות הגבלה / ייעוץ
                                   "כדאי", "אולי", "עדיף", "בואי", "בוא"})
 
+    # שמות עבריים שמתחילים באות ל כחלק מהשם (לא ל' יחס)
+    _L_NAMES = frozenset({'ליצקו', 'לי', 'לילך', 'לאה', 'ליאת', 'ליאור', 'ליבי', 'לירן', 'לירון', 'לינור'})
+
     _MEAL_MAP_FT = {"ערב": "ערב", "לילה": "ערב", "בוקר": "בוקר",
                     "צהריים": "צהריים", "צהרים": "צהריים", "ביניים": "ביניים"}
 
@@ -1135,7 +1138,11 @@ def parse_message(text: str) -> dict:
             clean_full = full_no_meal[_name_grams.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
         elif "name" not in result and _pre_sep and all(w not in _NOT_NAME_VERBS for w in _pre_sep.group(1).split()):
-            result["name"] = _pre_sep.group(1)
+            _pn = _pre_sep.group(1)
+            # "לדני:" → "דני" (strip ל יחס), אבל "ליצקו:" נשאר כמו שהוא (ל חלק מהשם)
+            if _pn.startswith("ל") and len(_pn) > 2 and _pn not in _L_NAMES:
+                _pn = _pn[1:]
+            result["name"] = _pn
             conf = max(conf, 75)
             clean_full = full_no_meal[_pre_sep.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
@@ -1228,7 +1235,7 @@ def parse_message(text: str) -> dict:
     clean_full = re.sub(r'כתחליף\s+ל', 'במקום ', clean_full)
     clean_full = re.sub(r'בנוסף\s+ל', 'במקום ', clean_full)
     # "תחליפי X ב-Y" → "X במקום Y"  (ב = אינדיקטור להחלפה, לא מיקום)
-    if re.search(r'(?:תחליפ[יה]|החלפ[יה]?|להחליף|שנ[הו]ת?)\b', text) and 'במקום' not in clean_full:
+    if re.search(r'(?:תחליפ[יה]|תחליף|החלפ[יה]?|החלף|להחליף)\b', text) and 'במקום' not in clean_full:
         clean_full = re.sub(r"(?<=[א-ת%'׳\"])\s+ב([א-ת])", r' במקום \1', clean_full)
     clean_full = re.sub(r'אופציה\s+של\s+', '', clean_full)     # "אופציה של X" → "X"
     clean_full = re.sub(r'אופציה\s+לתחליף\s+', '', clean_full) # "אופציה לתחליף X" → "X"
