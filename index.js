@@ -920,22 +920,36 @@ async function processBizBody(body) {
   runAutofitBiz(contactName, clientPhone, text, extraOpts);
 }
 
-// ─── BIZ Polling loop (במקום webhook) ─────────────────────────
+// ─── BIZ Polling loop — lastOutgoingMessages ──────────────────
 async function bizPollLoop() {
+  const startTs = Math.floor(Date.now() / 1000);
+  let lastTs = startTs;
+  console.log('[biz-poll] starting, watermark=', new Date(startTs * 1000).toISOString());
   while (true) {
+    await new Promise(r => setTimeout(r, 10000)); // כל 10 שניות
     try {
-      const resp = await fetch(`${BIZ_BASE}/receiveNotification/${BIZ_TOKEN}?receiveTimeout=5`);
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data && data.body) {
-          bizDebugLog.push({ ts: Date.now(), body: data.body });
-          if (bizDebugLog.length > 30) bizDebugLog.shift();
-          await processBizBody(data.body);
-          await fetch(`${BIZ_BASE}/deleteNotification/${BIZ_TOKEN}/${data.receiptId}`, { method: 'DELETE' });
-        }
+      const resp = await fetch(`${BIZ_BASE}/lastOutgoingMessages/${BIZ_TOKEN}`);
+      if (!resp.ok) continue;
+      const msgs = await resp.json();
+      if (!Array.isArray(msgs)) continue;
+      let maxTs = lastTs;
+      for (const msg of msgs) {
+        if (!msg.timestamp || msg.timestamp <= lastTs) continue;
+        maxTs = Math.max(maxTs, msg.timestamp);
+        const text = msg.textMessage || msg.extendedTextMessage?.text || '';
+        if (!text) continue;
+        bizDebugLog.push({ ts: Date.now(), body: msg });
+        if (bizDebugLog.length > 30) bizDebugLog.shift();
+        await processBizBody({
+          typeWebhook: 'outgoingMessageReceived',
+          idMessage: msg.idMessage,
+          senderData: { chatId: msg.chatId },
+          messageData: { typeMessage: 'textMessage', textMessageData: { textMessage: text } }
+        });
       }
+      lastTs = maxTs;
     } catch (e) {
-      await new Promise(r => setTimeout(r, 5000));
+      console.error('[biz-poll error]', e.message);
     }
   }
 }
