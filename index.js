@@ -249,6 +249,30 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
   const body = req.body;
+
+  // ── V3: הודעות יוצאות מדני ללקוחות ────────────────────────────────────
+  if (body.typeWebhook === 'outgoingMessageReceived' && BIZ_GROUP) {
+    const outMsg = body.messageData;
+    if (!outMsg || outMsg.typeMessage !== 'textMessage') return;
+    const outText = outMsg.textMessageData?.textMessage?.trim();
+    if (!outText) return;
+    const outChatId = body.senderData?.chatId || '';
+    if (outChatId.includes('@g.us')) return; // דלג קבוצות
+    const BIZ_TEST_PHONE = process.env.BIZ_TEST_PHONE;
+    if (BIZ_TEST_PHONE) {
+      const ph = outChatId.replace('@c.us','').replace(/^972/,'0');
+      const phAlt = outChatId.replace('@c.us','');
+      if (ph !== BIZ_TEST_PHONE && phAlt !== BIZ_TEST_PHONE && phAlt !== '972'+BIZ_TEST_PHONE.replace(/^0/,'')) return;
+    }
+    if (!hasTriggerWord(outText)) return;
+    const outName = body.senderData?.chatName || outChatId.replace('@c.us','');
+    const outPhone = outChatId.replace('@c.us','');
+    console.log(`[v3] פקודה יוצאת: "${outName}" (${outPhone}) | "${outText.slice(0,60)}"`);
+    const cachedId = bizNamePrefs.get(outName.toLowerCase());
+    runAutofitBiz(outName, outPhone, outText, cachedId ? { userIdOverride: cachedId } : {});
+    return;
+  }
+
   if (body.typeWebhook !== 'incomingMessageReceived') return;
 
   const msg = body.messageData;
@@ -471,23 +495,23 @@ const BIZ_PENDING_TTL = 10 * 60 * 1000; // 10 דקות
 
 // ─── שליחה דרך המספר העסקי ───────────────────────────────────
 async function sendBizMessage(chatId, text) {
-  if (!BIZ_BASE || !BIZ_TOKEN) return;
   const id = chatId.includes('@') ? chatId : `${chatId}@c.us`;
-  try {
-    const res = await fetch(`${BIZ_BASE}/sendMessage/${BIZ_TOKEN}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chatId: id, message: text }),
-    });
-    const data = await res.json();
-    if (data.idMessage) bizBotSentIds.add(data.idMessage);
-    if (bizBotSentIds.size > 200) {
-      const arr = [...bizBotSentIds];
-      arr.slice(0, 100).forEach(id => bizBotSentIds.delete(id));
+  // נסה BIZ instance קודם, fallback לאינסטנס הרגיל
+  if (BIZ_BASE && BIZ_TOKEN) {
+    try {
+      const res = await fetch(`${BIZ_BASE}/sendMessage/${BIZ_TOKEN}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId: id, message: text }),
+      });
+      const data = await res.json();
+      if (data.idMessage) { bizBotSentIds.add(data.idMessage); return; }
+    } catch (e) {
+      console.error('[biz-send biz-err]', e.message);
     }
-  } catch (e) {
-    console.error('[biz-send err]', e.message);
   }
+  // fallback: שלח דרך האינסטנס הרגיל
+  await sendMessage(id, text);
 }
 
 // ─── שם איש קשר מ-Green API (השם שדני שמר בטלפון) ──────────────
