@@ -273,8 +273,8 @@ def _fmt_grams(food: dict) -> str:
     return f" — {q} גרם"
 
 
-def format_menu(user_id: str, full_name: str) -> str:
-    """מחזיר תפריט מלא של מתאמן כטקסט מפורמט ל-WhatsApp."""
+def format_menu(user_id: str, full_name: str, meal_filter: str = "") -> str:
+    """מחזיר תפריט של מתאמן. meal_filter מסנן לארוחה ספציפית (אופציונלי)."""
     meals = get_user_meals(user_id)
     if not meals:
         return f"❌ לא נמצאו ארוחות עבור {full_name}"
@@ -284,11 +284,19 @@ def format_menu(user_id: str, full_name: str) -> str:
         "ארוחת ערב": "🌙", "ארוחת ביניים": "🍎",
         "ארוחת לילה": "🌙",
     }
+    _MEAL_FILTER_MAP = {
+        "בוקר": "ארוחת בוקר", "צהריים": "ארוחת צהריים", "צהרים": "ארוחת צהריים",
+        "ערב": "ארוחת ערב", "לילה": "ארוחת לילה", "ביניים": "ארוחת ביניים",
+    }
+    _filter_key = _MEAL_FILTER_MAP.get(meal_filter, "")
 
-    lines = [f"📋 תפריט של *{full_name}*:\n"]
+    header = f"📋 תפריט של *{full_name}*" + (f" — {_filter_key or meal_filter}" if meal_filter else "") + ":\n"
+    lines = [header]
     total_calories = 0
 
     for meal in meals:
+        if _filter_key and meal.get("meal_name", "").strip() != _filter_key:
+            continue
         meal_name = meal.get("meal_name", "ארוחה").strip()
         emoji = MEAL_EMOJI.get(meal_name, "🍽")
         meal_cals = meal.get("meal_totals", {}).get("calories") or 0
@@ -412,7 +420,16 @@ def normalize_food_query(q: str) -> str:
 
 # אליאסים: כשמבקשים X, מחפשים Y אלא אם צוין אחרת
 _FOOD_ALIASES: dict[str, str] = {
-    "חזה עוף": "חזה עוף לאחר בישול",
+    "חזה עוף":       "חזה עוף לאחר בישול",
+    "קוואקר":        "שיבולת שועל",
+    "שיבולת":        "שיבולת שועל",
+    "גרנולה":        "שיבולת שועל",
+    "חזה":           "חזה עוף לאחר בישול",
+    "הודו טחון":     "הודו",
+    "בשר טחון":      "בשר בקר",
+    "בשר בקר טחון":  "בשר בקר",
+    "דג":            "סלמון",
+    "סלמון":         "סלמון אטלנטי",
 }
 
 def find_best_food(query: str, coach_id: str = ""):
@@ -552,7 +569,7 @@ def _extract_meal(text: str) -> str:
             return key
     return ""
 
-_VERB_PAT = r"(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להוסיף|להחליף|שימ[יי]?|תשימ[יי]?)"
+_VERB_PAT = r"(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להוסיף|להחליף|שימ[יי]?|תשימ[יי]?|הכנס[יי]?|הכניס)"
 
 def _extract_foods(text: str):
     """מחלץ (מזון_חדש, מזון_קיים) מטקסט. מחזיר (new_food, group_hint)."""
@@ -882,7 +899,7 @@ def parse_message(text: str) -> dict:
     full = re.sub(r'\s+', ' ', full).strip()
 
     _NOT_NAME_VERBS = frozenset({"הוסיף", "הוסיפי", "תוסיפי", "תוסיף", "הוסף",
-                                  "החלף", "תחליפי", "תחליף", "הכנס", "הכניס", "להכניס",
+                                  "החלף", "תחליפי", "תחליף", "הכנס", "הכניס", "הכנסי", "להכניס",
                                   "עדכן", "שנה", "בצע", "שלח", "עשה", "עשי",
                                   "הוציא", "מחק", "הסר", "החליף", "תחליפ",
                                   "ארוחת", "ארוחה", "נוסיף", "נוסיפי",
@@ -939,8 +956,8 @@ def parse_message(text: str) -> dict:
         elif _meal_hits:
             result["meal"] = _meal_hits[0]
 
-    # נקה ביטויי ארוחה לפני חילוץ שם/מזון
-    _meal_re = r'ב(?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b'
+    # נקה ביטויי ארוחה לפני חילוץ שם/מזון — ב/ל prefix ("בצהריים", "לצהריים", "לארוחת בוקר")
+    _meal_re = r'[בל](?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b'
     full_no_meal = re.sub(_meal_re, '', full)
     # גם "+ארוחה" (כמו "+ערב", "+צהריים")
     full_no_meal = re.sub(r'\s*\+\s*(?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
@@ -982,10 +999,25 @@ def parse_message(text: str) -> dict:
             r'^([\u05D0-\u05EA]{2,5})\s+(?:צריך|רוצה|מבקש|מקבל|יצטרך|אוכל)\s+',
             full_no_meal
         )
+        # Fix G: "NAME GRAMS גרם FOOD" — שם בתחילה ישירות לפני גרמים
+        _name_grams = re.match(
+            r'^([א-ת]{2,6})\s+(\d+)\s*גרם\s+',
+            full_no_meal
+        )
         if "name" not in result and _ctx_verb and _ctx_verb.group(1) not in _NOT_NAME_VERBS:
             result["name"] = _ctx_verb.group(1)
             conf = max(conf, 70)
             clean_full = full_no_meal[_ctx_verb.end():]
+            clean_full = re.sub(r'\s+', ' ', clean_full).strip()
+        elif ("name" not in result and _name_grams
+              and _name_grams.group(1) not in _NOT_NAME_VERBS
+              and _name_grams.group(1) not in _FOOD_NOT_SURNAME
+              # אם יש ל+שם אחר בהמשך — הוא השם האמיתי, לא המילה הראשונה
+              and not re.search(r'(?<!\S)ל[א-ת]{2,}', full_no_meal[_name_grams.end():])):
+            result["name"] = _name_grams.group(1)
+            result["extra_grams"] = _name_grams.group(2)
+            conf = max(conf, 65)
+            clean_full = full_no_meal[_name_grams.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
         elif "name" not in result and _pre_sep and all(w not in _NOT_NAME_VERBS for w in _pre_sep.group(1).split()):
             result["name"] = _pre_sep.group(1)
@@ -1098,7 +1130,7 @@ def parse_message(text: str) -> dict:
     if not new_food and ("name" in result or not result.get("change")):
         # fallback: הטקסט שנשאר אחרי הסרת שם+ארוחה = שם המזון
         # מסיר פעלים בתחילה ותווי זבל
-        fb = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|הכנס|שימ[יי]?|תשימ[יי]?|הכניס)(?:\s+|$)', '', clean_full).strip()
+        fb = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|הכנס[יי]?|שימ[יי]?|תשימ[יי]?|הכניס)(?:\s+|$)', '', clean_full).strip()
         fb = re.sub(r'[^א-ת\s\d%\'\"]+', ' ', fb).strip()
         fb = re.sub(r'\s+', ' ', fb).strip()
         if len(fb) >= 2:
@@ -1413,8 +1445,8 @@ def execute_request(request_text: str, force: bool = False,
         new_food_raw = add_match.group(1).strip()
         group_hint_raw = (add_match.group(2) or "").strip() if add_match.lastindex and add_match.lastindex >= 2 else ""
 
-        # ניקוי "בערב/בבוקר/בצהריים" שדלף לשם המזון מטקסט חופשי
-        new_food_raw = re.sub(r'\s*ב(?:ארוחת\s+)?(?:ערב|בוקר|צהריים|ביניים|לילה)\b', '', new_food_raw).strip()
+        # ניקוי "בערב/בבוקר/בצהריים" ו"לערב/לבוקר/לצהריים" שדלפו לשם המזון
+        new_food_raw = re.sub(r'\s*[בל](?:ארוחת\s+)?(?:ערב|בוקר|צהריים|ביניים|לילה)\b', '', new_food_raw).strip()
 
         # חלץ מסוגריים תחילה — כדי שזיהוי הגרמים יעבוד גם על "(50 גרם אורז)"
         paren = re.search(r'\(([^)]+)\)', new_food_raw)
@@ -1625,6 +1657,7 @@ if __name__ == "__main__":
     food_override    = _pop_arg("--food")
     hint_override    = _pop_arg("--hint")
     menu_name        = _pop_arg("--menu")
+    menu_meal        = _pop_arg("--menu-meal")
     user_id_override = _pop_arg("--user-id")
 
     # הגנה: חוסם שימוש במספר טלפון ישראלי כ--name ללא דגל --allow-phone
@@ -1647,10 +1680,10 @@ if __name__ == "__main__":
             parts = [f"⚠️ נמצאו {len(entries)} מתאמנים בשם '{menu_name}':"]
             for eid, ename in entries:
                 parts.append(f"\n🔸 {ename} (ID: {eid}):")
-                parts.append(format_menu(eid, ename))
+                parts.append(format_menu(eid, ename, menu_meal or ""))
             print("\n".join(parts))
             sys.exit(0)
-        print(format_menu(uid, full_name))
+        print(format_menu(uid, full_name, menu_meal or ""))
         sys.exit(0)
 
     if not args:

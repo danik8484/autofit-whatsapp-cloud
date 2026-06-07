@@ -236,9 +236,11 @@ function runAutofit(phone, text, opts = {}) {
 }
 
 // ─── הצגת תפריט מתאמן ────────────────────────────────────────
-function runMenu(phone, name) {
+function runMenu(phone, name, meal = '') {
   const script = path.join(__dirname, 'autofit_api.py');
-  const proc = spawn('python3', [script, '--menu', name]);
+  const args = ['--menu', name];
+  if (meal) { args.push('--menu-meal'); args.push(meal); }
+  const proc = spawn('python3', [script, ...args]);
   let output = '';
   let timedOut = false;
   const killTimer = setTimeout(() => {
@@ -340,13 +342,16 @@ app.post('/webhook', async (req, res) => {
   }
 
   // ─── תפריט ─────────────────────────────────────────────────────
-  // "דני תפריט" / "תפריט דני" — הצג תפריט מלא
-  const menuM = /^([א-׺][א-׺\s'״׳]{1,30})\s+תפריט$/.exec(text.trim()) ||
-                /^תפריט\s+([א-׺][א-׺\s'״׳]{1,30})$/.exec(text.trim());
+  // "דני תפריט" / "תפריט דני" / "תפריט דני בוקר" / "דני תפריט ערב"
+  const _MEAL_KW = '(?:בוקר|צהריים|צהרים|ערב|לילה|ביניים)';
+  const menuM =
+    new RegExp(`^([א-׺][א-׺\\s'״׳]{1,30})\\s+תפריט(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim()) ||
+    new RegExp(`^תפריט\\s+([א-׺][א-׺\\s'״׳]{1,30})(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim());
   if (menuM) {
     const menuName = menuM[1].trim();
-    console.log(`📋 תפריט עבור: "${menuName}"`);
-    runMenu(sender, menuName);
+    const menuMeal = (menuM[2] || '').trim();
+    console.log(`📋 תפריט עבור: "${menuName}"${menuMeal ? ` (${menuMeal})` : ''}`);
+    runMenu(sender, menuName, menuMeal);
     return;
   }
 
@@ -507,10 +512,19 @@ app.post('/webhook', async (req, res) => {
       const prevGramsM = last.text.match(/(\d+)\s*גרם/);
       let newText;
       if (prevGramsM) {
+        // יש גרמים קודמים — חבר אותם
         const newGrams = parseInt(prevGramsM[1]) + addGrams;
         newText = last.text.replace(/\d+\s*גרם/, `${newGrams} גרם`);
       } else {
-        newText = last.text + ` עוד ${addGrams} גרם`;
+        // אין גרמים בפקודה הקודמת (למשל "תוסיפי ביצה לדני") — הוסף לפני שם המזון
+        newText = last.text.replace(
+          /^((?:תוסיפ[יי]?|הוסיפ[יי]?|הוסף)\s+)/,
+          `$1${addGrams} גרם `
+        );
+        if (newText === last.text) {
+          // fallback: הוסף בתחילה
+          newText = `${addGrams} גרם ` + last.text;
+        }
       }
       await sendMessage(sender, '⏳ מבצע...');
       runAutofit(sender, newText, { ...last.opts, force: true });
@@ -534,26 +548,38 @@ app.post('/webhook', async (req, res) => {
   runAutofit(sender, text, _skipPref ? { skipFoodPref: true } : {});
 });
 
-// חילוץ ריבוי שמות מ-"לרון ולדני" / "לרון, דני ומיכל"
+// חילוץ ריבוי שמות מ-"לרון ולדני" / "לרון, לדני" / "לרון ודני"
 function _extractMultiNames(text) {
-  // "לNAME ולNAME" או "לNAME, NAME ומיכל"
-  const m = text.match(/ל([א-ת]{2,}(?:\s+[א-ת]{2,})?)\s+ול([א-ת]{2,}(?:\s+[א-ת]{2,})?)/);
-  if (m) {
-    const names = [m[1].trim(), m[2].trim()];
-    // בדוק אם יש שם שלישי: "לרון ולדני ולמיכל"
-    const thirdM = text.slice(text.indexOf(m[0]) + m[0].length).match(/^\s+ול([א-ת]{2,}(?:\s+[א-ת]{2,})?)/);
-    if (thirdM) names.push(thirdM[1].trim());
-    return names;
+  const NAME = '[א-ת]{2,}(?:\\s+[א-ת]{2,})?';
+  const names = [];
+
+  // "לNAME ולNAME [ולNAME...]"
+  const m1 = text.match(new RegExp(`ל(${NAME})(?:\\s+ול(${NAME}))+`));
+  if (m1) {
+    // חלץ את כל ה-"ל+שם" ברצף
+    const segment = m1[0];
+    const parts = segment.match(new RegExp(`ל(${NAME})`, 'g')) || [];
+    parts.forEach(p => names.push(p.replace(/^ל/, '').trim()));
+    if (names.length >= 2) return names;
   }
+
+  // "לNAME, לNAME" (פסיק)
+  const m2 = text.match(new RegExp(`ל(${NAME}),\\s*ל(${NAME})`));
+  if (m2) return [m2[1].trim(), m2[2].trim()];
+
+  // "לNAME ודNAME" — ו' ישירה ללא ל' שני (פחות נפוץ)
+  const m3 = text.match(new RegExp(`ל(${NAME})\\s+ו(${NAME})\\s+`));
+  if (m3) return [m3[1].trim(), m3[2].trim()];
+
   return null;
 }
 
-// הסרת "לNAME ולNAME" מתחילת המשפט — מחזיר את שאר הטקסט
+// הסרת ריבוי שמות מהטקסט, השארת שאר הפקודה
 function _stripMultiNamesPrefix(text, names) {
-  // החלף "לNAME ולNAME ..." בתחילת הטקסט בהסרת השמות
   let result = text;
-  result = result.replace(/ל[א-ת]{2,}(?:\s+[א-ת]{2,})?\s+(?:ול[א-ת]{2,}(?:\s+[א-ת]{2,})?\s*)+/g, '');
-  result = result.replace(/^(?:תוסיפ[יי]?|הוסיפ[יי]?|הוסף)\s+/, ''); // הסר פועל מהתחלה אם נשאר
+  // הסר את כל "ל+שם" patterns
+  result = result.replace(/ל[א-ת]{2,}(?:\s+[א-ת]{2,})?\s*(?:,\s*|(?:ו(?=ל)))/g, '');
+  result = result.replace(/^(?:תוסיפ[יי]?|הוסיפ[יי]?|הוסף)\s+/, '');
   return result.trim() || text;
 }
 
