@@ -328,9 +328,11 @@ app.post('/webhook', async (req, res) => {
     if (outChatId.includes('@g.us')) return; // דלג קבוצות
     const BIZ_TEST_PHONE = process.env.BIZ_TEST_PHONE;
     if (BIZ_TEST_PHONE) {
+      const allowed = BIZ_TEST_PHONE.split(',').map(p => p.trim()).filter(Boolean);
       const ph = outChatId.replace('@c.us','').replace(/^972/,'0');
       const phAlt = outChatId.replace('@c.us','');
-      if (ph !== BIZ_TEST_PHONE && phAlt !== BIZ_TEST_PHONE && phAlt !== '972'+BIZ_TEST_PHONE.replace(/^0/,'')) return;
+      const isAllowed = allowed.some(a => ph === a || phAlt === a || phAlt === '972'+a.replace(/^0/,''));
+      if (!isAllowed) return;
     }
     if (!hasTriggerWord(outText)) return;
     // קבל שם איש קשר: אם ה-webhook לא כולל chatName (כגון polling) — שאל GreenAPI
