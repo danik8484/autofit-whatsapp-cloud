@@ -65,12 +65,21 @@ loadPrefs();
 async function sendMessage(phone, text) {
   const chatId = phone.includes('@') ? phone : `${phone}@c.us`;
   const body = JSON.stringify({ chatId, message: text });
-  const res = await fetch(`${BASE}/sendMessage/${TOKEN}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-  });
-  return res.ok;
+  try {
+    const res = await fetch(`${BASE}/sendMessage/${TOKEN}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.error(`[sendMessage] FAILED ${res.status} to ${chatId}: ${errBody.slice(0,100)}`);
+    }
+    return res.ok;
+  } catch (e) {
+    console.error(`[sendMessage] EXCEPTION to ${chatId}: ${e.message}`);
+    return false;
+  }
 }
 
 // תיקונים ממתינים: phone → { type, originalText, alternatives, timestamp }
@@ -257,6 +266,35 @@ function runMenu(phone, name, meal = '') {
   });
 }
 
+// ─── "לכולם" — הרצת פקודה על כל הלקוחות ────────────────────────────────────
+function getAllClientNames() {
+  return new Promise((resolve) => {
+    const script = path.join(__dirname, 'autofit_api.py');
+    const proc = spawn('python3', [script, '--list-users']);
+    let output = '';
+    proc.stdout.on('data', d => { output += d.toString(); });
+    proc.on('close', () => {
+      const names = output.split('\n').map(n => n.trim()).filter(n => n.length >= 2);
+      resolve(names);
+    });
+    proc.on('error', () => resolve([]));
+    setTimeout(() => { proc.kill(); resolve([]); }, 15000);
+  });
+}
+
+async function runForAllClients(phone, baseText) {
+  const names = await getAllClientNames();
+  if (!names.length) {
+    await sendMessage(phone, '❌ לא הצלחתי לטעון רשימת לקוחות.');
+    return;
+  }
+  await sendMessage(phone, `⏳ מבצע עבור ${names.length} לקוחות...`);
+  for (const name of names) {
+    await new Promise(resolve => setTimeout(resolve, 300)); // throttle
+    runAutofit(phone, baseText, { nameOverride: name, force: true });
+  }
+}
+
 // ─── Webhook מ-Green API ──────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -342,11 +380,16 @@ app.post('/webhook', async (req, res) => {
   }
 
   // ─── תפריט ─────────────────────────────────────────────────────
-  // "דני תפריט" / "תפריט דני" / "תפריט דני בוקר" / "דני תפריט ערב"
+  // "דני תפריט" / "תפריט דני" / "מה יש לדני בבוקר?" / "תראי לי את התפריט של דני"
   const _MEAL_KW = '(?:בוקר|צהריים|צהרים|ערב|לילה|ביניים)';
+  const _HEB_NAME = `[א-׺][א-׺\\s'״׳]{1,30}`;
   const menuM =
-    new RegExp(`^([א-׺][א-׺\\s'״׳]{1,30})\\s+תפריט(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim()) ||
-    new RegExp(`^תפריט\\s+([א-׺][א-׺\\s'״׳]{1,30})(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim());
+    new RegExp(`^(${_HEB_NAME})\\s+תפריט(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim()) ||
+    new RegExp(`^תפריט\\s+(${_HEB_NAME})(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim()) ||
+    // "מה יש לדני?" / "מה יש לדני בבוקר?"
+    new RegExp(`^מה\\s+(?:יש|אוכל)\\s+ל(${_HEB_NAME})(?:\\s+ב(${_MEAL_KW}))?\\??$`).exec(text.trim()) ||
+    // "תראי לי את התפריט של דני" / "תראי לי את התפריט של דני בערב"
+    new RegExp(`^(?:תראי?|הראי?)\\s+(?:לי\\s+)?(?:את\\s+)?(?:ה)?תפריט\\s+(?:של\\s+)?(${_HEB_NAME})(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim());
   if (menuM) {
     const menuName = menuM[1].trim();
     const menuMeal = (menuM[2] || '').trim();
@@ -531,6 +574,37 @@ app.post('/webhook', async (req, res) => {
     } else {
       await sendMessage(sender, 'אין פקודה קודמת — שלח פקודה מלאה.');
     }
+    return;
+  }
+
+  // ── "ממנו/מזה X גרם" — כינוי לאחרון מזון שהופעל ──────────────────────────
+  const _pronounM = /^(?:(?:תוסיפ[יי]?|הוסיפ[יי]?|הוסף|תחסר[יי]?|תורידי?|הורד)\s+)?(?:ממנו|מזה|ממנה)\s+(\d+)\s*גרם$/.exec(text.trim());
+  if (_pronounM) {
+    const last = lastCommands.get(sender);
+    if (last) {
+      const foodM = last.text.match(/(\d+)\s*גרם\s+(.+?)(?:\s+ב(?:מקום|וקר|ערב|צהריים|ביניים|לילה)|$)/);
+      const lastFood = foodM ? foodM[2].trim() : null;
+      if (lastFood) {
+        const pronGrams = _pronounM[1];
+        // קבע פועל לפי הקשר: "תחסרי/תורידי" = reduce, אחרת = הוסף
+        const isReduce = /(?:תחסר[יי]?|תורידי?|הורד)/.test(text.trim());
+        const verb = isReduce ? 'תחסרי' : 'תוסיפי';
+        const nameM = last.text.match(/ל([א-ת]{2,})/);
+        const namePrefix = nameM ? ` ל${nameM[1]}` : '';
+        const newText = `${verb}${namePrefix} ${pronGrams} גרם ${lastFood}`;
+        await sendMessage(sender, '⏳ מבצע...');
+        runAutofit(sender, newText, { ...last.opts, force: true });
+        return;
+      }
+    }
+    await sendMessage(sender, 'לא זוכר איזה מזון היה בפקודה הקודמת.');
+    return;
+  }
+
+  // ── "לכולם" — פקודה לכל הלקוחות ──────────────────────────────────────────
+  if (/\bלכולם\b/.test(text)) {
+    const baseText = text.replace(/\s*לכולם\s*/g, ' ').trim();
+    runForAllClients(sender, baseText);
     return;
   }
 
