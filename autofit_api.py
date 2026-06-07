@@ -151,7 +151,8 @@ def find_user(query: str):
                     pass
             for u in _phone_users:
                 u_phone = _to_il(_phone_norm(u.get("phone", "")))
-                if u_phone and (u_phone == clean_il or u_phone == clean):
+                _clean_9 = clean_il[1:] if (clean_il.startswith('0') and len(clean_il) == 10) else clean_il
+                if u_phone and (u_phone == clean_il or u_phone == clean or u_phone == _clean_9):
                     uid = str(u["id"])
                     full_name = (u.get("name") or f"{u.get('first_name','')} {u.get('last_name','')}").strip()
                     _uid_cache[query] = (uid, full_name, False)
@@ -620,6 +621,22 @@ _COMMON_SURNAMES = frozenset({
     'רוזנברג', 'זינגר', 'שלזינגר', 'ויינשטיין', 'ליבוביץ', 'כהנמן',
 })
 _SURNAME_SUFFIXES = ('ביץ', 'ייץ', 'ניץ', 'מן', 'שטיין', 'ניק', 'ובי', 'ייב', 'נקל', 'רגר', 'ברג')
+# Auto-populate surnames from user cache (runs once at import)
+_FOOD_NOT_SURNAME = frozenset({
+    'סלמון', 'טונה', 'אורז', 'פסטה', 'גבינה', 'חזה', 'עוף', 'ביצה', 'ביצים',
+    'בטטה', 'שיבולת', 'שועל', 'קוואקר', 'לחם', 'בשר', 'הודו', 'דג', 'יוגורט',
+    'קוטג', 'שקדים', 'אגוזים', 'חומוס', 'עדשים', 'אבוקדו', 'בננה', 'תפוח',
+})
+try:
+    _db_cache_data = json.loads(USER_CACHE_FILE.read_text(encoding="utf-8"))
+    _COMMON_SURNAMES = _COMMON_SURNAMES | frozenset(
+        w for u in _db_cache_data.get("users", [])
+        for w in (u.get("name") or "").split()[1:]
+        if w and len(w) >= 3 and re.match(r'^[א-ת]+$', w) and w not in _FOOD_NOT_SURNAME
+    )
+    del _db_cache_data
+except Exception:
+    pass
 
 def _looks_like_surname(word: str) -> bool:
     """בודק אם מילה עשויה להיות שם משפחה (לעומת שם מזון)."""
@@ -940,26 +957,34 @@ def parse_message(text: str) -> dict:
         _name_cut_end = 0
         _NAME_STOP = r'(?:במקום|בנוסף|כאופציה|כתחליף|ובמקום|אופציה)\b'
 
+        # Detect ל + phone number (e.g., ל0546739981)
+        _phone_lm = re.search(r'(?<!\S)ל(05\d{8})\b', full_no_meal)
+        if _phone_lm:
+            result["name"] = _phone_lm.group(1)
+            full_no_meal = full_no_meal[:_phone_lm.start()] + full_no_meal[_phone_lm.end():]
+            full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
+            clean_full = full_no_meal  # phone path: skip name-finding blocks
+
         # Fix C: שם לפני מפריד בתחילת משפט ("דני - תוסיפי X" / "רון וליצקו: X")
         _pre_sep = re.match(
-            r'^([\u05D0-\u05EA]{2,}(?:\s+[\u05D0-\u05EA]{2,})?)\s*[-:–]\s*', full_no_meal
+            r'^([\u05D0-\u05EA\u05F3\u0027]{2,}(?:\s+[\u05D0-\u05EA\u05F3\u0027]{2,}){0,2})\s*[-:–]\s*', full_no_meal
         )
         # Fix E: "NAME צריך/רוצה/מבקש X" — שם בתחילה לפני פועל הקשר
         _ctx_verb = re.match(
             r'^([\u05D0-\u05EA]{2,5})\s+(?:צריך|רוצה|מבקש|מקבל|יצטרך|אוכל)\s+',
             full_no_meal
         )
-        if _ctx_verb and _ctx_verb.group(1) not in _NOT_NAME_VERBS:
+        if "name" not in result and _ctx_verb and _ctx_verb.group(1) not in _NOT_NAME_VERBS:
             result["name"] = _ctx_verb.group(1)
             conf = max(conf, 70)
             clean_full = full_no_meal[_ctx_verb.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-        elif _pre_sep and all(w not in _NOT_NAME_VERBS for w in _pre_sep.group(1).split()):
+        elif "name" not in result and _pre_sep and all(w not in _NOT_NAME_VERBS for w in _pre_sep.group(1).split()):
             result["name"] = _pre_sep.group(1)
             conf = max(conf, 75)
             clean_full = full_no_meal[_pre_sep.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-        else:
+        elif "name" not in result:
             for _m in re.finditer(
                 r"(?:(?<!\S)של\s+|(?<!\S)עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+(?!" + _NAME_STOP + r")[\u05D0-\u05EA]{2,})?)",
                 full_no_meal,
@@ -978,8 +1003,8 @@ def parse_message(text: str) -> dict:
                     if len(words) >= 2 and words[1] in _NOT_NAME_VERBS:
                         # words[1] הוא פועל — בדוק אם יש שם אדם אחרי הפועל
                         _after_verb = full_no_meal[_m.start(1) + len(words[0]) + 1 + len(words[1]):].strip()
-                        if re.search(r'(?<!\S)ל(?=[\u05D0-\u05EA])', _after_verb):
-                            continue  # יש "לX" אחרי הפועל — זה עצם (מזון), לא שם אדם
+                        if re.match(r'ל(?=[א-ת])', _after_verb.strip()):
+                            continue  # יש "לX" אחרי הפועל ישירות — זה עצם (מזון), לא שם אדם
                         result["name"] = words[0]
                         _name_cut_end = _m.start(1) + len(words[0])
                     elif len(words) >= 2 and not _looks_like_surname(words[1]):
@@ -1341,7 +1366,7 @@ def execute_request(request_text: str, force: bool = False,
         return f"NAME_NOT_FOUND:{name}"
     # safety: אם עדיין fuzzy אחרי name_override — שלח שגיאה
     if is_fuzzy and name_override and name_override == name:
-        return f"❌ לא מצאתי '{name}' בדיוק — שלח שם מלא."
+        return f"NAME_NOT_FOUND:{name}"
 
     # קבל ארוחות (פעם אחת)
     all_meals = get_user_meals(user_id)
