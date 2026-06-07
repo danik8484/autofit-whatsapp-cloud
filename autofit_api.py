@@ -716,7 +716,9 @@ def parse_message(text: str) -> dict:
         text
     )
     text = re.sub(r'מחליף\s+ל[כךו]', 'הוסף', text)  # fallback: מחליף ללא "ב"
-    text = re.sub(r'(?:מוריד\s+ל[כךו]|מפחית)', 'הפחת', text)
+    # V3: "N גרם לFOOD" → "N גרם FOOD" (ל as preposition, 3+ chars after ל = definitely not לחם)
+    text = re.sub(r'(\d+\s*גרם\s+)ל([\u05D0-\u05EA]{3,})', r'\1\2', text)
+    text = re.sub(r'(?:מוריד\s+ל[כךו]|מפחית(?:\s+ל[כךו])?)', 'הפחת', text)
     text = re.sub(r'מעלה\s+ל[כךו]', 'העלה', text)
 
     # ── pre-process: נרמול רווחים לפני נקודותיים בשמות שדות ─────────────────
@@ -829,7 +831,7 @@ def parse_message(text: str) -> dict:
                 else:
                     m_gs = re.match(r'^(\d+)\s*גרם\s+מה?\s*', v)  # "50 גרם מ/מה-FOOD" (reduce)
                     if not m_gs:
-                        m_gs = re.match(r'^(\d+)\s*גרם\s+ל?\s*', v)  # "50 גרם [ל]אורז"
+                        m_gs = re.match(r'^(\d+)\s*גרם\s+(?:ל(?=[\u05D0-\u05EA]{3,}))?\s*', v)  # "50 גרם [ל]אורז"
                     if m_gs:
                         extra_grams = m_gs.group(1)
                         v = v[m_gs.end():].strip()
@@ -1068,12 +1070,13 @@ def parse_message(text: str) -> dict:
                 # ל + פועל + לשם: "להוסיף לדני" — חלץ שם מ-words[1]
                 if len(words) >= 2 and words[0] in _NOT_NAME_VERBS and words[1][:1] == '\u05DC' and len(words[1]) >= 3:
                     _cand = words[1][1:]  # הסר ל' prefix
-                    if _cand not in _NOT_NAME_VERBS:
+                    if len(_cand) >= 3 and _cand not in _NOT_NAME_VERBS:
                         result["name"] = _cand
                         _name_cut_end = _m.start(1) + len(words[0]) + 1 + len(words[1])
                         name_match = _m
                         break
-                if words[0] not in _NOT_NAME_VERBS:
+                if (words[0] not in _NOT_NAME_VERBS and words[0] not in _FOOD_NOT_SURNAME
+                        and _m.group(0).strip() not in _FOOD_NOT_SURNAME):
                     # בדוק: אם אחרי ה"שם" יש פועל ואחריו ל-שם נוסף — זה עצם, לא שם אדם
                     if len(words) >= 2 and words[1] in _NOT_NAME_VERBS:
                         # words[1] הוא פועל — בדוק אם יש שם אדם אחרי הפועל
@@ -1176,7 +1179,7 @@ def parse_message(text: str) -> dict:
             fb = re.sub(r'^(?:נוסיף|נוסיפי|להוסיף|להכניס|הכניס|הכנס)\s+', '', fb)
             fb = fb.strip()
             # extra_grams: "50 גרם לAFOOD"
-            gm = re.match(r'^(\d+)\s*גרם\s+ל?\s*', fb)
+            gm = re.match(r'^(\d+)\s*גרם\s+(?:ל(?=[\u05D0-\u05EA]{3,}))?\s*', fb)
             if gm:
                 result["extra_grams"] = gm.group(1)
                 fb = fb[gm.end():].strip()
@@ -1510,7 +1513,7 @@ def execute_request(request_text: str, force: bool = False,
             extra_grams = grams_in_food.group(1)
             new_food_clean = re.sub(r'\bעוד\s+\d+\s*גרם\s*', '', new_food_clean).strip()
         elif not extra_grams:
-            m_gs2 = re.match(r'^(\d+)\s*גרם\s+ל?\s*', new_food_clean)  # "50 גרם [ל]אורז"
+            m_gs2 = re.match(r'^(\d+)\s*גרם\s+(?:ל(?=[\u05D0-\u05EA]{3,}))?\s*', new_food_clean)  # "50 גרם [ל]אורז"
             if m_gs2:
                 extra_grams = m_gs2.group(1)
                 new_food_clean = new_food_clean[m_gs2.end():].strip()
