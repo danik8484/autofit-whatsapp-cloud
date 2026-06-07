@@ -734,6 +734,43 @@ def _strip_definite_article(s: str) -> str:
     ) if s else s
 
 
+def _detect_multi_food(text: str):
+    """
+    "50 גרם X ו-30 גרם Y" → [("X","50"),("Y","30")]
+    Only triggers when ו- (with dash) is followed by a digit, or comma between qty+food pairs.
+    Returns None for single-food text.
+    """
+    _UNIT_PAT = r'(?:גרם|יח\'?|כף(?:ות)?|כפיות?|כוס|מנות?)'
+
+    def _parse_part(part):
+        part = part.strip()
+        m = re.match(r'^(\d+)\s*' + _UNIT_PAT + r'\s+(.+)$', part)
+        if m:
+            return m.group(2).strip(), m.group(1)
+        m2 = re.search(r'^(.+?)\s+(\d+)\s*' + _UNIT_PAT + r'\s*$', part)
+        if m2:
+            return m2.group(1).strip(), m2.group(2)
+        if re.search(r'[א-ת]', part):
+            return part, None
+        return None, None
+
+    # ו- with dash — require second part starts with digit
+    raw = re.split(r'\s+ו-\s*', text.strip())
+    if len(raw) >= 2 and re.match(r'^\d', raw[1].strip()):
+        parts = [_parse_part(p) for p in raw]
+        if all(f for f, _ in parts):
+            return parts
+
+    # Comma — require ALL parts start with digit (qty, food qty food)
+    raw_c = [p.strip() for p in re.split(r'\s*,\s*', text.strip()) if p.strip()]
+    if len(raw_c) >= 2 and all(re.match(r'^\d', p) for p in raw_c):
+        parts = [_parse_part(p) for p in raw_c]
+        if all(f for f, _ in parts):
+            return parts
+
+    return None
+
+
 def _convert_heb_numbers(text: str) -> str:
     """ממיר מספרים עבריים לספרות לפני פרסינג: 'מאה גרם' → '100 גרם', 'חמישים' → '50'."""
     _TENS = {
@@ -1075,9 +1112,10 @@ def parse_message(text: str) -> dict:
         full_no_meal = re.sub(_bare_meal_re, ' ', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
     # נרמול מוקדם לפני חיפוש שמות — מונע "ל+מזון" אחרי מילות תחליף מלהיות שם אדם
-    full_no_meal = re.sub(r'אופציה\s+של\s+', '', full_no_meal)
     full_no_meal = re.sub(r'כתחליף\s+ל', 'במקום ', full_no_meal)
-    full_no_meal = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)', 'במקום ', full_no_meal)
+    full_no_meal = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)\s*', 'במקום ', full_no_meal)
+    full_no_meal = re.sub(r'באופצי(?:ה|ות)?\s+של\s*ה?', 'במקום ', full_no_meal)  # V3: "באופציה של X"
+    full_no_meal = re.sub(r'אופציה\s+של\s+', '', full_no_meal)  # standalone — לאחר כ/ב כבר טופלו
     full_no_meal = re.sub(r'כאופציות\b', '', full_no_meal)  # כאופציות ללא ל/של = מחיקה
     full_no_meal = re.sub(r'בנוסף\s+ל-?', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
@@ -1267,6 +1305,35 @@ def parse_message(text: str) -> dict:
     if _hint_pre:
         _pre_hint_word = _hint_pre.group(1)
         clean_full = clean_full[_hint_pre.end():].strip() + f' במקום {_pre_hint_word}'
+
+    # ── ריבוי מזונות: "50 גרם X ו-30 גרם Y" → multi ops ───────────────────
+    if not result.get("ops") and not result.get("change"):
+        # strip leading verb — may be present when name came from "לNAME" pattern
+        _cf_for_multi = re.sub(r'^(?:' + _VERB_PAT + r')\s+', '', clean_full).strip()
+        _mf = _detect_multi_food(_cf_for_multi)
+        if _mf and len(_mf) >= 2:
+            _mf_meal = result.get("meal") or _extract_meal(full) or "ערב"
+            result.setdefault("meal", _mf_meal)
+            # first food qty may have been consumed by _name_grams into result["extra_grams"]
+            _pre_grams = result.pop("extra_grams", None)
+            result["ops"] = []
+            for _mfi, (_mf_food, _mf_grams) in enumerate(_mf):
+                _mf_food = _strip_definite_article(_mf_food.strip())
+                _mf_op: dict = {"change": f"הוסף ({_mf_food})", "meal": _mf_meal}
+                _qty = _mf_grams or (_pre_grams if _mfi == 0 else None)
+                if _qty:
+                    _mf_op["extra_grams"] = _qty
+                if _reduce:
+                    _mf_op["reduce"] = True
+                result["ops"].append(_mf_op)
+            result["change"] = result["ops"][0]["change"]
+            result.setdefault("meal", "ערב")
+            result["confidence"] = conf
+            if _force_new:
+                result["force_new"] = True
+            if _reduce:
+                result["reduce"] = True
+            return result
 
     # מזון — על הטקסט ללא השם
     new_food, group_hint = _extract_foods(clean_full)
