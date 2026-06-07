@@ -748,6 +748,14 @@ app.post('/webhook-business', async (req, res) => {
   if (body.typeWebhook !== 'outgoingMessageReceived') return;
   if (chatId.includes('@g.us')) return; // דלג על קבוצות
 
+  // מצב ניסוי: עבד רק מסרים לטלפון הזה
+  const BIZ_TEST_PHONE = process.env.BIZ_TEST_PHONE; // ריק = כולם
+  if (BIZ_TEST_PHONE) {
+    const phone = chatId.replace('@c.us', '').replace(/^972/, '0');
+    const phoneAlt = chatId.replace('@c.us', '');
+    if (phone !== BIZ_TEST_PHONE && phoneAlt !== BIZ_TEST_PHONE && phoneAlt !== '972' + BIZ_TEST_PHONE.replace(/^0/, '')) return;
+  }
+
   // בדוק מילות מפתח
   if (!hasTriggerWord(text)) return;
 
