@@ -800,6 +800,16 @@ app.post('/webhook-business', async (req, res) => {
   runAutofitBiz(contactName, clientPhone, text, extraOpts);
 });
 
+// ─── Debug env ────────────────────────────────────────────────
+app.get('/debug-env', (_, res) => {
+  res.json({
+    BIZ_GROUP: process.env.NOTIFY_GROUP_CHAT_ID || 'NOT SET',
+    BIZ_TEST_PHONE: process.env.BIZ_TEST_PHONE || 'NOT SET',
+    BIZ_ID: process.env.GREEN_API_ID_BIZ || 'NOT SET',
+    REG_ID: process.env.GREEN_API_ID || 'SET',
+  });
+});
+
 // ─── Debug BIZ webhooks ────────────────────────────────────────
 app.get('/debug-biz', (_, res) => {
   const entries = bizDebugLog.slice(-10).reverse().map(e => ({
