@@ -57,13 +57,19 @@ def _headers() -> dict:
         "Accept-Language": "he",
     }
 
-def _post(path: str, body: dict) -> dict:
+def _post(path: str, body: dict, _retry: int = 0) -> dict:
     r = requests.post(f"{BACKEND}{path}", json=body, headers=_headers(), timeout=15)
+    if r.status_code == 429 and _retry < 3:
+        time.sleep(2 ** _retry)
+        return _post(path, body, _retry + 1)
     r.raise_for_status()
     return r.json()
 
-def _get(path: str, params: dict = None) -> dict:
+def _get(path: str, params: dict = None, _retry: int = 0) -> dict:
     r = requests.get(f"{BACKEND}{path}", params=params, headers=_headers(), timeout=15)
+    if r.status_code == 429 and _retry < 3:
+        time.sleep(2 ** _retry)
+        return _get(path, params, _retry + 1)
     r.raise_for_status()
     return r.json()
 
@@ -203,18 +209,33 @@ def find_user(query: str):
 
     terms_norm = [_ng(t) for t in terms]
 
-    # pass 1: כל מילות השאילתה נמצאות בשם
-    # אם שאילתה קצרה מהשם המלא → is_fuzzy=True (שם חלקי → שאל אישור)
-    exact_matches = []   # כל ההתאמות המדויקות
-    partial_match = None # מספר מילים פחות — התאמה חלקית
-    for u in all_users:
-        full_name = _full(u)
-        name_words_norm = [_ng(w) for w in full_name.split()]
-        if all(nt in name_words_norm for nt in terms_norm):
-            if len(terms) == len(full_name.split()):
-                exact_matches.append((str(u["id"]), full_name))
-            elif partial_match is None:
-                partial_match = (str(u["id"]), full_name)
+    def _pass1_search(tlist: list[str]):
+        """pass 1 על רשימת מילים נתונה — מחזיר (exact_list, partial_or_None)."""
+        tn = [_ng(t) for t in tlist]
+        exacts, partial = [], None
+        for u in all_users:
+            fn = _full(u)
+            nwn = [_ng(w) for w in fn.split()]
+            if all(t in nwn for t in tn):
+                if len(tlist) == len(fn.split()):
+                    exacts.append((str(u["id"]), fn))
+                elif partial is None:
+                    partial = (str(u["id"]), fn)
+        return exacts, partial
+
+    def _vav_variants(tlist: list[str]) -> list[list[str]]:
+        """וריאציות ו׳ חיבור לכל מילה שאינה ראשונה: מוסיף/מוריד ו׳ בתחילת המילה."""
+        variants = []
+        for i in range(1, len(tlist)):
+            w = tlist[i]
+            if w.startswith('ו') and len(w) > 1:
+                variants.append(tlist[:i] + [w[1:]] + tlist[i+1:])   # הסר ו (וליצקו→ליצקו)
+            else:
+                variants.append(tlist[:i] + ['ו' + w] + tlist[i+1:]) # הוסף ו (ליצקו→וליצקו)
+        return variants
+
+    # pass 1: כל מילות השאילתה נמצאות בשם (התאמה מדויקת)
+    exact_matches, partial_match = _pass1_search(terms)
 
     if len(exact_matches) == 1:
         uid, full_name = exact_matches[0]
@@ -223,9 +244,26 @@ def find_user(query: str):
     if len(exact_matches) > 1:
         encoded = ";".join(f"{uid}|{name}" for uid, name in exact_matches)
         return "MULTIPLE", encoded, False
+
+    # pass 1.5: ו׳ חיבור — נסה גם עם וגם בלי ו׳ לכל מילה שאינה ראשונה
+    # "רון ליצקו" → "רון וליצקו" | "רון וליצקו" → "רון ליצקו"
+    # התאמה כאן = ודאי (is_fuzzy=False), ללא שאלת אישור
+    if len(terms) > 1:
+        for vt in _vav_variants(terms):
+            v_exact, v_partial = _pass1_search(vt)
+            if len(v_exact) == 1:
+                uid, full_name = v_exact[0]
+                _uid_cache[query] = (uid, full_name, False)
+                return uid, full_name, False
+            if len(v_exact) > 1:
+                encoded = ";".join(f"{uid}|{name}" for uid, name in v_exact)
+                return "MULTIPLE", encoded, False
+            if v_partial and partial_match is None:
+                partial_match = v_partial
+
     if partial_match:
         uid, full_name = partial_match
-        _uid_cache[query] = (uid, full_name, True)  # שם חלקי → תמיד שאל
+        _uid_cache[query] = (uid, full_name, True)
         return uid, full_name, True
 
     # pass 2 (legacy fallback — נדיר אחרי pass 1 המשופר)
@@ -239,13 +277,17 @@ def find_user(query: str):
                 return uid, full_name, True
 
     # pass 3: חיפוש עמום (Levenshtein) — מוצא גם עם טעויות כתיב
+    # מנסה גם וריאציות ו׳ חיבור כדי להגביר סיכוי מציאה
     best_uid, best_name, best_score = None, None, 999
-    for u in all_users:
-        full_name = u.get("name") or f"{u.get('first_name','')} {u.get('last_name','')}".strip()
-        if _fuzzy_name_match(query, full_name):
-            score = sum(min(_levenshtein(qw, nw) for nw in full_name.split()) for qw in terms)
-            if score < best_score:
-                best_score, best_uid, best_name = score, str(u["id"]), full_name
+    all_variants = [terms] + (_vav_variants(terms) if len(terms) > 1 else [])
+    for vt in all_variants:
+        vq = " ".join(vt)
+        for u in all_users:
+            full_name = u.get("name") or f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+            if _fuzzy_name_match(vq, full_name):
+                score = sum(min(_levenshtein(qw, nw) for nw in full_name.split()) for qw in vt)
+                if score < best_score:
+                    best_score, best_uid, best_name = score, str(u["id"]), full_name
 
     if best_uid:
         _uid_cache[query] = (best_uid, best_name, True)
@@ -1026,6 +1068,28 @@ def parse_message(text: str) -> dict:
     full_no_meal = re.sub(r'בנוסף\s+ל', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
 
+    # ── V3: חילוץ שם לפני הלוגיקה הכללית ────────────────────────────────────
+    if _v3_triggered and "name" not in result:
+        # Fix A: VERB NAME N גרם — שם ישיר לפני גרמים (כולל שמות שמתחילים בל)
+        _v3_d = re.match(r'^(?:הוסף|הפחת|העלה)\s+([א-ת]{2,8})\s+(?=\d)', full_no_meal)
+        if _v3_d:
+            _cand = _v3_d.group(1)
+            if _cand not in _NOT_NAME_VERBS and _cand not in _FOOD_NOT_SURNAME:
+                result["name"] = _cand
+                conf = max(conf, 80)
+                full_no_meal = (full_no_meal[:_v3_d.start(1)] + full_no_meal[_v3_d.end():])
+                full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
+    if _v3_triggered and "name" not in result:
+        # Fix C: "במקום NAME FOOD" — שם לפני מזון מוחלף (מחליף לו NAME FOOD בNEW)
+        _v3_bk = re.search(r'במקום\s+([א-ת]{2,8})\s+([א-ת]{2,8})', full_no_meal)
+        if _v3_bk:
+            _w1 = _v3_bk.group(1)
+            if _w1 not in _NOT_NAME_VERBS and _w1 not in _FOOD_NOT_SURNAME:
+                result["name"] = _w1
+                conf = max(conf, 80)
+                full_no_meal = (full_no_meal[:_v3_bk.start(1)] + full_no_meal[_v3_bk.end(1):])
+                full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
+
     if "name" not in result:
         name_match = None
         _name_cut_end = 0
@@ -1049,7 +1113,9 @@ def parse_message(text: str) -> dict:
             full_no_meal
         )
         # Fix G: "NAME GRAMS גרם FOOD" — שם בתחילה ישירות לפני גרמים
+        # V3: לא מסיר ל' מהשם (ל' חלק מהשם, כגון ליצקו); V1/V2: מסיר ל' מוביל
         _name_grams = re.match(
+            r'^([א-ת]{2,8})\s+(\d+)\s*גרם\s+' if _v3_triggered else
             r'^ל?([א-ת]{2,6})\s+(\d+)\s*גרם\s+',
             full_no_meal
         )
@@ -1161,6 +1227,9 @@ def parse_message(text: str) -> dict:
     clean_full = re.sub(r'כאופציות\b', '', clean_full)  # כאופציות ללא ל/של = מחיקה
     clean_full = re.sub(r'כתחליף\s+ל', 'במקום ', clean_full)
     clean_full = re.sub(r'בנוסף\s+ל', 'במקום ', clean_full)
+    # "תחליפי X ב-Y" → "X במקום Y"  (ב = אינדיקטור להחלפה, לא מיקום)
+    if re.search(r'(?:תחליפ[יה]|החלפ[יה]?|להחליף|שנ[הו]ת?)\b', text) and 'במקום' not in clean_full:
+        clean_full = re.sub(r"(?<=[א-ת%'׳\"])\s+ב([א-ת])", r' במקום \1', clean_full)
     clean_full = re.sub(r'אופציה\s+של\s+', '', clean_full)     # "אופציה של X" → "X"
     clean_full = re.sub(r'אופציה\s+לתחליף\s+', '', clean_full) # "אופציה לתחליף X" → "X"
     clean_full = re.sub(r'תחליף\s+של\s+', '', clean_full)       # "תחליף של X" → "X"
@@ -1741,6 +1810,18 @@ if __name__ == "__main__":
         print(f"⛔ BLOCKED: --name '{name_override}' נראה כמו מספר טלפון ישראלי.")
         print("   הוסף --allow-phone אם אתה בטוח שאתה רוצה לפעול על משתמש זה.")
         _sys.exit(1)
+
+    if find_user_query:
+        # בדוק אם query הוא שם פרטי עצמאי (= מתחיל את השם המלא של לקוח קיים)
+        uid, full_name, _ = find_user(find_user_query)
+        if uid and uid != "MULTIPLE" and full_name:
+            norm_full = re.sub(r"[׳״\']", "", (full_name or "").strip())
+            norm_q    = re.sub(r"[׳״\']", "", find_user_query.strip())
+            # FOUND רק אם השם המלא מתחיל ב-query = query הוא שם פרטי, לא שם משפחה
+            print("FOUND" if norm_full.lower().startswith(norm_q.lower()) else "NOT_FOUND")
+        else:
+            print("NOT_FOUND")
+        sys.exit(0)
 
     if list_users:
         # מחזיר את כל שמות הלקוחות (שורה אחת לכל שם) — לשימוש index.js
