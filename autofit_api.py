@@ -619,6 +619,7 @@ _COMMON_SURNAMES = frozenset({
     # אשכנזיים + ספרדיים + מתאמנים ידועים
     'פרנקל', 'מרטינז', 'שלו', 'שליו', 'וליצקו', 'גרינברג', 'גולדברג',
     'רוזנברג', 'זינגר', 'שלזינגר', 'ויינשטיין', 'ליבוביץ', 'כהנמן',
+    'חן', 'טל', 'לי', 'שי', 'פז', 'לב', 'עד', 'גד',
 })
 _SURNAME_SUFFIXES = ('ביץ', 'ייץ', 'ניץ', 'מן', 'שטיין', 'ניק', 'ובי', 'ייב', 'נקל', 'רגר', 'ברג')
 # Auto-populate surnames from user cache (runs once at import)
@@ -892,7 +893,7 @@ def parse_message(text: str) -> dict:
                                   # כינויי גוף — לא שמות אדם
                                   "אני", "אנו", "אנחנו", "הוא", "היא", "הם", "הן",
                                   # פעלי נתינה — "לתת" / "נתן"
-                                  "תת", "נתן", "ניתן",
+                                  "תת", "ניתן",
                                   # מילות הגבלה / ייעוץ
                                   "כדאי", "אולי", "עדיף", "בואי", "בוא"})
 
@@ -986,7 +987,7 @@ def parse_message(text: str) -> dict:
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
         elif "name" not in result:
             for _m in re.finditer(
-                r"(?:(?<!\S)של\s+|(?<!\S)עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+(?!" + _NAME_STOP + r")[\u05D0-\u05EA]{2,})?)",
+                r"(?:(?<!\S)של\s+|(?<!\S)עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA\u05F3\u0027]))([\u05D0-\u05EA\u05F3\u0027]{2,}(?:\s+(?!" + _NAME_STOP + r")[\u05D0-\u05EA\u05F3\u0027]{2,})?)",
                 full_no_meal,
             ):
                 words = _m.group(1).strip().split()
@@ -1003,21 +1004,26 @@ def parse_message(text: str) -> dict:
                     if len(words) >= 2 and words[1] in _NOT_NAME_VERBS:
                         # words[1] הוא פועל — בדוק אם יש שם אדם אחרי הפועל
                         _after_verb = full_no_meal[_m.start(1) + len(words[0]) + 1 + len(words[1]):].strip()
-                        if re.match(r'ל(?=[א-ת])', _after_verb.strip()):
-                            continue  # יש "לX" אחרי הפועל ישירות — זה עצם (מזון), לא שם אדם
+                        if re.match(r'ל(?=[א-ת]{3,})', _after_verb.strip()):
+                            continue  # יש "לX" (3+ אותיות) אחרי הפועל — זה עצם (מזון), לא שם אדם
                         result["name"] = words[0]
                         _name_cut_end = _m.start(1) + len(words[0])
                     elif len(words) >= 2 and not _looks_like_surname(words[1]):
                         # Fix A: words[1] לא נראה שם משפחה — כנראה שם מזון, לקחת רק words[0]
-                        # אבל: אם המילה הבאה אחרי המשתנה היא פועל ויש ל-שם אחר → זה מזון דו-מילי
-                        _after_m = full_no_meal[_m.end():].lstrip()
-                        _nxt = _after_m.split()[0] if _after_m.split() else ""
-                        # רק פועל פעיל (לא מילות בישול) מצביע על "מזון-מזון VERB ל-שם"
-                        _is_action_verb = bool(re.match(_VERB_PAT, _nxt)) if _nxt else False
-                        if _is_action_verb and re.search(r'(?<!\S)ל(?=[א-ת])', _after_m):
-                            continue  # מזון דו-מילי + פועל + לשם — דלג
-                        result["name"] = words[0]
-                        _name_cut_end = _m.start(1) + len(words[0])
+                        # חריג: אם הפועל קדם למשתנה — words[0] הוא שם האדם
+                        _pre_match_txt = full_no_meal[:_m.start()].rstrip()
+                        _pre_word = _pre_match_txt.split()[-1] if _pre_match_txt.split() else ""
+                        if _pre_word in _NOT_NAME_VERBS:
+                            result["name"] = words[0]
+                            _name_cut_end = _m.start(1) + len(words[0])
+                        else:
+                            _after_m = full_no_meal[_m.end():].lstrip()
+                            _nxt = _after_m.split()[0] if _after_m.split() else ""
+                            _is_action_verb = bool(re.match(_VERB_PAT, _nxt)) if _nxt else False
+                            if _is_action_verb and re.search(r'(?<!\S)ל(?=[א-ת])', _after_m):
+                                continue  # מזון דו-מילי + פועל + לשם — דלג
+                            result["name"] = words[0]
+                            _name_cut_end = _m.start(1) + len(words[0])
                     else:
                         result["name"] = _m.group(1).strip()
                         _name_cut_end = _m.end()
