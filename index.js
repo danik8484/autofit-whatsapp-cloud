@@ -496,21 +496,7 @@ const BIZ_PENDING_TTL = 10 * 60 * 1000; // 10 דקות
 // ─── שליחה דרך המספר העסקי ───────────────────────────────────
 async function sendBizMessage(chatId, text) {
   const id = chatId.includes('@') ? chatId : `${chatId}@c.us`;
-  // נסה BIZ instance קודם, fallback לאינסטנס הרגיל
-  if (BIZ_BASE && BIZ_TOKEN) {
-    try {
-      const res = await fetch(`${BIZ_BASE}/sendMessage/${BIZ_TOKEN}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId: id, message: text }),
-      });
-      const data = await res.json();
-      if (data.idMessage) { bizBotSentIds.add(data.idMessage); return; }
-    } catch (e) {
-      console.error('[biz-send biz-err]', e.message);
-    }
-  }
-  // fallback: שלח דרך האינסטנס הרגיל
+  // שלח דרך האינסטנס הרגיל (BIZ instance מחזיר idMessage גם כשלא מחובר)
   await sendMessage(id, text);
 }
 
