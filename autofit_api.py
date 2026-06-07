@@ -596,8 +596,9 @@ def find_best_food(query: str, coach_id: str = ""):
     if not foods and norm_query != query:
         foods = search_food(query, coach_id)
     if not foods:
-        first_word = norm_query.split()[0]
-        foods = search_food(first_word, coach_id)
+        _nq_words = norm_query.split()
+        if _nq_words:
+            foods = search_food(_nq_words[0], coach_id)
 
     if not foods:
         return None, []
@@ -1739,7 +1740,7 @@ def execute_request(request_text: str, force: bool = False,
                 parsed["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', ch, count=1)
         if uid_check == "MULTIPLE":
             # ריבוי מתאמנים — בקש טלפון לזיהוי
-            options = found_name.split(";")
+            options = [o for o in found_name.split(";") if "|" in o]
             ids_pipe = "|".join(opt.split("|")[0] for opt in options)
             names_pipe = "|".join(opt.split("|")[1] for opt in options)
             return f"NAME_OPTIONS:{ids_pipe}||{names_pipe}\nמצאתי {len(options)} מתאמנים בשם *{raw_name}*.\n\nשלח/י מספר טלפון לזיהוי."
@@ -1830,7 +1831,7 @@ def execute_request(request_text: str, force: bool = False,
                 _op["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', _op.get("change",""), count=1)
     if user_id == "MULTIPLE":
         # ריבוי מתאמנים באותו שם — בקש טלפון לזיהוי
-        options = full_name.split(";")
+        options = [o for o in full_name.split(";") if "|" in o]
         ids_pipe = "|".join(opt.split("|")[0] for opt in options)
         names_pipe = "|".join(opt.split("|")[1] for opt in options)
         return f"NAME_OPTIONS:{ids_pipe}||{names_pipe}\nמצאתי {len(options)} מתאמנים בשם *{name}*.\n\nשלח/י מספר טלפון לזיהוי."
@@ -1850,6 +1851,18 @@ def execute_request(request_text: str, force: bool = False,
         ops_list = [{"change": parsed["change"], "meal": None}]
     else:
         ops_list = parsed.get("ops") or [{"change": parsed["change"], "meal": None}]
+
+    # ── פיצול multi-food: "הוסף (X גרם FOOD ו Y גרם FOOD2)" → שתי פעולות ──
+    _split_ops = []
+    for _sop in ops_list:
+        _sch = _sop.get("change", "")
+        _smm = re.search(r'\((.+?)\s+ו(\d+\s*גרם\s+[^)]+)\)', _sch)
+        if _smm:
+            _split_ops.append({"change": re.sub(r'\([^)]+\)', f'({_smm.group(1)})', _sch, count=1), "meal": _sop.get("meal")})
+            _split_ops.append({"change": f'הוסף ({_smm.group(2)})', "meal": _sop.get("meal")})
+        else:
+            _split_ops.append(_sop)
+    ops_list = _split_ops
 
     _VP = r'(?:להוסיף|הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להחליף)'
 

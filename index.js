@@ -124,6 +124,7 @@ function runAutofit(phone, text, opts = {}) {
     if (raw.startsWith('CONFIRM_WITH_NAME:')) {
       const rest = raw.slice('CONFIRM_WITH_NAME:'.length);
       const sepIdx = rest.indexOf('|||');
+      if (sepIdx < 0) { await sendMessage(phone, raw); return; } // פורמט שבור — שלח גולמי
       const correctedName = rest.slice(0, sepIdx).trim();
       const summary = rest.slice(sepIdx + 3);
       // חלץ את השם המקורי מה-summary
@@ -816,7 +817,8 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
     if (raw.startsWith('CONFIRM_WITH_NAME:')) {
       if (opts.nameOverride === clientPhone) {
         // טלפון הביא fuzzy (נדיר) — קח את השם המתוקן ובצע
-        const correctedName = raw.slice('CONFIRM_WITH_NAME:'.length, raw.indexOf('|||')).trim();
+        const _sepI = raw.indexOf('|||');
+        const correctedName = (_sepI > 0 ? raw.slice('CONFIRM_WITH_NAME:'.length, _sepI) : raw.slice('CONFIRM_WITH_NAME:'.length)).trim();
         console.log(`[biz] fuzzy by phone, executing: ${correctedName}`);
         runAutofitBiz(correctedName, clientPhone, commandText, { ...opts, nameOverride: correctedName });
       } else {
