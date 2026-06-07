@@ -612,7 +612,7 @@ def _extract_meal(text: str) -> str:
             return key
     return ""
 
-_VERB_PAT = r"(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להוסיף|להחליף|שימ[יי]?|תשימ[יי]?|הכנס[יי]?|הכניס)"
+_VERB_PAT = r"(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להוסיף|להחליף|שימ[יי]?|תשימ[יי]?|הכנס[יי]?|הכניס|עדכן|עדכני|תשנ[יה])"
 
 def _extract_foods(text: str):
     """מחלץ (מזון_חדש, מזון_קיים) מטקסט. מחזיר (new_food, group_hint)."""
@@ -970,6 +970,8 @@ def parse_message(text: str) -> dict:
     # נרמול שמות עצם של הפחתה → פועל
     full = re.sub(r'(?<![א-ת])(?:הפחתה|הורדה)\s+של', 'הפחת', full)
     full = re.sub(r'(?<![א-ת])(?:הפחתה|הורדה)', 'הפחת', full)
+    # "פחות X גרם" = הפחתה (למשל "לדני פחות 150 גרם גרנולה")
+    full = re.sub(r'(?<![א-ת])פחות\s+(?=\d)', 'הפחת ', full)
 
     # "הורד/הפחת X גרם" = פקודת הפחתה — כולל קידומת ש/ו (שתורידי, ותורידי)
     _REDUCE_PAT = r'(?<![א-ת])(?:[שוב]?)(?:להוריד|להפחית|הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|תפחית|תפחיתי|הורידי|הוריד|תחסר[יי]?|לחסר)(?![א-ת])'
@@ -1058,9 +1060,10 @@ def parse_message(text: str) -> dict:
     # גם "ו+ארוחה" (כמו "וערב")
     full_no_meal = re.sub(r'\s+[וV](?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     full_no_meal = re.sub(r'\b(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\s+[וV]\s*(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
-    # ארוחה ללא ב' בתחילת ביטוי ("ערב אורז" / "בוקר ביצה")
-    if _meal_hits:
-        _bare_meal_re = r'(?:^|\s)(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')(?=\s)'
+    # ארוחה ללא ב' בתחילת ביטוי ("ערב אורז" / "בוקר ביצה" / "לדני ערב: X")
+    # גם כשה-meal כבר הוגדר מ-extra_ops — כדי שלא ייכנס לשם
+    if _meal_hits or result.get("meal"):
+        _bare_meal_re = r'(?:^|\s)(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')(?=[\s:,]|$)'
         full_no_meal = re.sub(_bare_meal_re, ' ', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
     # נרמול מוקדם לפני חיפוש שמות — מונע "ל+מזון" אחרי מילות תחליף מלהיות שם אדם
@@ -1205,8 +1208,8 @@ def parse_message(text: str) -> dict:
                 clean_full = full_no_meal[:name_match.start()] + full_no_meal[_name_cut_end:]
                 clean_full = re.sub(r'\s+', ' ', clean_full).strip()
             else:
-                # Fix D: שם אחרי פועל ללא "ל" לפני גרמים ("תוסיפי דני 80 גרם")
-                _pv = re.search(_VERB_PAT + r'\s+([\u05D0-\u05EA]{2,5})\s+(?=\d+\s*גרם\b)', full_no_meal)
+                # Fix D: שם אחרי פועל ללא "ל" ("תוסיפי דני 80 גרם" / "עדכן דני ביצה")
+                _pv = re.search(_VERB_PAT + r'\s+([\u05D0-\u05EA]{2,5})\s+(?=\d+|[\u05D0-\u05EA])', full_no_meal)
                 if _pv:
                     _pv_n = _pv.group(1)
                     # strip leading ל (למשל "לדני" → "דני")
@@ -1234,15 +1237,19 @@ def parse_message(text: str) -> dict:
     clean_full = re.sub(r'כאופציות\b', '', clean_full)  # כאופציות ללא ל/של = מחיקה
     clean_full = re.sub(r'כתחליף\s+ל', 'במקום ', clean_full)
     clean_full = re.sub(r'בנוסף\s+ל', 'במקום ', clean_full)
-    # "תחליפי X ב-Y" → "X במקום Y"  (ב = אינדיקטור להחלפה, לא מיקום)
+    # "תחליפי X ב-Y" / "ב-Y" עם מקף → "X במקום Y"
     if re.search(r'(?:תחליפ[יה]|תחליף|החלפ[יה]?|החלף|להחליף)\b', text) and 'במקום' not in clean_full:
-        clean_full = re.sub(r"(?<=[א-ת%'׳\"])\s+ב([א-ת])", r' במקום \1', clean_full)
+        clean_full = re.sub(r"(?<=[א-ת%'׳\"])\s+ב-?([א-ת])", r' במקום \1', clean_full, count=1)
     clean_full = re.sub(r'אופציה\s+של\s+', '', clean_full)     # "אופציה של X" → "X"
     clean_full = re.sub(r'אופציה\s+לתחליף\s+', '', clean_full) # "אופציה לתחליף X" → "X"
     clean_full = re.sub(r'תחליף\s+של\s+', '', clean_full)       # "תחליף של X" → "X"
     clean_full = re.sub(r'\bעוד\s+', '', clean_full)             # "עוד 75 גרם" → "75 גרם"
     clean_full = re.sub(r'\bגם\s+', '', clean_full)             # "גם 50 גרם שקדים" → "50 גרם שקדים"
     clean_full = re.sub(r'\bאת\s+', '', clean_full)             # "את האורז" → "האורז"
+    clean_full = re.sub(r'\bבבקשה\b', '', clean_full)           # "שמן זית בבקשה" → "שמן זית"
+    clean_full = re.sub(r'^מה\s+עם\s+', '', clean_full)         # "מה עם שמן זית" → "שמן זית"
+    clean_full = re.sub(r'^(?:תבדקי?|תראי?|תסתכלי?)\s+', '', clean_full)  # פעלי בדיקה
+    clean_full = re.sub(r'\s+', ' ', clean_full).strip()
 
     # "לFOOD VERB ..." בתחילת משפט — hint לפני פועל: FOOD + "במקום" + HINT
     _hint_pre = re.match(
@@ -1258,7 +1265,7 @@ def parse_message(text: str) -> dict:
     if not new_food and ("name" in result or not result.get("change")):
         # fallback: הטקסט שנשאר אחרי הסרת שם+ארוחה = שם המזון
         # מסיר פעלים בתחילה ותווי זבל
-        fb = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|הכנס[יי]?|שימ[יי]?|תשימ[יי]?|הכניס)(?:\s+|$)', '', clean_full).strip()
+        fb = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|הכנס[יי]?|שימ[יי]?|תשימ[יי]?|הכניס|עדכן|עדכני|תשנ[יה])(?:\s+|$)', '', clean_full).strip()
         fb = re.sub(r'[^א-ת\s\d%\'\"]+', ' ', fb).strip()
         fb = re.sub(r'\s+', ' ', fb).strip()
         if len(fb) >= 2:

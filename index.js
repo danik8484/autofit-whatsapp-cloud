@@ -282,6 +282,19 @@ function getAllClientNames() {
   });
 }
 
+// בדיקת תקינות שם: האם NAME הוא שם פרטי עצמאי של לקוח (לא שם משפחה בלבד)
+function quickFindUser(name) {
+  return new Promise(resolve => {
+    const script = path.join(__dirname, 'autofit_api.py');
+    const proc = spawn('python3', [script, '--find-user', name]);
+    let out = '';
+    proc.stdout.on('data', d => { out += d.toString(); });
+    proc.on('close', () => resolve(out.trim() === 'FOUND'));
+    proc.on('error', () => resolve(false));
+    setTimeout(() => { proc.kill(); resolve(false); }, 5000);
+  });
+}
+
 async function runForAllClients(phone, baseText) {
   const names = await getAllClientNames();
   if (!names.length) {
@@ -320,7 +333,11 @@ app.post('/webhook', async (req, res) => {
       if (ph !== BIZ_TEST_PHONE && phAlt !== BIZ_TEST_PHONE && phAlt !== '972'+BIZ_TEST_PHONE.replace(/^0/,'')) return;
     }
     if (!hasTriggerWord(outText)) return;
-    const outName = body.senderData?.chatName || outChatId.replace('@c.us','');
+    // קבל שם איש קשר: אם ה-webhook לא כולל chatName (כגון polling) — שאל GreenAPI
+    let outName = body.senderData?.chatName || '';
+    if (!outName || /^\d{7,}$/.test(outName)) {
+      outName = await getContactName(outChatId);
+    }
     const outPhone = outChatId.replace('@c.us','');
     console.log(`[v3] פקודה יוצאת: "${outName}" (${outPhone}) | "${outText.slice(0,60)}"`);
     v3Log.push({ ts: Date.now(), step: 'trigger', name: outName, phone: outPhone, text: outText.slice(0,40) });
@@ -609,14 +626,22 @@ app.post('/webhook', async (req, res) => {
   }
 
   // ── ריבוי לקוחות: "לרון ולדני 120 גרם חזה עוף" ─────────────────────────
+  // ולידציה: כל שם (מה-2 ואילך) חייב להיות שם פרטי עצמאי — מונע "רון וליצקו" מלהיפצל
   const _multiNames = _extractMultiNames(text);
   if (_multiNames && _multiNames.length >= 2) {
-    const baseText = _stripMultiNamesPrefix(text, _multiNames);
-    await sendMessage(sender, `⏳ מבצע עבור ${_multiNames.join(', ')}...`);
-    for (const name of _multiNames) {
-      runAutofit(sender, baseText, { nameOverride: name, ..._skipPref ? { skipFoodPref: true } : {} });
+    const secondaryNames = _multiNames.slice(1);
+    const validChecks = await Promise.all(secondaryNames.map(n => quickFindUser(n)));
+    const allValid = validChecks.every(Boolean);
+    if (allValid) {
+      const baseText = _stripMultiNamesPrefix(text, _multiNames);
+      await sendMessage(sender, `⏳ מבצע עבור ${_multiNames.join(', ')}...`);
+      for (const name of _multiNames) {
+        runAutofit(sender, baseText, { nameOverride: name, ..._skipPref ? { skipFoodPref: true } : {} });
+      }
+      return;
     }
-    return;
+    // שם לא תקין = כנראה שם משפחה — המשך לעיבוד כאדם אחד
+    console.log(`[multi-skip] "${secondaryNames.join(',')}" לא שמות עצמאיים, מעבד כאדם אחד`);
   }
 
   runAutofit(sender, text, _skipPref ? { skipFoodPref: true } : {});
@@ -807,7 +832,7 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
     if (raw.startsWith('NAME_NOT_FOUND:')) {
       if (opts.nameOverride === clientPhone) {
         // כבר ניסינו טלפון — שלח alert
-        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}*\n(טלפון: ${clientPhone})`);
+        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}*\n(טלפון: ${clientPhone.replace(/^972/, '0')})`);
       } else {
         const badName = raw.slice('NAME_NOT_FOUND:'.length).trim();
         console.log(`[biz] שם לא נמצא: "${badName}", מנסה לפי טלפון: ${clientPhone}`);
