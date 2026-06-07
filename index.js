@@ -808,24 +808,18 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
     const raw = output.trim() || (code === 0 ? '✅ בוצע' : '❌ שגיאה לא ידועה');
     console.log(`[biz→] ${raw.slice(0,80).replace(/\n/g,' | ')}`);
 
-    // ── שם fuzzy: מצא שם מתוקן, בקש אישור ─────────────────────────
+    // ── שם לא מדויק: ישר לטלפון, לא שואלים אישור ──────────────────
     if (raw.startsWith('CONFIRM_WITH_NAME:')) {
-      const rest = raw.slice('CONFIRM_WITH_NAME:'.length);
-      const sepIdx = rest.indexOf('|||');
-      const correctedName = rest.slice(0, sepIdx).trim();
-      const summary = rest.slice(sepIdx + 3);
-      const rawMatch = summary.match(/מצאתי עבור "([^"]+)"/);
-      const rawName = rawMatch ? rawMatch[1] : contactName;
-
-      // יש בcache? בצע ישירות
-      const cachedId = bizNamePrefs.get((rawName || contactName).toLowerCase());
-      if (cachedId) {
-        runAutofitBiz(correctedName, clientPhone, commandText, { ...opts, userIdOverride: cachedId });
-        return;
+      if (opts.nameOverride === clientPhone) {
+        // טלפון הביא fuzzy (נדיר) — קח את השם המתוקן ובצע
+        const correctedName = raw.slice('CONFIRM_WITH_NAME:'.length, raw.indexOf('|||')).trim();
+        console.log(`[biz] fuzzy by phone, executing: ${correctedName}`);
+        runAutofitBiz(correctedName, clientPhone, commandText, { ...opts, nameOverride: correctedName });
+      } else {
+        // שם לא מדויק → ישר לטלפון
+        console.log(`[biz] שם לא מדויק → ישר לטלפון: ${clientPhone}`);
+        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
       }
-
-      bizPending = { type: 'name_confirm', contactName, correctedName, rawName, clientPhone, commandText, opts, timestamp: Date.now() };
-      await sendBizMessage(BIZ_GROUP, `🔍 *שם לא ברור*\nהבנתי: *${correctedName}*\n(שם בוואטסאפ: "${rawName}")\n\nנכון? השב *כן* לאישור`);
       return;
     }
 
@@ -842,16 +836,23 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       return;
     }
 
-    // ── שני לקוחות באותו שם: בקש בחירה ──────────────────────────────
+    // ── שמות כפולים: ישר לטלפון לזיהוי חד-משמעי ──────────────────────
     if (raw.startsWith('NAME_OPTIONS:')) {
-      const [header, ...rest] = raw.split('\n');
-      const headerBody = header.slice('NAME_OPTIONS:'.length);
-      const sepIdx = headerBody.indexOf('||');
-      const ids = (sepIdx >= 0 ? headerBody.slice(0, sepIdx) : headerBody).split('|');
-      const names = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : '').split('|');
-      const listMsg = names.map((n, i) => `${i+1}. ${n}`).join('\n');
-      bizPending = { type: 'name_options', contactName, clientPhone, commandText, alternatives: names, userIds: ids, opts, timestamp: Date.now() };
-      await sendBizMessage(BIZ_GROUP, `👥 *${contactName}* — נמצאו ${names.length} לקוחות:\n${listMsg}\n\n_השב_ *בחר N*`);
+      if (opts.nameOverride === clientPhone) {
+        // גם טלפון הביא כפילות — מצב נדיר, הצג אפשרויות לבחירה ידנית
+        const [header, ...rest] = raw.split('\n');
+        const headerBody = header.slice('NAME_OPTIONS:'.length);
+        const sepIdx = headerBody.indexOf('||');
+        const ids = (sepIdx >= 0 ? headerBody.slice(0, sepIdx) : headerBody).split('|');
+        const names = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : '').split('|');
+        const listMsg = names.map((n, i) => `${i+1}. ${n}`).join('\n');
+        bizPending = { type: 'name_options', contactName, clientPhone, commandText, alternatives: names, userIds: ids, opts, timestamp: Date.now() };
+        await sendBizMessage(BIZ_GROUP, `👥 *${contactName}* — נמצאו ${names.length} לקוחות:\n${listMsg}\n\n_השב_ *בחר N*`);
+      } else {
+        // שם כפול → ישר לטלפון לזיהוי חד-משמעי
+        console.log(`[biz] שמות כפולים → ישר לטלפון: ${clientPhone}`);
+        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+      }
       return;
     }
 
