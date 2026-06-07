@@ -38,12 +38,14 @@ def _parse_with_ai(text: str, v3_mode: bool = False) -> dict:
 אל תמציא ערכים. אם לא בטוח — null."""
         else:
             system_prompt = """אתה מחלץ מידע מהודעות תזונה בעברית של מאמן כושר.
+מבנה ההודעה: מילה1=פעולה, מילה2=שם פרטי, מילה3=שם משפחה, שאר=מזון+ארוחה.
 החזר JSON בלבד עם השדות:
-- name: שם מלא (שם פרטי + שם משפחה)
+- name: שם פרטי + שם משפחה (מילה 2 + מילה 3 בהודעה)
 - food: שם המזון
-- meal: בוקר/צהריים/ערב/ביניים
+- meal: בוקר/צהריים/ערב/ביניים (או null)
 - grams: מספר בלבד (או null)
-- hint: מזון חלופי אם יש (או null)
+- hint: מזון להחלפה אם יש "במקום X" (או null)
+- action: הוסף / הפחת / החלף (ברירת מחדל: הוסף)
 אל תמציא ערכים. אם לא בטוח — null."""
 
         response = client.messages.create(
@@ -83,10 +85,10 @@ def _parse_with_ai(text: str, v3_mode: bool = False) -> dict:
             _m = data["meal"]
             result["meal"] = _meal_short.get(_m, _m.replace("ארוחת ", ""))
         result["confidence"] = 90
-        print(f"[AI parse] {data} → {result}", flush=True)
+        print(f"[AI parse] {data} → {result}", flush=True, file=__import__("sys").stderr)
         return result
     except Exception as e:
-        print(f"[AI parse error] {e}", flush=True)
+        print(f"[AI parse error] {e}", flush=True, file=__import__("sys").stderr)
         return {}
 
 FOOD_API   = "https://food.we-site.co.il/api"
@@ -1510,7 +1512,9 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
 
     # ── AI fallback: כשה-confidence נמוך — נסה Claude Haiku ──────────────────
     if conf < 70 and not skip_name:
-        _ai = _parse_with_ai(text, v3_mode=_v3_triggered)
+        # V3: שלח טקסט מקורי (לפני נרמול) — ה-prompt של AI מצפה לפורמט "מוסיף לך..."
+        _ai_text = _text_before_v3 if _v3_triggered else text
+        _ai = _parse_with_ai(_ai_text, v3_mode=_v3_triggered)
         if _ai:
             # merge selective — מעדכן רק שדות חסרים, לא מוחק פרסינג נכון של regex
             for _k, _v in _ai.items():

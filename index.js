@@ -419,6 +419,7 @@ app.post('/webhook', async (req, res) => {
     const corr = pendingCorrections.get(sender);
     if (Date.now() - corr.timestamp > 5 * 60 * 1000) {
       pendingCorrections.delete(sender);
+      // פג תוקף — אל תעבד את ההודעה כבחירה ישנה, המשך לעיבוד רגיל
     } else if (corr.type === 'meal') {
       pendingCorrections.delete(sender);
       await sendMessage(sender, '⏳ מבצע...');
@@ -902,7 +903,7 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
     // ── הצלחה או שגיאה ────────────────────────────────────────────────
     bizPending = null;
     // חלץ שם לקוח מתשובת אוטופיט (תמיד — זה השם האמיתי במערכת)
-    const nmMatch = raw.match(/של ([\u05D0-\u05EA]+(?:\s+[\u05D0-\u05EA]+)*)/);
+    const nmMatch = raw.match(/של ([\u05D0-\u05EA\u05F3']+(?:\s+[\u05D0-\u05EA\u05F3']+)*)/);
     const clientName = nmMatch ? nmMatch[1].trim() : contactName;
     const phoneDisplay = clientPhone.replace(/^972/, '0');
     const msg = code === 0
@@ -952,13 +953,30 @@ async function handleBizGroupResponse(text) {
 
   // ── בחירת מזון / hint / ארוחה ──────────────────────────────────────
   if (['food_choice', 'hint_choice', 'meal_choice'].includes(type)) {
+    // pagination "עוד" — הצג עמוד הבא
+    if (type === 'food_choice' && /^(?:עוד|הצג עוד|עוד אפשרויות)$/i.test(t)) {
+      const allAlts = bizPending.allAlternatives || alternatives;
+      const nextOffset = (bizPending.pageOffset || 0) + 10;
+      const nextPage = allAlts.slice(nextOffset, nextOffset + 10);
+      if (nextPage.length === 0) {
+        await sendBizMessage(BIZ_GROUP, 'אין עוד אפשרויות.');
+      } else {
+        const listLines = nextPage.map((name, i) => `${nextOffset + i + 1}. ${name}`).join('\n');
+        const hasMore = allAlts.length > nextOffset + 10;
+        bizPending = { ...bizPending, alternatives: nextPage, allAlternatives: allAlts, pageOffset: nextOffset, timestamp: Date.now() };
+        await sendBizMessage(BIZ_GROUP, `${listLines}${hasMore ? '\n\nשלח *עוד* לאפשרויות נוספות' : ''}`);
+      }
+      return;
+    }
+
     // "בחר N" או "N" בלבד
     const numMatch = t.match(/^(?:בחר\s+)?(\d+)$/);
     let chosen = null;
 
     if (numMatch) {
+      const allAlts = bizPending.allAlternatives || alternatives;
       const idx = parseInt(numMatch[1]) - 1;
-      if (idx >= 0 && idx < alternatives.length) chosen = alternatives[idx];
+      if (idx >= 0 && idx < allAlts.length) chosen = allAlts[idx];
     } else if (t.length >= 2 && !t.includes('\n')) {
       // טקסט חופשי — אפשר גם לכתוב שם מזון
       chosen = t;
