@@ -570,17 +570,29 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       return;
     }
 
-    // ── שם לא נמצא: נסה לפי מספר טלפון ─────────────────────────────
+    // ── שם לא נמצא: נסה לפי מספר טלפון, אחר כך alert ────────────────
     if (raw.startsWith('NAME_NOT_FOUND:')) {
-      const badName = raw.slice('NAME_NOT_FOUND:'.length).trim();
-      console.log(`[biz] שם לא נמצא: "${badName}", מנסה לפי טלפון: ${clientPhone}`);
-      runAutofitBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+      if (opts.nameOverride === clientPhone) {
+        // כבר ניסינו טלפון — שלח alert
+        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}*\n(טלפון: ${clientPhone})`);
+      } else {
+        const badName = raw.slice('NAME_NOT_FOUND:'.length).trim();
+        console.log(`[biz] שם לא נמצא: "${badName}", מנסה לפי טלפון: ${clientPhone}`);
+        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+      }
       return;
     }
 
-    // ── NAME_NOT_FOUND אחרי fallback טלפון: alert ─────────────────────
-    if (opts.nameOverride === clientPhone && raw.startsWith('NAME_NOT_FOUND:')) {
-      await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}*\n(טלפון: ${clientPhone})`);
+    // ── שני לקוחות באותו שם: בקש בחירה ──────────────────────────────
+    if (raw.startsWith('NAME_OPTIONS:')) {
+      const [header, ...rest] = raw.split('\n');
+      const headerBody = header.slice('NAME_OPTIONS:'.length);
+      const sepIdx = headerBody.indexOf('||');
+      const ids = (sepIdx >= 0 ? headerBody.slice(0, sepIdx) : headerBody).split('|');
+      const names = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : '').split('|');
+      const listMsg = names.map((n, i) => `${i+1}. ${n}`).join('\n');
+      bizPending = { type: 'name_options', contactName, clientPhone, commandText, alternatives: names, userIds: ids, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `👥 *${contactName}* — נמצאו ${names.length} לקוחות:\n${listMsg}\n\n_השב_ *בחר N*`);
       return;
     }
 
@@ -636,7 +648,19 @@ async function handleBizGroupResponse(text) {
   }
 
   const t = text.trim();
-  const { type, contactName, correctedName, rawName, clientPhone, commandText, alternatives, opts } = bizPending;
+  const { type, contactName, correctedName, rawName, clientPhone, commandText, alternatives, userIds, opts } = bizPending;
+
+  // ── בחירת שם מרשימה (NAME_OPTIONS) ─────────────────────────────────
+  if (type === 'name_options') {
+    const numMatch = t.match(/^(?:בחר\s+)?(\d+)$/);
+    if (!numMatch) return;
+    const idx = parseInt(numMatch[1]) - 1;
+    if (idx < 0 || idx >= alternatives.length) return;
+    const chosenName = alternatives[idx];
+    bizPending = null;
+    runAutofitBiz(chosenName, clientPhone, commandText, { ...opts, nameOverride: chosenName });
+    return;
+  }
 
   // ── אישור שם fuzzy ─────────────────────────────────────────────────
   if (type === 'name_confirm') {
