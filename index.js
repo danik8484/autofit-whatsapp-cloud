@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 
 const ID    = process.env.GREEN_API_ID    || '7107642551';
 const TOKEN = process.env.GREEN_API_TOKEN || '5b7315dfa1cd46beaed1f82da183a246471219b64d674e029d';
@@ -23,12 +24,42 @@ const processedIds = new Set();
 // type: 'confirm' (confidence) | 'fuzzy' (שם עמום)
 const pendingConfirmations = new Map();
 
-// זיכרון בחירת מזון: query → chosen food name (נשמר בזיכרון עד restart)
+// זיכרון בחירת מזון: query → chosen food name (נשמר לדיסק)
 const foodPrefs = new Map();
 // זיכרון בחירת hint: hintQuery → chosen food row name
 const hintPrefs = new Map();
 // זיכרון שמות: rawName → correctedName (למניעת CONFIRM חוזר)
 const namePrefs = new Map();
+
+const PREFS_FILE = path.join(__dirname, 'prefs.json');
+
+function loadPrefs() {
+  try {
+    const raw = fs.readFileSync(PREFS_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    (data.food || []).forEach(([k, v]) => foodPrefs.set(k, v));
+    (data.hint || []).forEach(([k, v]) => hintPrefs.set(k, v));
+    (data.name || []).forEach(([k, v]) => namePrefs.set(k, v));
+    console.log(`[prefs loaded] food=${foodPrefs.size} hint=${hintPrefs.size} name=${namePrefs.size}`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn('[prefs load error]', e.message);
+  }
+}
+
+function savePrefs() {
+  try {
+    const data = {
+      food: [...foodPrefs.entries()],
+      hint: [...hintPrefs.entries()],
+      name: [...namePrefs.entries()],
+    };
+    fs.writeFileSync(PREFS_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('[prefs save error]', e.message);
+  }
+}
+
+loadPrefs();
 
 // ─── שליחת הודעה ─────────────────────────────────────────────
 async function sendMessage(phone, text) {
@@ -49,11 +80,12 @@ const pendingCorrections = new Map();
 function runAutofit(phone, text, opts = {}) {
   const script = path.join(__dirname, 'autofit_api.py');
   const args = [];
-  if (opts.force)        args.push('--force');
-  if (opts.nameOverride) { args.push('--name'); args.push(opts.nameOverride); }
-  if (opts.mealOverride) { args.push('--meal'); args.push(opts.mealOverride); }
-  if (opts.foodOverride) { args.push('--food'); args.push(opts.foodOverride); }
-  if (opts.hintOverride) { args.push('--hint'); args.push(opts.hintOverride); }
+  if (opts.force)          args.push('--force');
+  if (opts.nameOverride)   { args.push('--name'); args.push(opts.nameOverride); }
+  if (opts.mealOverride)   { args.push('--meal'); args.push(opts.mealOverride); }
+  if (opts.foodOverride)   { args.push('--food'); args.push(opts.foodOverride); }
+  if (opts.hintOverride)   { args.push('--hint'); args.push(opts.hintOverride); }
+  if (opts.userIdOverride) { args.push('--user-id'); args.push(opts.userIdOverride); }
   args.push(text);
 
   const proc = spawn('python3', [script, ...args]);
@@ -124,8 +156,8 @@ function runAutofit(phone, text, opts = {}) {
       const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const userMsg = rest.join('\n');
 
-      // יש העדפה שמורה? בחר אוטומטית
-      const pref = hintQuery && hintPrefs.get(hintQuery.toLowerCase());
+      // יש העדפה שמורה? בחר אוטומטית (אלא אם המשתמש ביקש "אפשרות אחרת")
+      const pref = hintQuery && !opts.skipFoodPref && hintPrefs.get(hintQuery.toLowerCase());
       if (pref && alts.includes(pref)) {
         console.log(`[hint-pref] ${hintQuery} → ${pref} (auto)`);
         await sendMessage(phone, '⏳ מבצע...');
@@ -135,6 +167,19 @@ function runAutofit(phone, text, opts = {}) {
 
       // שמור גם foodOverride שכבר נבחר — כדי לא לשכוח אותו
       pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, hintQuery, nameOverride: opts.nameOverride || '', foodOverride: opts.foodOverride || '', timestamp: Date.now() });
+      await sendMessage(phone, userMsg);
+      return;
+    }
+
+    // NAME_OPTIONS — ריבוי מתאמנים באותו שם
+    if (raw.startsWith('NAME_OPTIONS:')) {
+      const [header, ...rest] = raw.split('\n');
+      const headerBody = header.slice('NAME_OPTIONS:'.length);
+      const sepIdx = headerBody.indexOf('||');
+      const ids = (sepIdx >= 0 ? headerBody.slice(0, sepIdx) : headerBody).split('|');
+      const names = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : '').split('|');
+      const userMsg = rest.join('\n');
+      pendingCorrections.set(phone, { type: 'name_choice', originalText: text, alternatives: names, userIds: ids, nameOverride: opts.nameOverride || '', timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -156,8 +201,8 @@ function runAutofit(phone, text, opts = {}) {
       const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const userMsg = rest.join('\n');
 
-      // יש העדפה שמורה? בחר אוטומטית
-      const pref = foodQuery && foodPrefs.get(foodQuery.toLowerCase());
+      // יש העדפה שמורה? בחר אוטומטית (אלא אם המשתמש ביקש "אפשרות אחרת")
+      const pref = foodQuery && !opts.skipFoodPref && foodPrefs.get(foodQuery.toLowerCase());
       if (pref && alts.includes(pref)) {
         console.log(`[pref] ${foodQuery} → ${pref} (auto)`);
         await sendMessage(phone, '⏳ מבצע...');
@@ -274,9 +319,25 @@ app.post('/webhook', async (req, res) => {
         runAutofit(sender, corr.originalText, { force: true, nameOverride: text.trim() });
         return;
       }
+    } else if (corr.type === 'name_choice') {
+      const numMatch = text.trim().match(/^(\d+)$/);
+      if (numMatch) {
+        const idx = parseInt(numMatch[1]) - 1;
+        if (idx >= 0 && idx < corr.alternatives.length) {
+          const chosenName = corr.alternatives[idx];
+          const chosenId = corr.userIds[idx];
+          pendingCorrections.delete(sender);
+          await sendMessage(sender, '⏳ מבצע...');
+          runAutofit(sender, corr.originalText, { force: true, nameOverride: chosenName, userIdOverride: chosenId });
+          return;
+        }
+      }
+      return;
     } else if (corr.type === 'food' || corr.type === 'hint') {
-      // פקודה חדשה מובנית — נקה state ועבד מחדש
-      if (/שם\s*:|ארוחה\s*:/i.test(text)) {
+      // פקודה חדשה — נקה state ועבד מחדש (מובנית או פועל בתחילה)
+      const _isNewCmd = /שם\s*:|ארוחה\s*:/i.test(text) ||
+        /^(?:תוסיפ[יי]?|הוסיפ[יי]?|הוסף|תוסיף|הכנס|תכניס|הורד|הפחת|תוריד|תחליפ[יי]?|החליפ[יי]?|להוסיף|להחליף)\s/i.test(text.trim());
+      if (_isNewCmd) {
         pendingCorrections.delete(sender);
       } else {
         const numMatch = text.trim().match(/^(\d+)$/);
@@ -295,6 +356,7 @@ app.post('/webhook', async (req, res) => {
             if (corr.hintQuery) {
               hintPrefs.set(corr.hintQuery.toLowerCase(), chosen);
               console.log(`[hint-pref saved] "${corr.hintQuery}" → "${chosen}"`);
+              savePrefs();
             }
             // זכור גם foodOverride שנבחר קודם
             runAutofit(sender, corr.originalText, { force: true, hintOverride: chosen, nameOverride: corr.nameOverride || '', foodOverride: corr.foodOverride || '' });
@@ -303,6 +365,7 @@ app.post('/webhook', async (req, res) => {
             if (corr.foodQuery) {
               foodPrefs.set(corr.foodQuery.toLowerCase(), chosen);
               console.log(`[pref saved] "${corr.foodQuery}" → "${chosen}"`);
+              savePrefs();
             }
             // זכור גם hintOverride שנבחר קודם
             runAutofit(sender, corr.originalText, { force: true, foodOverride: chosen, nameOverride: corr.nameOverride || '', hintOverride: corr.hintOverride || '' });
@@ -330,6 +393,7 @@ app.post('/webhook', async (req, res) => {
           if (pending.rawName && pending.correctedName) {
             namePrefs.set(pending.rawName.toLowerCase(), pending.correctedName);
             console.log(`[name-pref saved] "${pending.rawName}" → "${pending.correctedName}"`);
+            savePrefs();
           }
           runAutofit(sender, pending.originalText, { force: true, nameOverride: pending.correctedName });
         } else {
@@ -345,7 +409,336 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  runAutofit(sender, text);
+  // "אפשרות אחרת" / "אופציה נוספת" — חיפוש חדש, מתעלם מהעדפה שמורה
+  const _skipPref = /(?:אפשרות|אופציה)\s+(?:אחרת|נוספת)|תחפש\s+עוד/.test(text);
+  runAutofit(sender, text, _skipPref ? { skipFoodPref: true } : {});
+});
+
+// ════════════════════════════════════════════════════════════════
+// ══  BOT V3 — WhatsApp Business (הודעות יוצאות של דני)       ══
+// ════════════════════════════════════════════════════════════════
+
+const BIZ_ID    = process.env.GREEN_API_ID_BIZ;
+const BIZ_TOKEN = process.env.GREEN_API_TOKEN_BIZ;
+const BIZ_BASE  = BIZ_ID ? `https://api.green-api.com/waInstance${BIZ_ID}` : null;
+const BIZ_GROUP = process.env.NOTIFY_GROUP_CHAT_ID; // chatId של קבוצת הצוות
+
+// מילות מפתח שמפעילות את הבוט
+const TRIGGER_WORDS = [
+  'מוסיף לך', 'מוסיף לו',
+  'מעלה לך', 'מעלה לו',
+  'מוריד לך', 'מפחית',
+  'מחליף לך', 'מחליף לו',
+];
+
+function hasTriggerWord(text) {
+  return TRIGGER_WORDS.some(w => text.includes(w));
+}
+
+// מניעת כפילויות v3
+const bizProcessedIds = new Set();
+// IDs שהבוט עצמו שלח (כדי לא להגיב להם)
+const bizBotSentIds = new Set();
+
+// namePrefs v3: שם WhatsApp (lowercase) → auto-fit user_id (אחרי אישור דני)
+const bizNamePrefs = new Map();
+const BIZ_PREFS_FILE = path.join(__dirname, 'biz_prefs.json');
+
+function loadBizPrefs() {
+  try {
+    const data = JSON.parse(fs.readFileSync(BIZ_PREFS_FILE, 'utf8'));
+    (data.names || []).forEach(([k, v]) => bizNamePrefs.set(k, v));
+    console.log(`[biz-prefs loaded] names=${bizNamePrefs.size}`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn('[biz-prefs load error]', e.message);
+  }
+}
+
+function saveBizPrefs() {
+  try {
+    fs.writeFileSync(BIZ_PREFS_FILE,
+      JSON.stringify({ names: [...bizNamePrefs.entries()] }, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('[biz-prefs save error]', e.message);
+  }
+}
+
+loadBizPrefs();
+
+// state ממתין v3 (אחד בזמן — דני הוא המשתמש היחיד)
+let bizPending = null; // { type, contactName, clientPhone, commandText, alternatives, ... }
+const BIZ_PENDING_TTL = 10 * 60 * 1000; // 10 דקות
+
+// ─── שליחה דרך המספר העסקי ───────────────────────────────────
+async function sendBizMessage(chatId, text) {
+  if (!BIZ_BASE || !BIZ_TOKEN) return;
+  const id = chatId.includes('@') ? chatId : `${chatId}@c.us`;
+  try {
+    const res = await fetch(`${BIZ_BASE}/sendMessage/${BIZ_TOKEN}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatId: id, message: text }),
+    });
+    const data = await res.json();
+    if (data.idMessage) bizBotSentIds.add(data.idMessage);
+    if (bizBotSentIds.size > 200) {
+      const arr = [...bizBotSentIds];
+      arr.slice(0, 100).forEach(id => bizBotSentIds.delete(id));
+    }
+  } catch (e) {
+    console.error('[biz-send err]', e.message);
+  }
+}
+
+// ─── שם איש קשר מ-Green API (השם שדני שמר בטלפון) ──────────────
+async function getContactName(chatId) {
+  if (!BIZ_BASE) return chatId.replace('@c.us', '');
+  try {
+    const res = await fetch(`${BIZ_BASE}/getContact/${BIZ_TOKEN}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatId }),
+    });
+    const data = await res.json();
+    return (data.name || data.pushName || '').trim() || chatId.replace('@c.us', '');
+  } catch (e) {
+    return chatId.replace('@c.us', '');
+  }
+}
+
+// ─── פורמט קבלה לקבוצה ───────────────────────────────────────
+function formatBizReceipt(contactName, autofitResult) {
+  const time = new Date().toLocaleTimeString('he-IL', {
+    timeZone: 'Asia/Jerusalem', hour: '2-digit', minute: '2-digit'
+  });
+  return `👤 *${contactName}* | 🕐 ${time}\n${autofitResult}`;
+}
+
+// ─── הרצת autofit עבור v3 ─────────────────────────────────────
+function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
+  const script = path.join(__dirname, 'autofit_api.py');
+  const args = ['--force'];
+
+  // אם יש user_id ידוע מ-cache → שלח דרכו (מונע חיפוש שם)
+  if (opts.userIdOverride) {
+    args.push('--user-id'); args.push(String(opts.userIdOverride));
+  } else {
+    args.push('--name'); args.push(opts.nameOverride || contactName);
+  }
+  if (opts.foodOverride) { args.push('--food'); args.push(opts.foodOverride); }
+  if (opts.hintOverride) { args.push('--hint'); args.push(opts.hintOverride); }
+  if (opts.mealOverride) { args.push('--meal'); args.push(opts.mealOverride); }
+  args.push(commandText);
+
+  const proc = spawn('python3', [script, ...args]);
+  let output = '';
+  let timedOut = false;
+
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    proc.kill();
+    if (BIZ_GROUP) sendBizMessage(BIZ_GROUP, `❌ *${contactName}* — הבקשה לקחה יותר מדי זמן`);
+  }, 30000);
+
+  proc.stdout.on('data', d => { output += d.toString(); });
+  proc.stderr.on('data', d => console.error('[biz-py err]', d.toString().trim()));
+
+  proc.on('close', async code => {
+    clearTimeout(killTimer);
+    if (timedOut || !BIZ_GROUP) return;
+    const raw = output.trim() || (code === 0 ? '✅ בוצע' : '❌ שגיאה לא ידועה');
+    console.log(`[biz→] ${raw.slice(0,80).replace(/\n/g,' | ')}`);
+
+    // ── שם fuzzy: מצא שם מתוקן, בקש אישור ─────────────────────────
+    if (raw.startsWith('CONFIRM_WITH_NAME:')) {
+      const rest = raw.slice('CONFIRM_WITH_NAME:'.length);
+      const sepIdx = rest.indexOf('|||');
+      const correctedName = rest.slice(0, sepIdx).trim();
+      const summary = rest.slice(sepIdx + 3);
+      const rawMatch = summary.match(/מצאתי עבור "([^"]+)"/);
+      const rawName = rawMatch ? rawMatch[1] : contactName;
+
+      // יש בcache? בצע ישירות
+      const cachedId = bizNamePrefs.get((rawName || contactName).toLowerCase());
+      if (cachedId) {
+        runAutofitBiz(correctedName, clientPhone, commandText, { ...opts, userIdOverride: cachedId });
+        return;
+      }
+
+      bizPending = { type: 'name_confirm', contactName, correctedName, rawName, clientPhone, commandText, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `🔍 *שם לא ברור*\nהבנתי: *${correctedName}*\n(שם בוואטסאפ: "${rawName}")\n\nנכון? השב *כן* לאישור`);
+      return;
+    }
+
+    // ── שם לא נמצא: נסה לפי מספר טלפון ─────────────────────────────
+    if (raw.startsWith('NAME_NOT_FOUND:')) {
+      const badName = raw.slice('NAME_NOT_FOUND:'.length).trim();
+      console.log(`[biz] שם לא נמצא: "${badName}", מנסה לפי טלפון: ${clientPhone}`);
+      runAutofitBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+      return;
+    }
+
+    // ── NAME_NOT_FOUND אחרי fallback טלפון: alert ─────────────────────
+    if (opts.nameOverride === clientPhone && raw.startsWith('NAME_NOT_FOUND:')) {
+      await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}*\n(טלפון: ${clientPhone})`);
+      return;
+    }
+
+    // ── אפשרויות מזון: שלח לקבוצה לבחירה ──────────────────────────
+    if (raw.startsWith('FOOD_OPTIONS:')) {
+      const [header, ...rest] = raw.split('\n');
+      const headerBody = header.slice('FOOD_OPTIONS:'.length);
+      const sepIdx = headerBody.indexOf('||');
+      const foodQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
+      const listMsg = alts.map((a, i) => `${i+1}. ${a}`).join('\n');
+      bizPending = { type: 'food_choice', contactName, clientPhone, commandText, alternatives: alts, foodQuery, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי "${foodQuery}"\n${listMsg}\n\n_השב_ *בחר N*`);
+      return;
+    }
+
+    // ── אפשרויות hint (מזון להחלפה) ─────────────────────────────────
+    if (raw.startsWith('HINT_OPTIONS:')) {
+      const [header, ...rest] = raw.split('\n');
+      const headerBody = header.slice('HINT_OPTIONS:'.length);
+      const sepIdx = headerBody.indexOf('||');
+      const hintQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
+      const listMsg = alts.map((a, i) => `${i+1}. ${a}`).join('\n');
+      bizPending = { type: 'hint_choice', contactName, clientPhone, commandText, alternatives: alts, hintQuery, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי "${hintQuery}"\n${listMsg}\n\n_השב_ *בחר N*`);
+      return;
+    }
+
+    // ── ארוחה לא ברורה ───────────────────────────────────────────────
+    if (raw.startsWith('MEAL_OPTIONS:')) {
+      const [header, ...rest] = raw.split('\n');
+      const alts = header.slice('MEAL_OPTIONS:'.length).split('|').slice(1);
+      const userMsg = rest.join('\n');
+      bizPending = { type: 'meal_choice', contactName, clientPhone, commandText, alternatives: alts, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `⚠️ *${contactName}*\n${userMsg}\n\n_השב_ *בחר N*`);
+      return;
+    }
+
+    // ── הצלחה או שגיאה ────────────────────────────────────────────────
+    bizPending = null;
+    const msg = code === 0 ? formatBizReceipt(contactName, raw) : `❌ *${contactName}*\n${raw}`;
+    await sendBizMessage(BIZ_GROUP, msg);
+  });
+}
+
+// ─── טיפול בתגובת דני בקבוצה ("כן" / "בחר N") ─────────────────
+async function handleBizGroupResponse(text) {
+  if (!bizPending) return;
+  if (Date.now() - bizPending.timestamp > BIZ_PENDING_TTL) {
+    bizPending = null;
+    return;
+  }
+
+  const t = text.trim();
+  const { type, contactName, correctedName, rawName, clientPhone, commandText, alternatives, opts } = bizPending;
+
+  // ── אישור שם fuzzy ─────────────────────────────────────────────────
+  if (type === 'name_confirm') {
+    if (t === 'כן' || t === 'yes') {
+      bizNamePrefs.set((rawName || contactName).toLowerCase(), correctedName);
+      saveBizPrefs();
+      console.log(`[biz-name saved] "${rawName}" → "${correctedName}"`);
+      bizPending = null;
+      runAutofitBiz(correctedName, clientPhone, commandText, { ...opts, nameOverride: correctedName });
+    } else if (t === 'לא' || t === 'no') {
+      bizPending = null;
+      await sendBizMessage(BIZ_GROUP, `❌ פעולה בוטלה`);
+    }
+    return;
+  }
+
+  // ── בחירת מזון / hint / ארוחה ──────────────────────────────────────
+  if (['food_choice', 'hint_choice', 'meal_choice'].includes(type)) {
+    // "בחר N" או "N" בלבד
+    const numMatch = t.match(/^(?:בחר\s+)?(\d+)$/);
+    let chosen = null;
+
+    if (numMatch) {
+      const idx = parseInt(numMatch[1]) - 1;
+      if (idx >= 0 && idx < alternatives.length) chosen = alternatives[idx];
+    } else if (t.length >= 2 && !t.includes('\n')) {
+      // טקסט חופשי — אפשר גם לכתוב שם מזון
+      chosen = t;
+    }
+
+    if (!chosen) return;
+
+    bizPending = null;
+
+    if (type === 'food_choice') {
+      runAutofitBiz(contactName, clientPhone, commandText, { ...opts, foodOverride: chosen });
+    } else if (type === 'hint_choice') {
+      runAutofitBiz(contactName, clientPhone, commandText, { ...opts, hintOverride: chosen });
+    } else {
+      runAutofitBiz(contactName, clientPhone, commandText, { ...opts, mealOverride: chosen });
+    }
+  }
+}
+
+// ─── Webhook v3 — הודעות יוצאות מהחשבון העסקי ─────────────────
+app.post('/webhook-business', async (req, res) => {
+  res.sendStatus(200);
+  if (!BIZ_ID || !BIZ_GROUP) return; // לא מוגדר → עצור
+
+  const body = req.body;
+
+  // כל הודעה שהבוט עצמו שלח — התעלם (מניעת לולאה)
+  const msgId = body.idMessage;
+  if (msgId && bizBotSentIds.has(msgId)) return;
+
+  // dedup
+  if (msgId) {
+    if (bizProcessedIds.has(msgId)) return;
+    bizProcessedIds.add(msgId);
+    if (bizProcessedIds.size > 500) {
+      const arr = [...bizProcessedIds];
+      arr.slice(0, 250).forEach(id => bizProcessedIds.delete(id));
+    }
+  }
+
+  const msg = body.messageData;
+  if (!msg || msg.typeMessage !== 'textMessage') return;
+  const text = msg.textMessageData?.textMessage?.trim();
+  if (!text) return;
+
+  const chatId = body.senderData?.chatId || '';
+  console.log(`[biz-wh] type=${body.typeWebhook} chatId=${chatId} text="${text.slice(0,40)}"`);
+
+  // ── תגובות דני בקבוצה ──────────────────────────────────────────────
+  if (chatId === BIZ_GROUP || chatId.replace('@g.us','') === (BIZ_GROUP || '').replace('@g.us','')) {
+    // הודעות יוצאות מהחשבון בקבוצה = תגובות דני
+    if (body.typeWebhook === 'outgoingMessageReceived') {
+      await handleBizGroupResponse(text);
+    }
+    return;
+  }
+
+  // ── שיחות 1-on-1 עם לקוחות ─────────────────────────────────────────
+  // קולט רק הודעות יוצאות (דני שולח ללקוח)
+  if (body.typeWebhook !== 'outgoingMessageReceived') return;
+  if (chatId.includes('@g.us')) return; // דלג על קבוצות
+
+  // בדוק מילות מפתח
+  if (!hasTriggerWord(text)) return;
+
+  console.log(`[biz] פקודה: chatId=${chatId} | "${text.slice(0,60)}"`);
+
+  // שלוף שם איש הקשר
+  const contactName = await getContactName(chatId);
+  const clientPhone = chatId.replace('@c.us', '');
+  console.log(`[biz] לקוח: "${contactName}" (${clientPhone})`);
+
+  // בדוק cache שמות
+  const cachedId = bizNamePrefs.get(contactName.toLowerCase());
+  const extraOpts = cachedId ? { userIdOverride: cachedId } : {};
+
+  runAutofitBiz(contactName, clientPhone, text, extraOpts);
 });
 
 // ─── Health check ─────────────────────────────────────────────
@@ -357,6 +750,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT}`);
 
+  // ── Webhook v1/v2 (חשבון אישי) ──────────────────────────────────
   const webhookUrl = process.env.WEBHOOK_URL;
   if (webhookUrl) {
     try {
@@ -365,11 +759,33 @@ app.listen(PORT, async () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ webhookUrl, webhookUrlToken: '' }),
       });
-      console.log('✅ Webhook set:', webhookUrl);
+      console.log('✅ Webhook v1 set:', webhookUrl);
     } catch (e) {
-      console.error('Webhook setup error:', e.message);
+      console.error('Webhook v1 setup error:', e.message);
     }
   } else {
     console.log('⚠️  WEBHOOK_URL not set — set it in Railway env vars');
+  }
+
+  // ── Webhook v3 (חשבון עסקי) ──────────────────────────────────────
+  const bizWebhookUrl = process.env.WEBHOOK_URL_BIZ;
+  if (BIZ_BASE && BIZ_TOKEN && bizWebhookUrl) {
+    try {
+      await fetch(`${BIZ_BASE}/setSettings/${BIZ_TOKEN}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          webhookUrl: bizWebhookUrl,
+          outgoingWebhook: 'yes',        // קבלת הודעות יוצאות
+          outgoingMessageWebhook: 'yes', // גיבוי
+          incomingWebhook: 'yes',        // קבלת הודעות נכנסות (לתגובות בקבוצה)
+        }),
+      });
+      console.log('✅ Webhook v3 (biz) set:', bizWebhookUrl);
+    } catch (e) {
+      console.error('Webhook v3 setup error:', e.message);
+    }
+  } else if (BIZ_ID) {
+    console.log('⚠️  BIZ instance מוגדר אבל WEBHOOK_URL_BIZ חסר');
   }
 });

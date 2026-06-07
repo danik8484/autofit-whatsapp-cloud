@@ -118,9 +118,45 @@ def find_user(query: str):
     if is_phone:
         phones = _load_phones()
         name = phones.get(clean) or phones.get("972" + clean[1:] if clean.startswith("0") else clean)
-        if not name:
+        if name:
+            query = name
+        else:
+            # phone fallback: חיפוש ב-auto-fit לפי מספר טלפון
+            _phone_norm = lambda p: re.sub(r'[\s\-\+]', '', str(p or ''))
+            _to_il = lambda p: ('0' + p[3:]) if p.startswith('972') else p
+            clean_il = _to_il(clean)
+            _phone_users = []
+            try:
+                if USER_CACHE_FILE.exists():
+                    _cd = json.loads(USER_CACHE_FILE.read_text(encoding="utf-8"))
+                    if time.time() - _cd.get("ts", 0) < USER_CACHE_TTL:
+                        _phone_users = _cd["users"]
+            except:
+                pass
+            if not _phone_users:
+                _page = 1
+                while True:
+                    _data = _post("/coach/get-coach-users", {"page": _page, "limit": 100})
+                    _phone_users.extend(_data.get("data", []))
+                    _total = _data.get("pagination", {}).get("total", 0)
+                    if _page * 100 >= _total:
+                        break
+                    _page += 1
+                try:
+                    USER_CACHE_FILE.write_text(
+                        json.dumps({"ts": time.time(), "users": _phone_users}, ensure_ascii=False),
+                        encoding="utf-8"
+                    )
+                except:
+                    pass
+            for u in _phone_users:
+                u_phone = _to_il(_phone_norm(u.get("phone", "")))
+                if u_phone and (u_phone == clean_il or u_phone == clean):
+                    uid = str(u["id"])
+                    full_name = (u.get("name") or f"{u.get('first_name','')} {u.get('last_name','')}").strip()
+                    _uid_cache[query] = (uid, full_name, False)
+                    return uid, full_name, False
             return None, None, False
-        query = name
 
     query = query.replace("-", " ")  # מקף = רווח בשם
     query = re.sub(r'\s+', ' ', query).strip()
@@ -168,22 +204,24 @@ def find_user(query: str):
 
     # pass 1: כל מילות השאילתה נמצאות בשם
     # אם שאילתה קצרה מהשם המלא → is_fuzzy=True (שם חלקי → שאל אישור)
-    exact_match = None   # אותו מספר מילים — התאמה מדויקת
+    exact_matches = []   # כל ההתאמות המדויקות
     partial_match = None # מספר מילים פחות — התאמה חלקית
     for u in all_users:
         full_name = _full(u)
         name_words_norm = [_ng(w) for w in full_name.split()]
         if all(nt in name_words_norm for nt in terms_norm):
             if len(terms) == len(full_name.split()):
-                exact_match = (str(u["id"]), full_name)
-                break
+                exact_matches.append((str(u["id"]), full_name))
             elif partial_match is None:
                 partial_match = (str(u["id"]), full_name)
 
-    if exact_match:
-        uid, full_name = exact_match
+    if len(exact_matches) == 1:
+        uid, full_name = exact_matches[0]
         _uid_cache[query] = (uid, full_name, False)
         return uid, full_name, False
+    if len(exact_matches) > 1:
+        encoded = ";".join(f"{uid}|{name}" for uid, name in exact_matches)
+        return "MULTIPLE", encoded, False
     if partial_match:
         uid, full_name = partial_match
         _uid_cache[query] = (uid, full_name, True)  # שם חלקי → תמיד שאל
@@ -371,12 +409,23 @@ def normalize_food_query(q: str) -> str:
     words = [w if w in _PROTECT_L else re.sub(r'^ל(?=[א-ת]{3,})', '', w) for w in words]
     return " ".join(words)
 
+# אליאסים: כשמבקשים X, מחפשים Y אלא אם צוין אחרת
+_FOOD_ALIASES: dict[str, str] = {
+    "חזה עוף": "חזה עוף לאחר בישול",
+}
+
 def find_best_food(query: str, coach_id: str = ""):
     """
     מחזיר (best_match, alternatives).
     best_match: התאמה מדויקת/הכי קרובה.
     alternatives: עד 10 תוצאות אם אין התאמה מדויקת.
     """
+    # אליאס: "חזה עוף" → מנסה "חזה עוף לאחר בישול" קודם
+    alias = _FOOD_ALIASES.get(query.strip())
+    if alias:
+        best_a, alts_a = find_best_food(alias, coach_id)
+        if best_a:
+            return best_a, alts_a
     norm_query = normalize_food_query(query)
     foods = search_food(norm_query, coach_id)
     if not foods and norm_query != query:
@@ -502,10 +551,14 @@ def _extract_meal(text: str) -> str:
             return key
     return ""
 
-_VERB_PAT = r"(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להוסיף|להחליף)"
+_VERB_PAT = r"(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להוסיף|להחליף|שימ[יי]?|תשימ[יי]?)"
 
 def _extract_foods(text: str):
     """מחלץ (מזון_חדש, מזון_קיים) מטקסט. מחזיר (new_food, group_hint)."""
+    # נרמול synonyms של "כאופציה/באופציה" לפני כל חיפוש
+    text = re.sub(r'באופצי(?:ה|ות)?\s+של', 'במקום', text)
+    text = re.sub(r'כאופציה\s+(?:ל|של)', 'במקום ', text)
+    text = re.sub(r'אופציה\s+של\s+', '', text)  # "אופציה של X במקום Y" → "X במקום Y"
     # סוגריים: (טונה) במקום (אורז)
     parens = re.findall(r"\(([^)]+)\)", text)
     if len(parens) >= 2:
@@ -520,6 +573,14 @@ def _extract_foods(text: str):
     )
     if m:
         return m.group(1).strip(), m.group(2).strip()
+
+    # "לHINT [verb] NEW_FOOD" — hint לפני הפועל (למשל "לאורז תוסיפי חזה עוף")
+    m_pre = re.match(
+        r'^ל([\u05D0-\u05EA]+(?:\s+[\u05D0-\u05EA]+)?)\s+' + _VERB_PAT + r'\s+(.+)',
+        text,
+    )
+    if m_pre:
+        return m_pre.group(2).strip(), m_pre.group(1).strip()
 
     # "הוסף X" בלבד
     m2 = re.search(
@@ -549,6 +610,32 @@ def _extract_foods(text: str):
     return "", ""
 
 
+_COMMON_SURNAMES = frozenset({
+    'כהן', 'לוי', 'מזרחי', 'פרץ', 'שפירא', 'אוחיון', 'אמסלם', 'גולן', 'רוזן',
+    'שרון', 'ביטון', 'עמר', 'זוהר', 'שלום', 'מלול', 'אלבז', 'בן', 'אבו',
+    'בר', 'דוד', 'יצחק', 'אברהם', 'יוסף', 'חיים', 'שמעון', 'עוז', 'אלון',
+})
+_SURNAME_SUFFIXES = ('ביץ', 'ייץ', 'ניץ', 'מן', 'שטיין', 'ניק', 'ובי', 'ייב')
+
+def _looks_like_surname(word: str) -> bool:
+    """בודק אם מילה עשויה להיות שם משפחה (לעומת שם מזון)."""
+    if word in _COMMON_SURNAMES:
+        return True
+    for sfx in _SURNAME_SUFFIXES:
+        if word.endswith(sfx):
+            return True
+    return False
+
+_H_PROTECT_FOODS = frozenset({"הודו", "הכל", "הכול"})
+
+def _strip_definite_article(s: str) -> str:
+    """מסיר ה' הידיעה מכל מילה (למעט מילים מוגנות כגון 'הודו')."""
+    return ' '.join(
+        w if w in _H_PROTECT_FOODS else re.sub(r'^ה(?=[א-ת])', '', w)
+        for w in s.split()
+    ) if s else s
+
+
 def parse_message(text: str) -> dict:
     """
     מנסה לפרסר הודעה — גם בתבנית מובנית וגם בשפה חופשית.
@@ -556,6 +643,19 @@ def parse_message(text: str) -> dict:
     """
     result = {}
     conf = 100
+
+    # ── pre-process: פקודות v3 ("מוסיף לך/לו") → פורמט שהפרסר מבין ───────────
+    # ל[כךו]: לך (ך = כ סופית 0x5da) + לו — שתי הצורות
+    text = re.sub(r'מוסיף\s+ל[כךו]', 'הוסף', text)
+    # מחליף לך X ב-Y → הוסף Y במקום X (Y = subFood לבחירה, X = מה שמחליפים)
+    text = re.sub(
+        r'מחליף\s+ל[כךו]\s+(.+?)\s+ב([^\n]+)',
+        lambda m: f'הוסף {m.group(2).strip()} במקום {m.group(1).strip()}',
+        text
+    )
+    text = re.sub(r'מחליף\s+ל[כךו]', 'הוסף', text)  # fallback: מחליף ללא "ב"
+    text = re.sub(r'(?:מוריד\s+ל[כךו]|מפחית)', 'הפחת', text)
+    text = re.sub(r'מעלה\s+ל[כךו]', 'העלה', text)
 
     # ── pre-process: נרמול רווחים לפני נקודותיים בשמות שדות ─────────────────
     # "שם :" → "שם:", "ארוחה  :" → "ארוחה:" (רווח לפני :)
@@ -654,9 +754,10 @@ def parse_message(text: str) -> dict:
                 v = re.sub(r'בנוסף\s+ל', 'ל ', v)         # "בנוסף ל X" → "ל X"
                 v = re.sub(r'במקום\s+של', 'ל ', v)      # "במקום של X" → "ל X"
                 v = re.sub(r'במקום', 'ל ', v)            # "במקום X" → "ל X"
-                v = re.sub(r'באופציות\s+של', 'ל ', v)   # "באופציות של X" → "ל X"
-                v = re.sub(r'כאופציה\s+ל', 'ל ', v)     # "כאופציה ל X" → "ל X"
+                v = re.sub(r'באופצי(?:ה|ות)?\s+של', 'ל ', v)  # "באופציה/ות של X" → "ל X"
+                v = re.sub(r'כאופציה\s+(?:ל|של)', 'ל ', v)  # "כאופציה ל/של X" → "ל X"
                 v = re.sub(r'כתחליף\s+ל', 'ל ', v)      # "כתחליף ל X" → "ל X"
+                v = re.sub(r'אופציה\s+של\s+', '', v)    # "אופציה של X" → "X"
                 # גרמים: "עוד X גרם FOOD" / "X גרם [ל]FOOD" / "FOOD X גרם"
                 extra_grams = None
                 grams_m = re.search(r'\bעוד\s+(\d+)\s*גרם\b', v)
@@ -746,12 +847,26 @@ def parse_message(text: str) -> dict:
         full = re.sub(r'(\d+\s*גרם\s+)מה?\s*', r'\1', full)
         full = re.sub(r'\s+', ' ', full).strip()
 
+    # פועלי הגדלה — הסר לפני פרסינג (לא reduce, פשוט הסרת הפועל)
+    full = re.sub(r'\b(?:תעל[יי]?|העל[יה]?|הגדל[יי]?)\s+', '', full)
+    full = re.sub(r'\s+', ' ', full).strip()
+
     _NOT_NAME_VERBS = frozenset({"הוסיף", "הוסיפי", "תוסיפי", "תוסיף", "החלף",
                                   "תחליפי", "תחליף", "הכנס", "הכניס", "להכניס",
                                   "עדכן", "שנה", "בצע", "שלח", "עשה", "עשי",
                                   "הוציא", "מחק", "הסר", "החליף", "תחליפ",
                                   "ארוחת", "ארוחה", "נוסיף", "נוסיפי",
-                                  "מזון", "חדש", "הורד", "הפחת", "תוריד", "תורידי"})
+                                  "מזון", "חדש", "הורד", "הפחת", "תוריד", "תורידי",
+                                  "תעלי", "תעלה", "העלי", "העלה", "הגדלי", "הגדל",
+                                  # מילות בישול — מונעות לקיחת "לאחר בישול" כשם אדם
+                                  "אחר", "אחרי", "בישול", "מבושל", "גולמי", "חי",
+                                  "קלוי", "מאודה", "טחון", "מטוגן", "אפוי", "מעורבב",
+                                  # מילות אופציה — מונעות לקיחת "דני אופציה" כשם
+                                  "אופציה", "אופציות",
+                                  # פעלי הוספה בסדר "לX תשימי" — מונעות לאבד את X
+                                  "שים", "שימי", "תשים", "תשימי",
+                                  # "עוד" — כינוי כמות, לא שם
+                                  "עוד"})
 
     _MEAL_MAP_FT = {"ערב": "ערב", "לילה": "ערב", "בוקר": "בוקר",
                     "צהריים": "צהריים", "צהרים": "צהריים", "ביניים": "ביניים"}
@@ -770,6 +885,11 @@ def parse_message(text: str) -> dict:
                     for k in [k1, k2]:
                         if k not in _meal_hits:
                             _meal_hits.append(k)
+        # "+ערב", "+בוקר" וכו' — ארוחה נוספת עם +
+        for w, k in _MEAL_MAP_FT.items():
+            if re.search(rf'\+\s*{w}\b', full):
+                if k not in _meal_hits:
+                    _meal_hits.append(k)
         _meal_hits = list(dict.fromkeys(_meal_hits))
         if len(_meal_hits) > 1:
             result["meals"] = _meal_hits
@@ -779,45 +899,114 @@ def parse_message(text: str) -> dict:
     # נקה ביטויי ארוחה לפני חילוץ שם/מזון
     _meal_re = r'ב(?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b'
     full_no_meal = re.sub(_meal_re, '', full)
+    # גם "+ארוחה" (כמו "+ערב", "+צהריים")
+    full_no_meal = re.sub(r'\s*\+\s*(?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     # גם "ו+ארוחה" (כמו "וערב")
     full_no_meal = re.sub(r'\s+[וV](?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     full_no_meal = re.sub(r'\b(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\s+[וV]\s*(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
+    # מונע "אופציה של X" מלהיות prefix לשם אדם בחיפוש שמות
+    full_no_meal = re.sub(r'אופציה\s+של\s+', '', full_no_meal)
+    full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
 
     if "name" not in result:
         name_match = None
-        _NAME_STOP = r'(?:במקום|בנוסף|כאופציה|כתחליף|ובמקום)\b'
-        for _m in re.finditer(
-            r"(?:של\s+|עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+(?!" + _NAME_STOP + r")[\u05D0-\u05EA]{2,})?)",
-            full_no_meal,
-        ):
-            words = _m.group(1).strip().split()
-            if words[0] not in _NOT_NAME_VERBS and (len(words) < 2 or words[1] not in _NOT_NAME_VERBS):
-                result["name"] = _m.group(1).strip()
-                name_match = _m
-                break
-        if name_match:
-            conf = 85
-            clean_full = full_no_meal[:name_match.start()] + full_no_meal[name_match.end():]
+        _name_cut_end = 0
+        _NAME_STOP = r'(?:במקום|בנוסף|כאופציה|כתחליף|ובמקום|אופציה)\b'
+
+        # Fix C: שם לפני מפריד בתחילת משפט ("דני - תוסיפי X" / "דני: X")
+        _pre_sep = re.match(r'^([\u05D0-\u05EA]{2,6})\s*[-:–]\s*', full_no_meal)
+        if _pre_sep and _pre_sep.group(1) not in _NOT_NAME_VERBS:
+            result["name"] = _pre_sep.group(1)
+            conf = max(conf, 75)
+            clean_full = full_no_meal[_pre_sep.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
         else:
-            conf = 40
-            clean_full = full_no_meal
+            for _m in re.finditer(
+                r"(?:(?<!\S)של\s+|(?<!\S)עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA]))([\u05D0-\u05EA]{2,}(?:\s+(?!" + _NAME_STOP + r")[\u05D0-\u05EA]{2,})?)",
+                full_no_meal,
+            ):
+                words = _m.group(1).strip().split()
+                # ל + פועל + לשם: "להוסיף לדני" — חלץ שם מ-words[1]
+                if len(words) >= 2 and words[0] in _NOT_NAME_VERBS and words[1][:1] == '\u05DC' and len(words[1]) >= 3:
+                    _cand = words[1][1:]  # הסר ל' prefix
+                    if _cand not in _NOT_NAME_VERBS:
+                        result["name"] = _cand
+                        _name_cut_end = _m.start(1) + len(words[0]) + 1 + len(words[1])
+                        name_match = _m
+                        break
+                if words[0] not in _NOT_NAME_VERBS:
+                    # בדוק: אם אחרי ה"שם" יש פועל ואחריו ל-שם נוסף — זה עצם, לא שם אדם
+                    if len(words) >= 2 and words[1] in _NOT_NAME_VERBS:
+                        # words[1] הוא פועל — בדוק אם יש שם אדם אחרי הפועל
+                        _after_verb = full_no_meal[_m.start(1) + len(words[0]) + 1 + len(words[1]):].strip()
+                        if re.search(r'(?<!\S)ל(?=[\u05D0-\u05EA])', _after_verb):
+                            continue  # יש "לX" אחרי הפועל — זה עצם (מזון), לא שם אדם
+                        result["name"] = words[0]
+                        _name_cut_end = _m.start(1) + len(words[0])
+                    elif len(words) >= 2 and not _looks_like_surname(words[1]):
+                        # Fix A: words[1] לא נראה שם משפחה — כנראה שם מזון, לקחת רק words[0]
+                        result["name"] = words[0]
+                        _name_cut_end = _m.start(1) + len(words[0])
+                    else:
+                        result["name"] = _m.group(1).strip()
+                        _name_cut_end = _m.end()
+                    name_match = _m
+                    break
+
+            if name_match:
+                conf = 85
+                clean_full = full_no_meal[:name_match.start()] + full_no_meal[_name_cut_end:]
+                clean_full = re.sub(r'\s+', ' ', clean_full).strip()
+            else:
+                # Fix D: שם אחרי פועל ללא "ל" לפני גרמים ("תוסיפי דני 80 גרם")
+                _pv = re.search(_VERB_PAT + r'\s+([\u05D0-\u05EA]{2,5})\s+(?=\d+\s*גרם\b)', full_no_meal)
+                if _pv:
+                    _pv_n = _pv.group(1)
+                    # strip leading ל (למשל "לדני" → "דני")
+                    if _pv_n.startswith("ל") and len(_pv_n) > 1:
+                        _pv_n = _pv_n[1:]
+                    if _pv_n not in _NOT_NAME_VERBS:
+                        result["name"] = _pv_n
+                        conf = 65
+                        _pv_s = _pv.start(1)
+                        _pv_e = _pv.end(1)
+                        clean_full = full_no_meal[:_pv_s] + full_no_meal[_pv_e:]
+                        clean_full = re.sub(r'\s+', ' ', clean_full).strip()
+                    else:
+                        conf = 40
+                        clean_full = full_no_meal
+                else:
+                    conf = 40
+                    clean_full = full_no_meal
     else:
         clean_full = full_no_meal
 
     # נרמול synonyms לפני חילוץ מזון
-    clean_full = re.sub(r'באופציות\s+של', 'במקום', clean_full)
-    clean_full = re.sub(r'כאופציה\s+ל', 'במקום ', clean_full)
+    clean_full = re.sub(r'באופצי(?:ה|ות)?\s+של', 'במקום', clean_full)   # "באופציה של" / "באופציות של"
+    clean_full = re.sub(r'כאופציה\s+(?:ל|של)', 'במקום ', clean_full)
     clean_full = re.sub(r'כתחליף\s+ל', 'במקום ', clean_full)
     clean_full = re.sub(r'בנוסף\s+ל', 'במקום ', clean_full)
+    clean_full = re.sub(r'אופציה\s+של\s+', '', clean_full)     # "אופציה של X" → "X"
+    clean_full = re.sub(r'אופציה\s+לתחליף\s+', '', clean_full) # "אופציה לתחליף X" → "X"
+    clean_full = re.sub(r'תחליף\s+של\s+', '', clean_full)       # "תחליף של X" → "X"
+    clean_full = re.sub(r'\bעוד\s+', '', clean_full)             # "עוד 75 גרם" → "75 גרם"
+
+    # "לFOOD VERB ..." בתחילת משפט — hint לפני פועל: FOOD + "במקום" + HINT
+    _hint_pre = re.match(
+        r'^ל([\u05D0-\u05EA]{2,}(?:\s+[\u05D0-\u05EA]{2,})?)\s+' + _VERB_PAT + r'\s+',
+        clean_full,
+    )
+    if _hint_pre:
+        _pre_hint_word = _hint_pre.group(1)
+        clean_full = clean_full[_hint_pre.end():].strip() + f' במקום {_pre_hint_word}'
 
     # מזון — על הטקסט ללא השם
     new_food, group_hint = _extract_foods(clean_full)
-    if not new_food and "name" in result:
+    if not new_food and ("name" in result or not result.get("change")):
         # fallback: הטקסט שנשאר אחרי הסרת שם+ארוחה = שם המזון
         # מסיר פעלים בתחילה ותווי זבל
-        fb = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|הכנס|שים|תשים|הכניס)\s+', '', clean_full).strip()
+        fb = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|הכנס|שימ[יי]?|תשימ[יי]?|הכניס)(?:\s+|$)', '', clean_full).strip()
         fb = re.sub(r'[^א-ת\s\d%\'\"]+', ' ', fb).strip()
         fb = re.sub(r'\s+', ' ', fb).strip()
         if len(fb) >= 2:
@@ -844,6 +1033,20 @@ def parse_message(text: str) -> dict:
                     new_food, group_hint = ml.group(1).strip(), ml.group(2).strip()
                 else:
                     new_food = fb
+    # מספר בסוף שם מזון ללא "גרם" — חלץ כמות: "אורז 75" → food="אורז", extra_grams=75
+    if new_food:
+        _trail_num = re.match(r'^(.*?)\s+(\d+)\s*$', new_food.strip())
+        if _trail_num and not re.search(r'\d', _trail_num.group(1)):
+            new_food = _trail_num.group(1).strip()
+            if not result.get("extra_grams"):
+                result["extra_grams"] = _trail_num.group(2)
+
+    # Fix B: הסרת ה' הידיעה מהמזון ומה-hint לפני בניית change string
+    if new_food:
+        new_food = _strip_definite_article(new_food)
+    if group_hint:
+        group_hint = _strip_definite_article(group_hint)
+
     if new_food:
         change_str = f"הוסף ({new_food})"
         if group_hint:
@@ -867,9 +1070,55 @@ def parse_message(text: str) -> dict:
     return result
 
 
+_MULTI_VERBS = (r'(?:תוסיפ[יי]?|הוסיפ[יי]?|תחליפ[יי]?|החליפ[יי]?'
+                r'|תעל[יי]?|העל[יה]?|הגדל[יי]?'
+                r'|תוריד[יי]?|הורד[יי]?|הפחת[יי]?'
+                r'|הכנס|תכניס)')
+
+_NEGATION_PREFIX = re.compile(
+    r'^\s*(?:אל\s+ת|לא\s+(?:ל(?:הוסיף|החליף|עדכן|שנות)|ת(?:וסיפ|חליפ|עלה|עלי|ורידי|וריד)))',
+    re.UNICODE
+)
+
 def execute_request(request_text: str, force: bool = False,
                     name_override: str = "", meal_override: str = "",
-                    food_override: str = "", hint_override: str = "") -> str:
+                    food_override: str = "", hint_override: str = "",
+                    user_id_override: str = "") -> str:
+    # ── שלילה: "אל תוסיפי" / "לא להוסיף" ─────────────────────────────────────
+    if _NEGATION_PREFIX.search(request_text.strip()):
+        return "❓ לא הבנתי — נראה כמו שלילה. אם רצית לבצע פעולה, שלח שוב ללא 'אל' / 'לא'."
+    # ── ריבוי משימות: "תעלי לדני X ותוסיפי לו Y" / שורות נפרדות ─────────────
+    if not name_override and not food_override and not hint_override:
+        # פיצוח: "ו+פועל" OR שורה חדשה שמתחילה בפועל
+        _mt_parts = re.split(
+            rf'(?:\s+ו(?={_MULTI_VERBS})|\n\s*(?={_MULTI_VERBS}))',
+            request_text.strip()
+        )
+        if len(_mt_parts) > 1:
+            # חלץ שם וארוחה מהחלק הראשון
+            _fp = parse_message(_mt_parts[0])
+            _first_name = _fp.get("name", "")
+            _first_meal = _fp.get("meal", "") or ""
+            sub_results = []
+            for i, part in enumerate(_mt_parts):
+                if i > 0 and _first_name:
+                    # "לו/לה/לזה" → "לFIRST_NAME"
+                    part = re.sub(r'\bל(?:ו|ה|זה|זו|אותו|אותה)\b', f'ל{_first_name}', part)
+                    # הוסף ארוחה אם חסרה
+                    if _first_meal and not re.search(r'\b(?:ערב|בוקר|צהריים|ביניים)\b', part):
+                        part += f' ב{_first_meal}'
+                    # בדוק שיש מספיק תוכן (לפחות שם מזון אחד)
+                    _pp = parse_message(part)
+                    if not _pp.get("change") or not _pp.get("name"):
+                        continue  # דלג על חלק חסר תוכן
+                sub_results.append(execute_request(part, force, name_override,
+                                                   meal_override, food_override, hint_override,
+                                                   user_id_override))
+            if not sub_results:
+                pass  # ימשיך לפרסינג רגיל
+            else:
+                return "\n\n".join(sub_results)
+
     # ריבוי אנשים: "שם: X ... שם: Y" → מפצל ומטפל בנפרד
     if not name_override:
         _parts = re.split(r'(?m)(?=^\s*שם\s*:)', request_text.strip())
@@ -878,7 +1127,8 @@ def execute_request(request_text: str, force: bool = False,
             sub_results = []
             for part in _parts:
                 sub_results.append(execute_request(part, force, name_override,
-                                                   meal_override, food_override, hint_override))
+                                                   meal_override, food_override, hint_override,
+                                                   user_id_override))
             return "\n\n─────────────\n\n".join(sub_results)
 
     parsed = parse_message(request_text)
@@ -911,6 +1161,14 @@ def execute_request(request_text: str, force: bool = False,
                 leftover = parts[1]
                 ch = parsed.get("change", "")
                 parsed["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', ch, count=1)
+        if uid_check == "MULTIPLE":
+            # ריבוי מתאמנים — שלח NAME_OPTIONS
+            options = found_name.split(";")
+            lines = "\n".join(f"{i+1}. {opt.split('|')[1]}" for i, opt in enumerate(options))
+            ids_pipe = "|".join(opt.split("|")[0] for opt in options)
+            names_pipe = "|".join(opt.split("|")[1] for opt in options)
+            return f"NAME_OPTIONS:{ids_pipe}||{names_pipe}\nמצאתי {len(options)} מתאמנים בשם *{raw_name}*:\n{lines}\n\nשלח מספר לבחירה."
+
         if not uid_check:
             return f"NAME_NOT_FOUND:{raw_name}"
 
@@ -951,6 +1209,25 @@ def execute_request(request_text: str, force: bool = False,
 
     name   = name_override if name_override else parsed["name"]
 
+    # כשname_override שונה מהשם שנוסח — בדוק אם יש מילות "עודף" שנספחו לשם
+    # דוגמה: parsed["name"]="דני שיבולת", name_override="דני קגנוביץ'" → "שיבולת" חזרה לאוכל
+    if name_override and parsed.get("name") and parsed["name"] != name_override:
+        def _ng_s(s): return re.sub(r"[׳״\']", "", s)
+        def _strip_l(s): return re.sub(r'^ל', '', s)  # "ליה" → "יה"
+        # השוואה fuzzy: strip ל, נרמול גרש, levenshtein≤1
+        def _name_word_match(pw, ow):
+            pn = _ng_s(_strip_l(pw)); on = _ng_s(_strip_l(ow))
+            return pn == on or _levenshtein(pn, on) <= 1
+        override_words = name_override.split()
+        extra_words = [w for w in parsed["name"].split()
+                       if not any(_name_word_match(w, ow) for ow in override_words)]
+        if extra_words:
+            leftover = " ".join(extra_words)
+            ch = parsed.get("change", "")
+            parsed["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', ch, count=1)
+            for _op in parsed.get("ops", []):
+                _op["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', _op.get("change",""), count=1)
+
     # בנה רשימת ארוחות ברירת מחדל
     if meal_override:
         m = _extract_meal(meal_override)
@@ -959,9 +1236,12 @@ def execute_request(request_text: str, force: bool = False,
         meals_list = parsed.get("meals") or [parsed.get("meal", "ערב")]
 
     # מצא מתאמן (פעם אחת)
-    user_id, full_name, is_fuzzy = find_user(name)
+    if user_id_override:
+        user_id, full_name, is_fuzzy = user_id_override, name_override or name, False
+    else:
+        user_id, full_name, is_fuzzy = find_user(name)
     # fallback: שם 2 מילים לא נמצא → נסה מילה ראשונה
-    if not user_id and not name_override and ' ' in name:
+    if not user_id_override and not user_id and not name_override and ' ' in name:
         parts = name.split(None, 1)
         user_id2, full_name2, is_fuzzy2 = find_user(parts[0])
         if user_id2:
@@ -973,6 +1253,13 @@ def execute_request(request_text: str, force: bool = False,
             # עדכן ops אם קיים
             for _op in parsed.get("ops", []):
                 _op["change"] = re.sub(r'הוסף \(', f'הוסף ({leftover} ', _op.get("change",""), count=1)
+    if user_id == "MULTIPLE":
+        # ריבוי מתאמנים באותו שם — שלח רשימה לבחירה
+        options = full_name.split(";")
+        lines = "\n".join(f"{i+1}. {opt.split('|')[1]}" for i, opt in enumerate(options))
+        ids_pipe = "|".join(opt.split("|")[0] for opt in options)
+        names_pipe = "|".join(opt.split("|")[1] for opt in options)
+        return f"NAME_OPTIONS:{ids_pipe}||{names_pipe}\nמצאתי {len(options)} מתאמנים בשם *{name}*:\n{lines}\n\nשלח מספר לבחירה."
     if not user_id:
         return f"NAME_NOT_FOUND:{name}"
     # safety: אם עדיין fuzzy אחרי name_override — שלח שגיאה
@@ -1215,17 +1502,27 @@ if __name__ == "__main__":
             return val
         return ""
 
-    name_override  = _pop_arg("--name")
-    meal_override  = _pop_arg("--meal")
-    food_override  = _pop_arg("--food")
-    hint_override  = _pop_arg("--hint")
-    menu_name      = _pop_arg("--menu")
+    name_override    = _pop_arg("--name")
+    meal_override    = _pop_arg("--meal")
+    food_override    = _pop_arg("--food")
+    hint_override    = _pop_arg("--hint")
+    menu_name        = _pop_arg("--menu")
+    user_id_override = _pop_arg("--user-id")
 
     if menu_name:
         uid, full_name, _ = find_user(menu_name)
         if not uid:
             print(f"❌ לא מצאתי '{menu_name}'")
             sys.exit(1)
+        if uid == "MULTIPLE":
+            # יש כמה משתמשים עם אותו שם — הצג שניהם עם מספר ID
+            entries = [e.split("|", 1) for e in full_name.split(";")]
+            parts = [f"⚠️ נמצאו {len(entries)} מתאמנים בשם '{menu_name}':"]
+            for eid, ename in entries:
+                parts.append(f"\n🔸 {ename} (ID: {eid}):")
+                parts.append(format_menu(eid, ename))
+            print("\n".join(parts))
+            sys.exit(0)
         print(format_menu(uid, full_name))
         sys.exit(0)
 
@@ -1238,7 +1535,8 @@ if __name__ == "__main__":
                               name_override=name_override,
                               meal_override=meal_override,
                               food_override=food_override,
-                              hint_override=hint_override))
+                              hint_override=hint_override,
+                              user_id_override=user_id_override))
     except Exception as e:
         print(f"שגיאה: {e}", file=sys.stderr)
         sys.exit(1)
