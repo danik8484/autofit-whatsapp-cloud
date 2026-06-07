@@ -1177,137 +1177,50 @@ def parse_message(text: str) -> dict:
                 full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
 
     if "name" not in result:
-        name_match = None
-        _name_cut_end = 0
-        _NAME_STOP = r'(?:במקום|בנוסף|כאופציה|כתחליף|ובמקום|אופציה)\b'
+        # כלל פוזיציוני: [פעולה] [שם פרטי] [שם משפחה] [מזון...]
+        # מילה 1 = פעולה תמיד, מילה 2 = שם פרטי תמיד, מילה 3 = שם משפחה תמיד
 
-        # Detect ל + phone number (e.g., ל0546739981)
+        # טלפון: "ל0546..." — טיפול מיוחד לפני הכלל הפוזיציוני
         _phone_lm = re.search(r'(?<!\S)ל(972\d{9}|05[\d\-]{8,})', full_no_meal)
         if _phone_lm:
             result["name"] = _phone_lm.group(1)
             full_no_meal = full_no_meal[:_phone_lm.start()] + full_no_meal[_phone_lm.end():]
             full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
-            clean_full = full_no_meal  # phone path: skip name-finding blocks
+            clean_full = full_no_meal
+        else:
+            _wds = full_no_meal.split()
+            _pos = 0  # מיקום תחילת השם (אחרי פועל)
 
-        # Fix C: שם לפני מפריד בתחילת משפט ("דני - תוסיפי X" / "רון וליצקו: X")
-        _pre_sep = re.match(
-            r'^([\u05D0-\u05EA\u05F3\u0027]{2,}(?:\s+[\u05D0-\u05EA\u05F3\u0027]{2,}){0,2})\s*[-:–]\s*', full_no_meal
-        )
-        # Fix E: "NAME צריך/רוצה/מבקש X" — שם בתחילה לפני פועל הקשר
-        _ctx_verb = re.match(
-            r'^([\u05D0-\u05EA]{2,5})\s+(?:צריך|רוצה|מבקש|מקבל|יצטרך|אוכל)\s+',
-            full_no_meal
-        )
-        # Fix G: "NAME GRAMS גרם FOOD" — שם בתחילה ישירות לפני גרמים
-        # V3: לא מסיר ל' מהשם (ל' חלק מהשם, כגון ליצקו); V1/V2: מסיר ל' מוביל
-        _name_grams = re.match(
-            r'^([א-ת\u05F3\']{2,8})\s+(\d+)\s*גרם\s+' if _v3_triggered else
-            r'^ל?([א-ת\u05F3\']{2,6})\s+(\d+)\s*גרם\s+',
-            full_no_meal
-        )
-        if "name" not in result and _ctx_verb and _ctx_verb.group(1) not in _NOT_NAME_VERBS:
-            result["name"] = _ctx_verb.group(1)
-            conf = max(conf, 70)
-            clean_full = full_no_meal[_ctx_verb.end():]
-            clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-        elif ("name" not in result and _name_grams
-              and _name_grams.group(1) not in _NOT_NAME_VERBS
-              and _name_grams.group(1) not in _FOOD_NOT_SURNAME
-              # אם יש ל+שם אחר בהמשך — הוא השם האמיתי, לא המילה הראשונה
-              and not re.search(r'(?<!\S)ל[א-ת]{2,}', full_no_meal[_name_grams.end():])):
-            result["name"] = _name_grams.group(1)
-            result["extra_grams"] = _name_grams.group(2)
-            conf = max(conf, 65)
-            clean_full = full_no_meal[_name_grams.end():]
-            clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-        elif "name" not in result and _pre_sep and all(w not in _NOT_NAME_VERBS for w in _pre_sep.group(1).split()):
-            _pn = _pre_sep.group(1)
-            # "לדני:" → "דני" (strip ל יחס), אבל "ליצקו:" נשאר כמו שהוא (ל חלק מהשם)
-            if _pn.startswith("ל") and len(_pn) > 2 and _pn not in _L_NAMES:
-                _pn = _pn[1:]
-            result["name"] = _pn
-            conf = max(conf, 75)
-            clean_full = full_no_meal[_pre_sep.end():]
-            clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-        elif "name" not in result:
-            for _m in re.finditer(
-                r"(?:(?<!\S)של\s+|(?<!\S)עבור\s+|(?<!\S)ל\s+|(?<!\S)ל(?=[\u05D0-\u05EA\u05F3\u0027]))([\u05D0-\u05EA\u05F3\u0027]{2,}(?:\s+(?!" + _NAME_STOP + r")[\u05D0-\u05EA\u05F3\u0027]{2,})?)",
-                full_no_meal,
-            ):
-                words = _m.group(1).strip().split()
-                # ל + פועל + לשם: "להוסיף לדני" — חלץ שם מ-words[1]
-                if len(words) >= 2 and words[0] in _NOT_NAME_VERBS and words[1][:1] == '\u05DC' and len(words[1]) >= 3:
-                    _cand = words[1][1:]  # הסר ל' prefix
-                    if len(_cand) >= 3 and _cand not in _NOT_NAME_VERBS:
-                        result["name"] = _cand
-                        _name_cut_end = _m.start(1) + len(words[0]) + 1 + len(words[1])
-                        name_match = _m
-                        break
-                if (words[0] not in _NOT_NAME_VERBS and words[0] not in _FOOD_NOT_SURNAME
-                        and _m.group(0).strip() not in _FOOD_NOT_SURNAME):
-                    # בדוק: אם אחרי ה"שם" יש פועל ואחריו ל-שם נוסף — זה עצם, לא שם אדם
-                    if len(words) >= 2 and words[1] in _NOT_NAME_VERBS:
-                        # words[1] הוא פועל — בדוק אם יש שם אדם אחרי הפועל
-                        _after_verb = full_no_meal[_m.start(1) + len(words[0]) + 1 + len(words[1]):].strip()
-                        if re.match(r'ל(?=[א-ת]{3,})', _after_verb.strip()):
-                            continue  # יש "לX" (3+ אותיות) אחרי הפועל — זה עצם (מזון), לא שם אדם
-                        result["name"] = words[0]
-                        _name_cut_end = _m.start(1) + len(words[0])
-                    elif len(words) >= 2 and not _looks_like_surname(words[1]):
-                        # Fix A: words[1] לא נראה שם משפחה — כנראה שם מזון, לקחת רק words[0]
-                        # חריג: אם הפועל קדם למשתנה — words[0] הוא שם האדם
-                        _pre_match_txt = full_no_meal[:_m.start()].rstrip()
-                        _pre_word = _pre_match_txt.split()[-1] if _pre_match_txt.split() else ""
-                        if _pre_word in _NOT_NAME_VERBS:
-                            result["name"] = words[0]
-                            _name_cut_end = _m.start(1) + len(words[0])
-                        else:
-                            _after_m = full_no_meal[_m.end():].lstrip()
-                            _nxt = _after_m.split()[0] if _after_m.split() else ""
-                            _is_action_verb = bool(re.match(_VERB_PAT, _nxt)) if _nxt else False
-                            if _is_action_verb and re.search(r'(?<!\S)ל(?=[א-ת])', _after_m):
-                                continue  # מזון דו-מילי + פועל + לשם — דלג
-                            result["name"] = words[0]
-                            _name_cut_end = _m.start(1) + len(words[0])
-                    else:
-                        result["name"] = _m.group(1).strip()
-                        _name_cut_end = _m.end()
-                    name_match = _m
-                    break
-                elif (len(words) >= 2 and words[0] in _NOT_NAME_VERBS
-                      and words[1].startswith("ל") and len(words[1]) > 1
-                      and words[1][1:] not in _NOT_NAME_VERBS):
-                    # words[0] הוא פועל ו-words[1] הוא "לשם" — השם האמיתי
-                    result["name"] = words[1][1:]  # strip ל: "לדני" → "דני"
-                    _name_cut_end = _m.end()
-                    name_match = _m
-                    break
+            # דלג על פועל ראשון אם קיים
+            _VERB_SET = _NOT_NAME_VERBS | {'מוסיף', 'מוריד', 'מחליף', 'מעלה', 'מפחית'}
+            if _wds and (re.match(_VERB_PAT + r'$', _wds[0]) or _wds[0] in _VERB_SET):
+                _pos = 1
 
-            if name_match:
-                conf = 85
-                clean_full = full_no_meal[:name_match.start()] + full_no_meal[_name_cut_end:]
-                clean_full = re.sub(r'\s+', ' ', clean_full).strip()
+            _fn = _wds[_pos] if len(_wds) > _pos else ''
+            _ln = _wds[_pos + 1] if len(_wds) > _pos + 1 else ''
+
+            # strip ל' יחס מהשם הפרטי ("לרון" → "רון"), אלא אם ל' חלק מהשם
+            if _fn.startswith('ל') and len(_fn) > 2 and _fn not in _L_NAMES:
+                _fn = _fn[1:]
+
+            _fn_ok = bool(_fn and _fn not in _NOT_NAME_VERBS and _fn not in _FOOD_NOT_SURNAME
+                          and not re.match(r'^\d', _fn) and len(_fn) >= 2)
+            _ln_ok = bool(_ln and _ln not in _NOT_NAME_VERBS and _ln not in _FOOD_NOT_SURNAME
+                          and not re.match(r'^\d', _ln)
+                          and re.match(r'^[\u05D0-\u05EA\u05F3\']{2,}', _ln))
+
+            if _fn_ok and _ln_ok:
+                result["name"] = f"{_fn} {_ln}"
+                conf = max(conf, 90)
+                clean_full = ' '.join(_wds[_pos + 2:])
+            elif _fn_ok:
+                result["name"] = _fn
+                conf = max(conf, 75)
+                clean_full = ' '.join(_wds[_pos + 1:])
             else:
-                # Fix D: שם אחרי פועל ללא "ל" ("תוסיפי דני 80 גרם" / "עדכן דני ביצה")
-                _pv = re.search(_VERB_PAT + r'\s+([\u05D0-\u05EA]{2,5})\s+(?=\d+|[\u05D0-\u05EA])', full_no_meal)
-                if _pv:
-                    _pv_n = _pv.group(1)
-                    # strip leading ל (למשל "לדני" → "דני")
-                    if _pv_n.startswith("ל") and len(_pv_n) > 1:
-                        _pv_n = _pv_n[1:]
-                    if _pv_n not in _NOT_NAME_VERBS and _pv_n not in _FOOD_NOT_SURNAME:
-                        result["name"] = _pv_n
-                        conf = 65
-                        _pv_s = _pv.start(1)
-                        _pv_e = _pv.end(1)
-                        clean_full = full_no_meal[:_pv_s] + full_no_meal[_pv_e:]
-                        clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-                    else:
-                        conf = 40
-                        clean_full = full_no_meal
-                else:
-                    conf = 40
-                    clean_full = full_no_meal
+                conf = 40
+                clean_full = full_no_meal
+            clean_full = re.sub(r'\s+', ' ', clean_full).strip()
     else:
         clean_full = full_no_meal
 
