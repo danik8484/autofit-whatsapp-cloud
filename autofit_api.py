@@ -876,15 +876,28 @@ def parse_message(text: str) -> dict:
             meal_key = _extract_meal(key)
             v = val.strip()
             v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
-            if " ל " in v:
-                nf, ht = v.split(" ל ", 1)
+            # multi-food: "20 גרם X ו-15 גרם Y" → multiple ops
+            _mf_s = _detect_multi_food(v)
+            if _mf_s and len(_mf_s) >= 2:
+                for _mf_food, _mf_grams in _mf_s:
+                    _mf_ch = f"הוסף ({_mf_food.strip()})"
+                    _mf_op_d = {"change": _mf_ch, "meal": meal_key}
+                    if _mf_grams:
+                        _mf_op_d["extra_grams"] = _mf_grams
+                    if "ops" not in result:
+                        result["ops"] = []
+                    result["ops"].append(_mf_op_d)
+                result.setdefault("change", result["ops"][0]["change"])
             else:
-                ml = re.search(r'^(.+?)\s+ל([\u05D0-\u05EA].+)$', v)
-                nf, ht = (ml.group(1), ml.group(2)) if ml else (v, "")
-            op = f"הוסף ({nf.strip()}) במקום ({ht.strip()})" if ht.strip() else f"הוסף ({nf.strip()})"
-            if "extra_ops" not in result:
-                result["extra_ops"] = []
-            result["extra_ops"].append({"meal": meal_key, "change": op})
+                if " ל " in v:
+                    nf, ht = v.split(" ל ", 1)
+                else:
+                    ml = re.search(r'^(.+?)\s+ל([\u05D0-\u05EA].+)$', v)
+                    nf, ht = (ml.group(1), ml.group(2)) if ml else (v, "")
+                op = f"הוסף ({nf.strip()}) במקום ({ht.strip()})" if ht.strip() else f"הוסף ({nf.strip()})"
+                if "extra_ops" not in result:
+                    result["extra_ops"] = []
+                result["extra_ops"].append({"meal": meal_key, "change": op})
         elif key in ("שנה", "change", "פעולה", "בקשה"):
             result["change"] = val
         elif key in ("החלף", "הוסף", "תחליף"):
@@ -1097,9 +1110,13 @@ def parse_message(text: str) -> dict:
         elif _meal_hits:
             result["meal"] = _meal_hits[0]
 
-    # נקה ביטויי ארוחה לפני חילוץ שם/מזון — ב/ל/מ prefix ("בצהריים", "לצהריים", "מארוחת צהריים")
+    # נקה ביטויי ארוחה לפני חילוץ שם/מזון — ב/ל/מ prefix + "עבור/של ארוחת X"
     _meal_re = r'[בלמ](?:ארוחת\s+)?ה?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b'
     full_no_meal = re.sub(_meal_re, '', full)
+    # "עבור ארוחת X" / "של ארוחת X"
+    _meal_words = '|'.join(_MEAL_MAP_FT.keys())
+    full_no_meal = re.sub(r'\s*(?:עבור|של)\s+ארוחת\s+(?:' + _meal_words + r')\b', '', full_no_meal)
+    full_no_meal = re.sub(r'\s*(?:עבור|של)\s+(?:' + _meal_words + r')\b', '', full_no_meal)
     # גם "+ארוחה" (כמו "+ערב", "+צהריים")
     full_no_meal = re.sub(r'\s*\+\s*(?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
     # גם "ו+ארוחה" (כמו "וערב")
@@ -1667,8 +1684,9 @@ def execute_request(request_text: str, force: bool = False,
         new_food_raw = add_match.group(1).strip()
         group_hint_raw = (add_match.group(2) or "").strip() if add_match.lastindex and add_match.lastindex >= 2 else ""
 
-        # ניקוי "בערב/בבוקר/בצהריים", "לערב/לצהריים", "מארוחת..." שדלפו לשם המזון
+        # ניקוי prefix ארוחה שדלף לשם המזון: "בצהריים", "מארוחת ערב", "עבור/של ארוחת X"
         new_food_raw = re.sub(r'\s*[בלמ](?:ארוחת\s+)?ה?(?:ערב|בוקר|צהריים|ביניים|לילה)\b', '', new_food_raw).strip()
+        new_food_raw = re.sub(r'\s*(?:עבור|של)\s+(?:ארוחת\s+)?(?:ערב|בוקר|צהריים|ביניים|לילה)\b', '', new_food_raw).strip()
 
         # חלץ מסוגריים תחילה — כדי שזיהוי הגרמים יעבוד גם על "(50 גרם אורז)"
         paren = re.search(r'\(([^)]+)\)', new_food_raw)
