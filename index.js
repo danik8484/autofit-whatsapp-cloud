@@ -307,6 +307,14 @@ app.post('/webhook', async (req, res) => {
   const sender = body.senderData?.sender?.replace('@c.us', '');
   if (!ALLOWED.includes(sender)) return;
 
+  // ── תגובות דני מהטלפון האישי בקבוצת הצוות ──────────────────
+  const inChatId = body.senderData?.chatId || '';
+  if (BIZ_GROUP && (inChatId === BIZ_GROUP || inChatId.replace('@g.us','') === (BIZ_GROUP||'').replace('@g.us',''))) {
+    console.log(`[group-reply] ${sender}: "${text.slice(0,40)}"`);
+    await handleBizGroupResponse(text);
+    return;
+  }
+
   console.log(`📨 מ: ${sender} | "${text.slice(0,50).replace(/\n/g,'↵')}"`);
   console.log(`[state] conf=${pendingConfirmations.has(sender)} corr=${pendingCorrections.has(sender)}`);
 
