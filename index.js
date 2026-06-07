@@ -652,7 +652,10 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
   if (opts.userIdOverride) {
     args.push('--user-id'); args.push(String(opts.userIdOverride));
   } else {
-    args.push('--name'); args.push(opts.nameOverride || contactName);
+    const nameArg = opts.nameOverride || contactName;
+    args.push('--name'); args.push(nameArg);
+    // כשה-nameOverride הוא מספר טלפון (retry לגיטימי) → הוסף --allow-phone
+    if (nameArg === clientPhone) args.push('--allow-phone');
   }
   if (opts.foodOverride) { args.push('--food'); args.push(opts.foodOverride); }
   if (opts.hintOverride) { args.push('--hint'); args.push(opts.hintOverride); }
