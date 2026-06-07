@@ -1188,39 +1188,93 @@ def parse_message(text: str) -> dict:
             full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
             clean_full = full_no_meal
         else:
-            _wds = full_no_meal.split()
-            _pos = 0  # מיקום תחילת השם (אחרי פועל)
-
-            # דלג על פועל ראשון אם קיים
-            _VERB_SET = _NOT_NAME_VERBS | {'מוסיף', 'מוריד', 'מחליף', 'מעלה', 'מפחית'}
-            if _wds and (re.match(_VERB_PAT + r'$', _wds[0]) or _wds[0] in _VERB_SET):
-                _pos = 1
-
-            _fn = _wds[_pos] if len(_wds) > _pos else ''
-            _ln = _wds[_pos + 1] if len(_wds) > _pos + 1 else ''
-
-            # strip ל' יחס מהשם הפרטי ("לרון" → "רון"), אלא אם ל' חלק מהשם
-            if _fn.startswith('ל') and len(_fn) > 2 and _fn not in _L_NAMES:
-                _fn = _fn[1:]
-
-            _fn_ok = bool(_fn and _fn not in _NOT_NAME_VERBS and _fn not in _FOOD_NOT_SURNAME
-                          and not re.match(r'^\d', _fn) and len(_fn) >= 2)
-            _ln_ok = bool(_ln and _ln not in _NOT_NAME_VERBS and _ln not in _FOOD_NOT_SURNAME
-                          and not re.match(r'^\d', _ln)
-                          and re.match(r'^[\u05D0-\u05EA\u05F3\']{2,}', _ln))
-
-            if _fn_ok and _ln_ok:
-                result["name"] = f"{_fn} {_ln}"
-                conf = max(conf, 90)
-                clean_full = ' '.join(_wds[_pos + 2:])
-            elif _fn_ok:
-                result["name"] = _fn
-                conf = max(conf, 75)
-                clean_full = ' '.join(_wds[_pos + 1:])
+            # פורמט "שם:" / "שם -" — שם לפני מפריד
+            _pre_sep = re.match(
+                r'^([\u05D0-\u05EA\u05F3\u0027]{2,}(?:\s+[\u05D0-\u05EA\u05F3\u0027]{2,}){0,2})\s*[-:\u2013]\s*',
+                full_no_meal
+            )
+            if _pre_sep and all(w not in _NOT_NAME_VERBS for w in _pre_sep.group(1).split()):
+                _pn = _pre_sep.group(1)
+                if _pn.startswith('ל') and len(_pn) > 2 and _pn not in _L_NAMES:
+                    _pn = _pn[1:]
+                result["name"] = _pn
+                conf = max(conf, 80)
+                clean_full = full_no_meal[_pre_sep.end():]
+                clean_full = re.sub(r'\s+', ' ', clean_full).strip()
             else:
-                conf = 40
-                clean_full = full_no_meal
-            clean_full = re.sub(r'\s+', ' ', clean_full).strip()
+                # כלל פוזיציוני: דלג על פעלים/מילות קישור, ואז מילה 1 = שם פרטי, מילה 2 = שם משפחה
+                _wds = full_no_meal.split()
+                _pos = 0
+
+                _SKIP_WORDS = _NOT_NAME_VERBS | {
+                    'מוסיף', 'מוריד', 'מחליף', 'מעלה', 'מפחית',
+                    'אפשר', 'צריך', 'רוצה', 'מבקש', 'יצטרך', 'אוכל',
+                    'ניתן', 'כדאי', 'אולי', 'נא', 'גם', 'בבקשה',
+                    'תוכלי', 'תוכל', 'יכולה', 'יכול', 'הכניסי', 'הכניס',
+                    'תכניסי', 'תכניס', 'רוצים', 'מבקשים', 'אשמח', 'אם',
+                    'לתת', 'לשים', 'של', 'עבור', 'את',
+                    'כן', 'אוקי', 'נכון', 'טוב', 'בסדר', 'בטח', 'כבר', 'ממש',
+                    'תן', 'תני', 'תתן', 'יש', 'האם', 'חשוב', 'תעשה', 'תעשי',
+                    'בכל', 'ותוסיפי', 'שני', 'תקן', 'תקני', 'ותחליף', 'ותוריד',
+                    'מקרה', 'חשבתי', 'מציע', 'מאוד', 'בסוף', 'הגיע', 'מוצע',
+                    'וסיפי', 'פחת',
+                }
+                while _pos < len(_wds) and (
+                    re.match(_VERB_PAT + r'$', _wds[_pos])
+                    or _wds[_pos] in _SKIP_WORDS
+                    or _wds[_pos] == 'ל'
+                    or re.match(r'^ש(?:תוסיפ|תחליפ|תחסר|תחליפ|תוריד|תעל|הוסיפ|הכנס|תשימ|תניח)', _wds[_pos])
+                ):
+                    _pos += 1
+
+                _fn = _wds[_pos] if len(_wds) > _pos else ''
+                _ln = _wds[_pos + 1] if len(_wds) > _pos + 1 else ''
+
+                # strip ל' יחס מהשם הפרטי ("לרון" → "רון"), אלא אם ל' חלק מהשם
+                if _fn.startswith('ל') and len(_fn) > 2 and _fn not in _L_NAMES:
+                    _fn = _fn[1:]
+
+                _fn_ok = bool(_fn and _fn not in _NOT_NAME_VERBS and _fn not in _FOOD_NOT_SURNAME
+                              and not re.match(r'^\d', _fn) and len(_fn) >= 2)
+                _ln_clean = re.sub(r'[\u05F3\u0027]+$', '', _ln)
+                _ln_ok = bool(_ln and _ln not in _NOT_NAME_VERBS and _ln not in _FOOD_NOT_SURNAME
+                              and not re.match(r'^\d', _ln)
+                              and re.match(r'^[\u05D0-\u05EA\u05F3\u0027]{2,}', _ln)
+                              and _looks_like_surname(_ln_clean))
+
+                if _fn_ok and _ln_ok:
+                    result["name"] = f"{_fn} {_ln}"
+                    conf = max(conf, 90)
+                    clean_full = ' '.join(_wds[_pos + 2:])
+                elif _fn_ok:
+                    result["name"] = _fn
+                    conf = max(conf, 75)
+                    clean_full = ' '.join(_wds[_pos + 1:])
+                else:
+                    # Fallback: סרוק ל/של/עבור + שם בכל מקום (פורמטים ישנים)
+                    _found_fb = False
+                    for _l_m in re.finditer(
+                        r'(?<!\S)(?:ל\s*|של\s+|עבור\s+)([\u05D0-\u05EA\u05F3\u0027]{2,8}(?:\s+[\u05D0-\u05EA\u05F3\u0027]{2,8})?)',
+                        full_no_meal
+                    ):
+                        _lw = _l_m.group(1).split()
+                        _lfn = _lw[0] if _lw else ''
+                        _lln = _lw[1] if len(_lw) > 1 else ''
+                        if (_lfn not in _NOT_NAME_VERBS and _lfn not in _FOOD_NOT_SURNAME
+                                and len(_lfn) >= 2 and not re.match(r'^\d', _lfn)):
+                            _lln_clean = re.sub(r'[\u05F3\u0027]+$', '', _lln)
+                            if _lln and _looks_like_surname(_lln_clean) and _lln not in _FOOD_NOT_SURNAME:
+                                result["name"] = f"{_lfn} {_lln}"
+                            else:
+                                result["name"] = _lfn
+                            conf = max(conf, 70)
+                            clean_full = (full_no_meal[:_l_m.start()] + full_no_meal[_l_m.end():])
+                            _found_fb = True
+                            break
+                    if not _found_fb:
+                        conf = 40
+                        clean_full = full_no_meal
+                clean_full = re.sub(r'\s+', ' ', clean_full).strip()
     else:
         clean_full = full_no_meal
 
