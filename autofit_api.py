@@ -768,7 +768,7 @@ def parse_message(text: str) -> dict:
     text = _t.replace('\u05f4', ' ')
     text = re.sub(r'מחליף\s+ל[כךו]', 'הוסף', text)  # fallback: מחליף ללא "ב"
     # V3: "N גרם לFOOD" → "N גרם FOOD" (ל as preposition, 3+ chars after ל = definitely not לחם)
-    text = re.sub(r'(?:מוריד\s+ל[כךוי]|מפחית(?:\s+ל[כךוי])?)', 'הפחת', text)
+    text = re.sub(r'(?:מוריד\s+ל[כךוי](?![\u05D0-\u05EA])|מפחית(?:\s+ל[כךוי](?![\u05D0-\u05EA]))?)', 'הפחת', text)
     text = re.sub(r'מעלה\s+ל[כךו]', 'העלה', text)
     _v3_triggered = (text != _text_before_v3)
     # V3 only: strip ל-preposition from "N גרם לFOOD" (not applied to old-style לNAME format)
@@ -1084,7 +1084,7 @@ def parse_message(text: str) -> dict:
                 full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
     if _v3_triggered and "name" not in result:
         # Fix C: "במקום NAME FOOD" — שם לפני מזון מוחלף (מחליף לו NAME FOOD בNEW)
-        _v3_bk = re.search(r'במקום\s+([א-ת]{2,8})\s+([א-ת]{2,8})', full_no_meal)
+        _v3_bk = re.search(r'במקום\s+([א-ת]{2,8})', full_no_meal)
         if _v3_bk:
             _w1 = _v3_bk.group(1)
             if _w1 not in _NOT_NAME_VERBS and _w1 not in _FOOD_NOT_SURNAME:
