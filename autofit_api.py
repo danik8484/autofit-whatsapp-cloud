@@ -1074,7 +1074,7 @@ def parse_message(text: str) -> dict:
     # ── V3: חילוץ שם לפני הלוגיקה הכללית ────────────────────────────────────
     if _v3_triggered and "name" not in result:
         # Fix A: VERB NAME N גרם — שם ישיר לפני גרמים (כולל שמות שמתחילים בל)
-        _v3_d = re.match(r'^(?:הוסף|הפחת|העלה)\s+([א-ת]{2,8})\s+(?=\d)', full_no_meal)
+        _v3_d = re.match(r'^(?:הוסף|הפחת|העלה)\s+([א-ת\u05F3\']{2,10})\s+(?=\d)', full_no_meal)
         if _v3_d:
             _cand = _v3_d.group(1)
             if _cand not in _NOT_NAME_VERBS and _cand not in _FOOD_NOT_SURNAME:
