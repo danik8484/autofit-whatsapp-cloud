@@ -581,7 +581,7 @@ def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict, gra
         }
         data = _post("/coach/v2-addUserSubmealFood", body)
         if data.get("status"):
-            return f"✅ נוסף כתחליף ל-{food_row.get('food_name','')}: {food['food_name']}"
+            return f"✅ נוסף כתחליף ל-{food_row.get('food_name','')}: {food['food_name']}|GRAMS={actual_grams}"
         return f"❌ שגיאת API: {data.get('message','')}"
     else:
         # מזון חדש — מוסיף ישירות לארוחה
@@ -1923,6 +1923,10 @@ def execute_request(request_text: str, force: bool = False,
                 continue
 
             add_result = add_food_to_meal(user_id, meal_id, best_food, food_row, extra_grams)
+            # חלץ actual_grams מהתוצאה (הוטמע ע"י add_food_to_meal)
+            _ag_match = re.search(r'\|GRAMS=([\d.]+)', add_result)
+            _actual_grams_used = _ag_match.group(1) if _ag_match else None
+            add_result = re.sub(r'\|GRAMS=[\d.]+', '', add_result)
             if add_result.startswith("✅"):
                 food_name = best_food.get("food_name", "")
                 if food_row:
@@ -1941,9 +1945,15 @@ def execute_request(request_text: str, force: bool = False,
                         replaced_disp = f" ({replaced_q_str} גרם)"
                     else:
                         replaced_disp = ""
-                    # כמות המזון החדש — חישוב לפי יחס קלוריות
+                    # כמות המזון החדש — actual_grams שנשלחו לאוטופיט, או חישוב קלוריות
                     if extra_grams:
                         new_disp = f" ({extra_grams} גרם)"
+                    elif _actual_grams_used:
+                        # גרמים שנשלחו בפועל לאוטופיט
+                        try:
+                            _ag_f = float(_actual_grams_used)
+                            new_disp = f" ({int(_ag_f) if _ag_f == int(_ag_f) else round(_ag_f,1)} גרם)"
+                        except: new_disp = f" ({_actual_grams_used} גרם)"
                     else:
                         try:
                             cal_target = float(food_row.get("calories") or 0)
@@ -1953,8 +1963,9 @@ def execute_request(request_text: str, force: bool = False,
                                 new_disp = f" ({new_q} גרם)"
                             else:
                                 # fallback: אותה כמות כמו המזון שמוחלף
-                                fb_q = food_row.get("quantity") or food_row.get("gram_value")
-                                new_disp = f" ({fb_q} גרם)" if fb_q and float(fb_q) > 0 else ""
+                                fb_q = (food_row.get("gram_value") or food_row.get("grams") or
+                                        food_row.get("quantity") or food_row.get("quantity_to_calculate"))
+                                new_disp = f" ({int(float(fb_q))} גרם)" if fb_q and float(fb_q or 0) > 0 else ""
                         except: new_disp = ""
                     all_results.append(f"✅ נוסף: *{food_name}*{new_disp} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{replaced_disp}")
                 else:

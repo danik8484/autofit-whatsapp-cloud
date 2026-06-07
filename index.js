@@ -896,7 +896,13 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
 
     // ── הצלחה או שגיאה ────────────────────────────────────────────────
     bizPending = null;
-    const msg = code === 0 ? formatBizReceipt(contactName, raw) : `❌ *${contactName}*\n${raw}`;
+    // אם contactName הוא מספר טלפון — נסה לחלץ שם לקוח מתשובת אוטופיט
+    let displayName = contactName;
+    if (/^\d{7,}$/.test(contactName)) {
+      const nm = raw.match(/של ([\u05D0-\u05EA]+(?:\s+[\u05D0-\u05EA]+)*)/);
+      if (nm) displayName = nm[1].trim();
+    }
+    const msg = code === 0 ? formatBizReceipt(displayName, raw) : `❌ *${displayName}*\n${raw}`;
     await sendBizMessage(BIZ_GROUP, msg);
   });
 }
