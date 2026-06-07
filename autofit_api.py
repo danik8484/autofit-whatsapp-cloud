@@ -801,7 +801,11 @@ def parse_message(text: str) -> dict:
     # ── pre-process: פקודות v3 ("מוסיף לך/לו") → פורמט שהפרסר מבין ───────────
     # ל[כךו]: לך (ך = כ סופית 0x5da) + לו — שתי הצורות
     _text_before_v3 = text
+    # נרמול "גר" → "גרם" (קיצור נפוץ) — לפני כל parsing
+    text = re.sub(r'(\d+)\s*גר(?![\u05D0-\u05EA])', r'\1 גרם', text)
     text = re.sub(r'מוסיף\s+ל[כךו]', 'הוסף', text)
+    # גוף שני/שלישי: "תוסיף לך", "הוסיף לו"
+    text = re.sub(r'(?:תוסיף|הוסיף)\s+ל[כךוי](?![\u05D0-\u05EA])', 'הוסף', text)
     # מחליף לך X ב-Y → הוסף Y במקום X (Y = subFood לבחירה, X = מה שמחליפים)
     # protect "לאחר/לפני בישול" then lazy-match to find FIRST ב separator
     _t = text.replace('לאחר בישול', 'לאחר״בישול').replace('לפני בישול', 'לפני״בישול')
@@ -810,15 +814,27 @@ def parse_message(text: str) -> dict:
         lambda m: f'הוסף {m.group(2).strip().lstrip("-")} במקום {m.group(1).strip()}',
         _t
     )
-    text = _t.replace('\u05f4', ' ')
+    text = _t.replace('״', ' ')
     text = re.sub(r'מחליף\s+ל[כךו]', 'הוסף', text)  # fallback: מחליף ללא "ב"
-    # V3: "N גרם לFOOD" → "N גרם FOOD" (ל as preposition, 3+ chars after ל = definitely not לחם)
+    # גוף שני/שלישי "תחליף/החליף לך X ב-Y"
+    _t2 = text.replace('לאחר בישול', 'לאחר״בישול').replace('לפני בישול', 'לפני״בישול')
+    _t2 = re.sub(
+        r'(?:תחליף|החליף)\s+ל[כךוי]\s+(.+?)\s+ב-?([^\n]+)',
+        lambda m: f'הוסף {m.group(2).strip().lstrip("-")} במקום {m.group(1).strip()}',
+        _t2
+    )
+    text = _t2.replace('״', ' ')
+    text = re.sub(r'(?:תחליף|החליף)\s+ל[כךוי]', 'הוסף', text)
     text = re.sub(r'(?:מוריד\s+ל[כךוי](?![\u05D0-\u05EA])|מפחית(?:\s+ל[כךוי](?![\u05D0-\u05EA]))?)', 'הפחת', text)
+    # גוף שני/שלישי: "תוריד לך", "הוריד לו"
+    text = re.sub(r'(?:תורידי?|הוריד)\s+ל[כךוי](?![\u05D0-\u05EA])', 'הפחת', text)
     text = re.sub(r'מעלה\s+ל[כךו]', 'העלה', text)
+    # גוף שני/שלישי: "תעלה לך", "העלה לו"
+    text = re.sub(r'(?:תעל[הי]|העל[הי])\s+ל[כךוי](?![\u05D0-\u05EA])', 'העלה', text)
     _v3_triggered = (text != _text_before_v3)
-    # V3 only: strip ל-preposition from "N גרם לFOOD" (not applied to old-style לNAME format)
+    # V3 only: strip ל-preposition from "N [גרם] לFOOD" (not applied to old-style לNAME format)
     if _v3_triggered:
-        text = re.sub(r'(\d+\s*גרם\s+)ל([\u05D0-\u05EA]{3,})', r'\1\2', text)
+        text = re.sub(r'(\d+\s*(?:גרם\s+)?)ל([\u05D0-\u05EA]{3,})', r'\1\2', text)
 
     # ── pre-process: נרמול רווחים לפני נקודותיים בשמות שדות ─────────────────
     # "שם :" → "שם:", "ארוחה  :" → "ארוחה:" (רווח לפני :)
@@ -874,6 +890,7 @@ def parse_message(text: str) -> dict:
         elif _extract_meal(key):
             # "ערב: X ל Y" — שם ארוחה ישירות כ-key
             meal_key = _extract_meal(key)
+            result.setdefault("meal", meal_key)  # so free-text _bare_meal_re fires
             v = val.strip()
             v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
             # multi-food: "20 גרם X ו-15 גרם Y" → multiple ops
@@ -1036,8 +1053,8 @@ def parse_message(text: str) -> dict:
     _reduce = bool(re.search(_REDUCE_PAT, full))
     if _reduce:
         full = re.sub(_REDUCE_PAT + r'\s*', '', full)
-        # "מ-FOOD" / "מה-FOOD" אחרי גרמים — strip prefix מ/מה לפני שם מזון
-        full = re.sub(r'(\d+\s*גרם\s+)מה?\s*', r'\1', full)
+        # "N [גרם] מ/מה-FOOD" — strip prefix מ/מה לפני שם מזון (גם ללא גרם)
+        full = re.sub(r'(\d+\s*(?:גרם\s+)?)מה?([א-ת])', r'\1\2', full)
         full = re.sub(r'\s+', ' ', full).strip()
 
     # פועלי הגדלה — הסר לפני פרסינג (לא reduce, פשוט הסרת הפועל)
@@ -1082,8 +1099,8 @@ def parse_message(text: str) -> dict:
             if re.search(r'[בולמ](?:ארוחת\s+)?ה?' + w + r'\b', full):
                 if k not in _meal_hits:
                     _meal_hits.append(k)
-            # מילת ארוחה בסוף משפט ללא prefix — "לפני שינה" → "לילה"
-            elif re.search(r'(?:^|\s)' + w + r'(?:\s|$)', full):
+            # מילת ארוחה ללא prefix — "לדני בוקר: X" / "ערב X" / "בוקר:"
+            elif re.search(r'(?:^|\s)' + w + r'(?:[\s:,]|$)', full):
                 if k not in _meal_hits:
                     _meal_hits.append(k)
         # "X וY" כריבוי ארוחות
@@ -1445,10 +1462,100 @@ _NEGATION_PREFIX = re.compile(
     re.UNICODE
 )
 
+_READ_QUERY_PAT = re.compile(
+    r'(?:מה\s+(?:יש|אוכל|קיים|נמצא)|תראי?\s+מה\s+יש|תבדקי?\s+מה\s+יש'
+    r'|כמה\s+(?:יש|גרם)|מה\s+(?:יש\s+)?ב(?:ארוחת?\s+)?(?:ערב|בוקר|צהריים))',
+    re.UNICODE
+)
+
+_ACTION_VERB_PAT = re.compile(
+    r'(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?'
+    r'|הפחת[יי]?|תפחית[יי]?|תוריד[יי]?|הוריד[יי]?|עדכן|עדכני|תשנ[יה]'
+    r'|מוסיף|מחליף|מוריד|מפחית|מעלה)',
+    re.UNICODE
+)
+
+
+def _handle_read_query(request_text: str, name_override: str = "",
+                       meal_override: str = "", user_id_override: str = "") -> str:
+    """שאילתת קריאה: 'מה יש לדני בצהריים?' → רשימת מזונות ללא שינוי."""
+    meal_key = _extract_meal(meal_override) if meal_override else _extract_meal(request_text)
+
+    if name_override:
+        name = name_override
+    else:
+        m = re.search(r'(?<!\S)ל([א-ת׳\']{2,10})(?:\s|$|[?!,])', request_text)
+        name = m.group(1) if m else ""
+        if not name:
+            return "ℹ️ חסר: שם מתאמן לשאילתה"
+
+    if user_id_override:
+        user_id, full_name = user_id_override, name_override or name
+    else:
+        user_id, full_name, _ = find_user(name)
+    if not user_id:
+        return f"NAME_NOT_FOUND:{name}"
+
+    all_meals = get_user_meals(user_id)
+
+    food_q_match = re.search(
+        r'(?:כמה\s+גרם\s+|כמה\s+)(.+?)\s+(?:יש|נמצא|קיים)', request_text
+    )
+    if food_q_match:
+        food_q = normalize_food_query(food_q_match.group(1).strip())
+        results_fq = []
+        for meal in all_meals:
+            for f in (meal.get("mealFoods") or []):
+                fn = f.get("food_name","").lower()
+                if food_q in fn or fn in food_q:
+                    qty = f.get("quantity","")
+                    results_fq.append(f"• {f['food_name']} — {qty}ג' ב{meal.get('meal_name','')}")
+        if results_fq:
+            return f"📋 {full_name}:\n" + "\n".join(results_fq)
+        return f"❌ לא מצאתי '{food_q_match.group(1)}' בתפריט של {full_name}"
+
+    _meal_map_rq = {"בוקר": "ארוחת בוקר", "צהריים": "ארוחת צהריים", "ערב": "ארוחת ערב",
+                    "ביניים": "ארוחת ביניים", "לילה": "ארוחת ערב"}
+
+    if not meal_key:
+        lines = [f"📋 תפריט של {full_name}:"]
+        for m in all_meals:
+            foods = m.get("mealFoods") or []
+            if not foods:
+                continue
+            lines.append(f"\n*{m.get('meal_name','')}:*")
+            for f in foods:
+                qty = f.get("quantity","")
+                lines.append(f"  • {f.get('food_name','')}" + (f" {qty}ג'" if qty else ""))
+        return "\n".join(lines) if len(lines) > 1 else f"לא נמצא תפריט עבור {full_name}"
+
+    full_meal = _meal_map_rq.get(meal_key, f"ארוחת {meal_key}")
+    target = next(
+        (m for m in all_meals
+         if full_meal in m.get("meal_name","") or m.get("meal_name","") in full_meal),
+        None
+    )
+    if not target:
+        return f"לא מצאתי {full_meal} עבור {full_name}"
+
+    foods = target.get("mealFoods") or []
+    if not foods:
+        return f"{full_meal} של {full_name} ריקה"
+
+    lines = [f"📋 {full_meal} של {full_name}:"]
+    for f in foods:
+        qty = f.get("quantity","")
+        lines.append(f"• {f.get('food_name','')}" + (f" — {qty}ג'" if qty else ""))
+    return "\n".join(lines)
+
+
 def execute_request(request_text: str, force: bool = False,
                     name_override: str = "", meal_override: str = "",
                     food_override: str = "", hint_override: str = "",
                     user_id_override: str = "") -> str:
+    # ── שאילתת קריאה: "מה יש לדני בצהריים?" ────────────────────────────────────
+    if _READ_QUERY_PAT.search(request_text) and not _ACTION_VERB_PAT.search(request_text):
+        return _handle_read_query(request_text, name_override, meal_override, user_id_override)
     # ── שלילה: "אל תוסיפי" / "לא להוסיף" ─────────────────────────────────────
     if _NEGATION_PREFIX.search(request_text.strip()):
         return "❓ לא הבנתי — נראה כמו שלילה. אם רצית לבצע פעולה, שלח שוב ללא 'אל' / 'לא'."
