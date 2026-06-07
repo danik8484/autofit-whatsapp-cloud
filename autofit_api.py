@@ -9,19 +9,96 @@ import json
 import base64
 import urllib.parse
 import re
+from difflib import SequenceMatcher
 import os
 import time
 from pathlib import Path
 
 BACKEND    = "https://chat.auto-fit.co.il"
+
+# ── AI fallback parser (Claude Haiku) ─────────────────────────────────────────
+def _parse_with_ai(text: str, v3_mode: bool = False) -> dict:
+    """פרסור עם Claude Haiku כאשר הregex נכשל (confidence נמוך)"""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {}
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=api_key)
+
+        if v3_mode:
+            system_prompt = """אתה מחלץ פרטי תזונה מהודעות של מאמן כושר ישראלי בעברית.
+המאמן שולח הוראות כמו: "מוסיף לך 50 גרם של חזה עוף בארוחת ערב" / "מחליף לך את הלחם בשיבולת שועל".
+החזר JSON בלבד עם השדות הבאים:
+- food: שם המזון להוסיף (string, חובה)
+- grams: כמות בגרמים (מספר שלם, או null אם לא צוין)
+- meal: ארוחה — אחד מ: בוקר / צהריים / ערב / ביניים (או null)
+- hint: המזון שמוחלף/מוחסר — אם יש "כאופציה ל / כתחליף ל / במקום" (string או null)
+- action: הוסף / הפחת / החלף (ברירת מחדל: הוסף)
+אל תמציא ערכים. אם לא בטוח — null."""
+        else:
+            system_prompt = """אתה מחלץ מידע מהודעות תזונה בעברית של מאמן כושר.
+החזר JSON בלבד עם השדות:
+- name: שם מלא (שם פרטי + שם משפחה)
+- food: שם המזון
+- meal: בוקר/צהריים/ערב/ביניים
+- grams: מספר בלבד (או null)
+- hint: מזון חלופי אם יש (או null)
+אל תמציא ערכים. אם לא בטוח — null."""
+
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system=system_prompt,
+            messages=[{"role": "user", "content": text}]
+        )
+        import json as _json
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+        data = _json.loads(raw)
+        result = {}
+        if not v3_mode and data.get("name"):
+            result["name"] = data["name"]
+        if data.get("food"):
+            _action = (data.get("action") or "הוסף").strip()
+            # נרמל פעולות לפועל הסטנדרטי
+            if any(w in _action for w in ("הפחת", "הורד", "מוריד", "הפחית")):
+                result["reduce"] = True
+                _action = "הוסף"
+            elif any(w in _action for w in ("החלף", "מחליף")):
+                _action = "הוסף"
+            result["change"] = f"הוסף ({data['food']})"
+            if data.get("hint"):
+                result["change"] = f"הוסף ({data['food']}) במקום ({data['hint']})"
+            if data.get("grams"):
+                try:
+                    result["extra_grams"] = str(int(data["grams"]))
+                except (ValueError, TypeError):
+                    pass
+        if data.get("meal"):
+            # שמור meal בפורמט קצר (ערב, לא ארוחת ערב) — parse_message מצפה לזה
+            _meal_short = {"ארוחת בוקר": "בוקר", "ארוחת צהריים": "צהריים",
+                           "ארוחת ערב": "ערב", "ארוחת ביניים": "ביניים"}
+            _m = data["meal"]
+            result["meal"] = _meal_short.get(_m, _m.replace("ארוחת ", ""))
+        result["confidence"] = 90
+        print(f"[AI parse] {data} → {result}", flush=True)
+        return result
+    except Exception as e:
+        print(f"[AI parse error] {e}", flush=True)
+        return {}
+
 FOOD_API   = "https://food.we-site.co.il/api"
 FOOD_TOKEN = "eb8b0f58c895019fcbc3bb17480ced3a2d1e12a346d6ed0f0d0267a24587a203"
 SESSION_FILE   = Path(__file__).parent / "session.json"
 PHONES_FILE    = Path(__file__).parent / "phones.json"
 USER_CACHE_FILE = Path(__file__).parent / "user_cache.json"
-USER_CACHE_TTL  = 300  # 5 דקות
+USER_CACHE_TTL  = 1800  # 30 דקות
 
 _uid_cache: dict = {}
+
+_PHONE_RE = re.compile(r'^(?:972|0)(?:5[0-9]|[23489])\d{7,8}$')
 
 
 # ─── Session ─────────────────────────────────────────────────────────────────
@@ -406,15 +483,32 @@ def find_meal_and_food(meals: list, meal_name: str, food_hint: str) -> tuple:
         def _norm(s):
             return normalize_food_query(s)
 
-        # חיפוש: כל מילות ה-hint נמצאות בשם המזון (אחרי נרמול)
+        def _word_fuzzy(query_words, food_name, max_edit=1):
+            """כל מילת query מוצאת (substring או edit≤max_edit) בשם המזון"""
+            fw = _norm(food_name).split()
+            for qw in query_words:
+                found = any(
+                    qw in fword or fword in qw or
+                    SequenceMatcher(None, qw, fword).ratio() >= 1 - (2*max_edit / max(len(qw)+len(fword), 1))
+                    for fword in fw if len(fword) >= 2
+                )
+                if not found:
+                    return False
+            return True
+
+        # 1. חיפוש מדויק: כל מילות ה-hint מופיעות בשם המזון
         match = next((f for f in foods if all(
             w in _norm(f.get("food_name", ""))
             for w in hint_words
         )), None)
 
-        # חיפוש רחב יותר — מילה ראשונה בלבד
+        # 2. חיפוש רחב — מילה ראשונה בלבד (substring)
         if not match:
             match = next((f for f in foods if hint_words[0] in _norm(f.get("food_name", ""))), None)
+
+        # 3. fuzzy — סובלנות לטעויות כתיב (edit distance ≤ 1 לכל מילה)
+        if not match:
+            match = next((f for f in foods if _word_fuzzy(hint_words, f.get("food_name", ""))), None)
 
         if not match:
             available_foods = [f.get("food_name","") for f in foods]
@@ -563,7 +657,7 @@ def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict, gra
     if food_row:
         # תחליף — מוסיף כאופציה חלופית בקבוצה הקיימת
         # גרמים: grams_override → מהמנה האמיתית → default מאגר
-        actual_grams = str(grams_override or food_row.get("gram_value") or food_row.get("grams") or food.get("grams") or food.get("gram_value") or "100")
+        actual_grams = str(grams_override or food_row.get("quantity") or food_row.get("quantity_to_calculate") or food_row.get("gram_value") or food.get("grams") or food.get("gram_value") or "")
         body = {
             "mavap_status": "0",
             "user_id": str(user_id),
@@ -790,7 +884,7 @@ def _convert_heb_numbers(text: str) -> str:
     return text
 
 
-def parse_message(text: str) -> dict:
+def parse_message(text: str, skip_name: bool = False) -> dict:
     """
     מנסה לפרסר הודעה — גם בתבנית מובנית וגם בשפה חופשית.
     מחזיר dict עם: name, meal, change, confidence (0-100).
@@ -803,6 +897,7 @@ def parse_message(text: str) -> dict:
     _text_before_v3 = text
     # נרמול "גר" → "גרם" (קיצור נפוץ) — לפני כל parsing
     text = re.sub(r'(\d+)\s*גר(?![\u05D0-\u05EA])', r'\1 גרם', text)
+    text = re.sub(r'^אני\s+', '', text)  # 'אני מוסיף לך' → 'מוסיף לך'
     text = re.sub(r'מוסיף\s+ל[כךו]', 'הוסף', text)
     # גוף שני/שלישי: "תוסיף לך", "הוסיף לו"
     text = re.sub(r'(?:תוסיף|הוסיף)\s+ל[כךוי](?![\u05D0-\u05EA])', 'הוסף', text)
@@ -1146,6 +1241,7 @@ def parse_message(text: str) -> dict:
         full_no_meal = re.sub(_bare_meal_re, ' ', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
     # נרמול מוקדם לפני חיפוש שמות — מונע "ל+מזון" אחרי מילות תחליף מלהיות שם אדם
+    full_no_meal = re.sub(r'(\d+\s*גרם)\s+של\s+', r'\1 ', full_no_meal)  # '50 גרם של חזה עוף' → '50 גרם חזה עוף'
     full_no_meal = re.sub(r'כתחליף\s+ל', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)\s*', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'באופצי(?:ה|ות)?\s+של\s*ה?', 'במקום ', full_no_meal)  # V3: "באופציה של X"
@@ -1155,7 +1251,10 @@ def parse_message(text: str) -> dict:
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
 
     # ── V3: חילוץ שם לפני הלוגיקה הכללית ────────────────────────────────────
-    if _v3_triggered and "name" not in result:
+    if skip_name:
+        # phone-first: שם ידוע ממספר טלפון — לא מחלצים מהטקסט כדי לא לשבור איתות תחליף
+        clean_full = full_no_meal
+    elif _v3_triggered and "name" not in result:
         # Fix A: VERB NAME N גרם — שם ישיר לפני גרמים (כולל שמות שמתחילים בל)
         _v3_d = re.match(r'^(?:הוסף|הפחת|העלה)\s+([א-ת\u05F3\']{2,10})\s+(?=\d)', full_no_meal)
         if _v3_d:
@@ -1165,7 +1264,7 @@ def parse_message(text: str) -> dict:
                 conf = max(conf, 80)
                 full_no_meal = (full_no_meal[:_v3_d.start(1)] + full_no_meal[_v3_d.end():])
                 full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
-    if _v3_triggered and "name" not in result:
+    if not skip_name and _v3_triggered and "name" not in result:
         # Fix C: "במקום NAME FOOD" — שם לפני מזון מוחלף (מחליף לו NAME FOOD בNEW)
         _v3_bk = re.search(r'במקום\s+([א-ת]{2,8})', full_no_meal)
         if _v3_bk:
@@ -1176,7 +1275,7 @@ def parse_message(text: str) -> dict:
                 full_no_meal = (full_no_meal[:_v3_bk.start(1)] + full_no_meal[_v3_bk.end(1):])
                 full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
 
-    if "name" not in result:
+    if not skip_name and "name" not in result:
         # כלל פוזיציוני: [פעולה] [שם פרטי] [שם משפחה] [מזון...]
         # מילה 1 = פעולה תמיד, מילה 2 = שם פרטי תמיד, מילה 3 = שם משפחה תמיד
 
@@ -1261,6 +1360,7 @@ def parse_message(text: str) -> dict:
                         _lfn = _lw[0] if _lw else ''
                         _lln = _lw[1] if len(_lw) > 1 else ''
                         if (_lfn not in _NOT_NAME_VERBS and _lfn not in _FOOD_NOT_SURNAME
+                                and ('ל' + _lfn) not in _FOOD_NOT_SURNAME
                                 and len(_lfn) >= 2 and not re.match(r'^\d', _lfn)):
                             _lln_clean = re.sub(r'[\u05F3\u0027]+$', '', _lln)
                             if _lln and _looks_like_surname(_lln_clean) and _lln not in _FOOD_NOT_SURNAME:
@@ -1407,6 +1507,17 @@ def parse_message(text: str) -> dict:
 
     if not result.get("change"):
         conf = min(conf, 50)
+
+    # ── AI fallback: כשה-confidence נמוך — נסה Claude Haiku ──────────────────
+    if conf < 70 and not skip_name:
+        _ai = _parse_with_ai(text, v3_mode=_v3_triggered)
+        if _ai:
+            # merge selective — מעדכן רק שדות חסרים, לא מוחק פרסינג נכון של regex
+            for _k, _v in _ai.items():
+                if _k == "confidence":
+                    conf = _v
+                elif _k not in result or not result[_k]:
+                    result[_k] = _v
 
     result.setdefault("meal", "ערב")
     result["confidence"] = conf
@@ -1588,7 +1699,8 @@ def execute_request(request_text: str, force: bool = False,
                                                    user_id_override))
             return "\n\n─────────────\n\n".join(sub_results)
 
-    parsed = parse_message(request_text)
+    _skip_name = bool(name_override and _PHONE_RE.match(name_override.replace('-','').replace(' ','')))
+    parsed = parse_message(request_text, skip_name=_skip_name)
     # V3: שם מגיע דרך --name (name_override), לא מתוך הטקסט
     if name_override:
         parsed["name"] = name_override
@@ -1810,13 +1922,16 @@ def execute_request(request_text: str, force: bool = False,
                 best_food, alternatives = find_best_food(normalize_food_query(food_override), coach_id)
                 if not best_food:
                     if alternatives:
-                        options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:10]))
-                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives)
-                        more_hint = f"\n\nשלח *עוד* לעוד אפשרויות." if len(alternatives) > 10 else ""
+                        def _fmt(f):
+                            cal = int(float(f.get('calories') or 0))
+                            return f"{f['food_name']}{f' — {cal} קל' if cal else ''}"
+                        options = "\n".join(f"{i+1}. {_fmt(f)}" for i, f in enumerate(alternatives[:10]))
+                        alts_pipe = "|".join(f"{f.get('food_name','')}:{int(float(f.get('calories',0) or 0))}" for f in alternatives)
+                        more_hint = f"\n\n_שלח *עוד* לאפשרויות נוספות_" if len(alternatives) > 10 else ""
                         return (f"FOOD_OPTIONS:{normalize_food_query(food_override)}||{alts_pipe}\n"
-                                f"לא מצאתי {food_override} כאופציה, מה שכן מצאתי זה:\n"
+                                f"לא מצאתי *{food_override}*, מה שמצאתי:\n"
                                 f"{options}\n\n"
-                                f"שלח מספר לבחירה, או שם מדויק יותר.{more_hint}")
+                                f"בחר מספר, כתוב שם אחר, או שלח *עוד*.{more_hint}")
                     all_results.append(f"❓ לא נמצא '{food_override}' במאגר.")
                     continue
         else:
@@ -1824,13 +1939,16 @@ def execute_request(request_text: str, force: bool = False,
             if not best_food:
                 if len(ops_list) == 1:
                     if alternatives:
-                        options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:10]))
-                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives)
-                        more_hint = f"\n\nשלח *עוד* לעוד אפשרויות." if len(alternatives) > 10 else ""
+                        def _fmt(f):
+                            cal = int(float(f.get('calories') or 0))
+                            return f"{f['food_name']}{f' — {cal} קל' if cal else ''}"
+                        options = "\n".join(f"{i+1}. {_fmt(f)}" for i, f in enumerate(alternatives[:10]))
+                        alts_pipe = "|".join(f"{f.get('food_name','')}:{int(float(f.get('calories',0) or 0))}" for f in alternatives)
+                        more_hint = f"\n\n_שלח *עוד* לאפשרויות נוספות_" if len(alternatives) > 10 else ""
                         return (f"FOOD_OPTIONS:{new_food_query}||{alts_pipe}\n"
-                                f"לא מצאתי {new_food_query} כאופציה, מה שכן מצאתי זה:\n"
+                                f"לא מצאתי *{new_food_query}*, מה שמצאתי:\n"
                                 f"{options}\n\n"
-                                f"שלח מספר לבחירה, או שם מדויק יותר.{more_hint}")
+                                f"בחר מספר, כתוב שם אחר, או שלח *עוד*.{more_hint}")
                     return (f"לא מצאתי {new_food_query} במאגר.\n"
                             f"נסה שם ספציפי יותר — לדוגמא: 'פסטה מבושלת', 'גבינה 5% שומן'.")
                 all_results.append(f"⚠️ לא מצאתי '{new_food_query}' — דלגתי")
@@ -1911,12 +2029,15 @@ def execute_request(request_text: str, force: bool = False,
                         meal_foods = next((m.get("mealFoods") or m.get("new_meal_food") or []
                                            for m in all_meals if m["id"] == meal_id), [])
                         if meal_foods:
-                            opts = "\n".join(f"{i+1}. {f.get('food_name','')}" for i, f in enumerate(meal_foods))
-                            foods_list = "|".join(f.get("food_name","") for f in meal_foods)
+                            def _fmt_h(f):
+                                cal = int(float(f.get('calories') or 0))
+                                return f"{f.get('food_name','')}{f' — {cal} קל' if cal else ''}"
+                            opts = "\n".join(f"{i+1}. {_fmt_h(f)}" for i, f in enumerate(meal_foods))
+                            foods_list = "|".join(f"{f.get('food_name','')}:{int(float(f.get('calories',0) or 0))}" for f in meal_foods)
                             return (f"HINT_OPTIONS:{group_hint}||{foods_list}\n{prefix}"
-                                    f"לא מצאתי {group_hint} ב{full_meal}, במה תרצה להחליף את {new_food_query}?\n"
+                                    f"לא מצאתי *{group_hint}* ב{full_meal}, במה תרצה להחליף את *{new_food_query}*?\n"
                                     f"המזונות שיש בארוחה:\n{opts}\n\n"
-                                    f"שלח מספר או שם.")
+                                    f"בחר מספר או כתוב שם אחר.")
                     all_results.append(f"⚠️ '{group_hint}' לא קיים ב{full_meal} — דלגתי")
                     continue
                 all_results.append(err)
@@ -1931,8 +2052,9 @@ def execute_request(request_text: str, force: bool = False,
                 food_name = best_food.get("food_name", "")
                 if food_row:
                     replaced = food_row.get("food_name", "")
-                    # כמות המזון המוחלף (quantity = גרמים/יחידות אמיתיים)
-                    replaced_q = food_row.get("quantity") or food_row.get("quantity_to_calculate") or ""
+                    # גרמי המזון המוחלף — gram_value הוא השדה הנכון
+                    replaced_q = (food_row.get("quantity") or food_row.get("quantity_to_calculate") or
+                                  food_row.get("gram_value") or food_row.get("grams") or "")
                     replaced_measure = food_row.get("measure", "grams")
                     try:
                         replaced_q_f = float(replaced_q)
@@ -1945,29 +2067,17 @@ def execute_request(request_text: str, force: bool = False,
                         replaced_disp = f" ({replaced_q_str} גרם)"
                     else:
                         replaced_disp = ""
-                    # כמות המזון החדש — actual_grams שנשלחו לאוטופיט, או חישוב קלוריות
-                    if extra_grams:
-                        new_disp = f" ({extra_grams} גרם)"
-                    elif _actual_grams_used:
-                        # גרמים שנשלחו בפועל לאוטופיט
+                    # גרמי המזון החדש — actual_grams שנשלחו בפועל לאוטופיט
+                    if _actual_grams_used:
                         try:
                             _ag_f = float(_actual_grams_used)
                             new_disp = f" ({int(_ag_f) if _ag_f == int(_ag_f) else round(_ag_f,1)} גרם)"
                         except: new_disp = f" ({_actual_grams_used} גרם)"
+                    elif extra_grams:
+                        new_disp = f" ({extra_grams} גרם)"
                     else:
-                        try:
-                            cal_target = float(food_row.get("calories") or 0)
-                            cal_per_100 = float(best_food.get("calories") or 0)
-                            if cal_target > 0 and cal_per_100 > 0:
-                                new_q = round(cal_target * 100 / cal_per_100, 2)
-                                new_disp = f" ({new_q} גרם)"
-                            else:
-                                # fallback: אותה כמות כמו המזון שמוחלף
-                                fb_q = (food_row.get("gram_value") or food_row.get("grams") or
-                                        food_row.get("quantity") or food_row.get("quantity_to_calculate"))
-                                new_disp = f" ({int(float(fb_q))} גרם)" if fb_q and float(fb_q or 0) > 0 else ""
-                        except: new_disp = ""
-                    all_results.append(f"✅ נוסף: *{food_name}*{new_disp} ב{full_meal} של {full_name}\nכתחליף ל: {replaced}{replaced_disp}")
+                        new_disp = ""
+                    all_results.append(f"✅ *{food_name}*{new_disp} ← החליף: {replaced}{replaced_disp}\nב{full_meal} של {full_name}")
                 else:
                     disp_grams = extra_grams or best_food.get("grams") or best_food.get("gram_value") or ""
                     grams_str = f" ({disp_grams} גרם)" if disp_grams else ""
@@ -2008,7 +2118,6 @@ if __name__ == "__main__":
 
     # הגנה: חוסם שימוש במספר טלפון ישראלי כ--name ללא דגל --allow-phone
     # מונע הרצת פקודות בטעות על משתמש אמיתי תוך כדי בדיקות
-    _PHONE_RE = re.compile(r'^(?:972|0)(?:5[0-9]|[23489])\d{7,8}$')
     if name_override and _PHONE_RE.match(name_override.replace("-","").replace(" ","")) and not allow_phone:
         import sys as _sys
         print(f"⛔ BLOCKED: --name '{name_override}' נראה כמו מספר טלפון ישראלי.")

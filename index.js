@@ -210,7 +210,8 @@ function runAutofit(phone, text, opts = {}) {
       const headerBody = header.slice('FOOD_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
       const foodQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
-      const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
+      const rawAltsReg = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
+      const alts = rawAltsReg.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? a.slice(0, ci) : a; });
       const userMsg = rest.join('\n');
 
       // יש העדפה שמורה? בחר אוטומטית (אלא אם המשתמש ביקש "אפשרות אחרת")
@@ -692,10 +693,13 @@ const BIZ_GROUP = process.env.NOTIFY_GROUP_CHAT_ID; // chatId של קבוצת ה
 // מילות מפתח שמפעילות את הבוט
 const TRIGGER_WORDS = [
   'מוסיף לך', 'מוסיף לו', 'תוסיף לך', 'תוסיף לו', 'להוסיף',
+  'אוסיף לך', 'אוסיף לו', 'נוסיף לך', 'נוסיף לו',
+  'שמתי לך', 'שמתי לו', 'שם לך', 'שם לו',
   'מעלה לך', 'מעלה לו', 'תעלה לך', 'תעלה לו', 'להעלות',
   'מוריד לך', 'מוריד לו', 'תוריד לך', 'תוריד לו', 'הוריד לו', 'מפחית',
-  'להוריד', 'להפחית',
+  'הורדתי לך', 'הורדתי לו', 'להוריד', 'להפחית',
   'מחליף לך', 'מחליף לו', 'תחליף לך', 'תחליף לו', 'להחליף',
+  'החלפתי לך', 'החלפתי לו',
 ];
 
 function hasTriggerWord(text) {
@@ -861,10 +865,12 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       const headerBody = header.slice('FOOD_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
       const foodQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
-      const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
-      const listMsg = alts.map((a, i) => `${i+1}. ${a}`).join('\n');
-      bizPending = { type: 'food_choice', contactName, clientPhone, commandText, alternatives: alts, foodQuery, opts, timestamp: Date.now() };
-      await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי "${foodQuery}"\n${listMsg}\n\n_השב_ *בחר N*`);
+      const rawAlts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
+      const altObjs = rawAlts.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? { name: a.slice(0, ci), cal: parseInt(a.slice(ci+1)) || 0 } : { name: a, cal: 0 }; });
+      const altNames = altObjs.map(o => o.name);
+      const listMsg = altObjs.map((o, i) => `${i+1}. ${o.name}${o.cal > 0 ? ` — ${o.cal} קל` : ''}`).join('\n');
+      bizPending = { type: 'food_choice', contactName, clientPhone, commandText, alternatives: altNames, foodQuery, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי *${foodQuery}*, מה שמצאתי:\n${listMsg}\n\n_השב_ *בחר N*, כתוב שם אחר, או *עוד*`);
       return;
     }
 
@@ -874,10 +880,12 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       const headerBody = header.slice('HINT_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
       const hintQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
-      const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
-      const listMsg = alts.map((a, i) => `${i+1}. ${a}`).join('\n');
-      bizPending = { type: 'hint_choice', contactName, clientPhone, commandText, alternatives: alts, hintQuery, opts, timestamp: Date.now() };
-      await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי "${hintQuery}"\n${listMsg}\n\n_השב_ *בחר N*`);
+      const rawAlts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
+      const altObjs = rawAlts.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? { name: a.slice(0, ci), cal: parseInt(a.slice(ci+1)) || 0 } : { name: a, cal: 0 }; });
+      const altNames = altObjs.map(o => o.name);
+      const listMsg = altObjs.map((o, i) => `${i+1}. ${o.name}${o.cal > 0 ? ` — ${o.cal} קל` : ''}`).join('\n');
+      bizPending = { type: 'hint_choice', contactName, clientPhone, commandText, alternatives: altNames, hintQuery, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי *${hintQuery}*, מה שמצאתי:\n${listMsg}\n\n_השב_ *בחר N*, כתוב שם אחר, או *עוד*`);
       return;
     }
 
@@ -913,7 +921,7 @@ async function handleBizGroupResponse(text) {
   }
 
   const t = text.trim();
-  const { type, contactName, correctedName, rawName, clientPhone, commandText, alternatives, userIds, opts } = bizPending;
+  const { type, contactName, correctedName, rawName, clientPhone, commandText, alternatives, userIds, opts, foodQuery, hintQuery } = bizPending;
 
   // ── בחירת שם מרשימה (NAME_OPTIONS) ─────────────────────────────────
   if (type === 'name_options') {
@@ -961,8 +969,10 @@ async function handleBizGroupResponse(text) {
     bizPending = null;
 
     if (type === 'food_choice') {
+      if (foodQuery) { foodPrefs.set(foodQuery.toLowerCase(), chosen); savePrefs(); }
       runAutofitBiz(contactName, clientPhone, commandText, { ...opts, foodOverride: chosen });
     } else if (type === 'hint_choice') {
+      if (hintQuery) { hintPrefs.set(hintQuery.toLowerCase(), chosen); savePrefs(); }
       runAutofitBiz(contactName, clientPhone, commandText, { ...opts, hintOverride: chosen });
     } else {
       runAutofitBiz(contactName, clientPhone, commandText, { ...opts, mealOverride: chosen });
