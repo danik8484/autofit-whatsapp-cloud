@@ -337,6 +337,12 @@ app.post('/webhook', async (req, res) => {
       if (!isAllowed) return;
     }
     if (!hasTriggerWord(outText)) return;
+    // הגנה מפני עיבוד כפול — webhook + polling עלולים להביא את אותה הודעה
+    const outMsgId = body.idMessage;
+    if (outMsgId) {
+      if (bizProcessedIds.has(outMsgId)) return;
+      bizProcessedIds.add(outMsgId);
+    }
     // חיפוש לפי טלפון תמיד — מהיר ואמין יותר; שם הצ'אט רק לתצוגה בקבלה
     const outPhone = outChatId.replace('@c.us','');
     const outName = body.senderData?.chatName || outPhone;

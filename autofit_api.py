@@ -897,10 +897,10 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
 
     # ── pre-process: פקודות v3 ("מוסיף לך/לו") → פורמט שהפרסר מבין ───────────
     # ל[כךו]: לך (ך = כ סופית 0x5da) + לו — שתי הצורות
-    _text_before_v3 = text
-    # נרמול "גר" → "גרם" (קיצור נפוץ) — לפני כל parsing
+    # נרמול כלי (לא V3-ספציפי) — לפני הגדרת _text_before_v3
     text = re.sub(r'(\d+)\s*גר(?![\u05D0-\u05EA])', r'\1 גרם', text)
     text = re.sub(r'^אני\s+', '', text)  # 'אני מוסיף לך' → 'מוסיף לך'
+    _text_before_v3 = text  # שמור לפני נרמולי V3 בלבד
     text = re.sub(r'מוסיף\s+ל[כךו]', 'הוסף', text)
     # גוף שני/שלישי: "תוסיף לך", "הוסיף לו"
     text = re.sub(r'(?:תוסיף|הוסיף)\s+ל[כךוי](?![\u05D0-\u05EA])', 'הוסף', text)
@@ -1920,9 +1920,11 @@ def execute_request(request_text: str, force: bool = False,
                 extra_grams = m_nf.group(1)
                 new_food_clean = m_nf.group(2).strip()
 
-        # בפקודת הפחתה: strip prefix "מ/מה" אחרי גרמים ("50 גרם מהאורז" → "אורז")
+        # strip "מה" הידיעה prefix לכל פעולה: "100 גרם מהאורז" → "אורז"
+        new_food_clean = re.sub(r'^מה(?=[א-ת])', '', new_food_clean).strip()
+        # בפקודת הפחתה: strip prefix "מ" ("50 גרם מאורז" → "אורז")
         if op.get("reduce") or parsed.get("reduce"):
-            new_food_clean = re.sub(r'^מה?', '', new_food_clean).strip()
+            new_food_clean = re.sub(r'^מ(?=[א-ת])', '', new_food_clean).strip()
 
         new_food_query = normalize_food_query(new_food_clean)
 
