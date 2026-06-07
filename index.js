@@ -686,7 +686,8 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
   if (opts.foodOverride) { args.push('--food'); args.push(opts.foodOverride); }
   if (opts.hintOverride) { args.push('--hint'); args.push(opts.hintOverride); }
   if (opts.mealOverride) { args.push('--meal'); args.push(opts.mealOverride); }
-  args.push(commandText);
+  // הודעות V3 מתחילות ב-"אני" — מסיר כדי שלא יבלבל את הפרסר
+  args.push(commandText.replace(/^אני\s+/, ''));
 
   const proc = spawn('python3', [script, ...args]);
   let output = '';
