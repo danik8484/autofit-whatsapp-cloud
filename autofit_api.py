@@ -711,6 +711,7 @@ def parse_message(text: str) -> dict:
 
     # ── pre-process: פקודות v3 ("מוסיף לך/לו") → פורמט שהפרסר מבין ───────────
     # ל[כךו]: לך (ך = כ סופית 0x5da) + לו — שתי הצורות
+    _text_before_v3 = text
     text = re.sub(r'מוסיף\s+ל[כךו]', 'הוסף', text)
     # מחליף לך X ב-Y → הוסף Y במקום X (Y = subFood לבחירה, X = מה שמחליפים)
     # protect "לאחר/לפני בישול" then lazy-match to find FIRST ב separator
@@ -723,9 +724,12 @@ def parse_message(text: str) -> dict:
     text = _t.replace('\u05f4', ' ')
     text = re.sub(r'מחליף\s+ל[כךו]', 'הוסף', text)  # fallback: מחליף ללא "ב"
     # V3: "N גרם לFOOD" → "N גרם FOOD" (ל as preposition, 3+ chars after ל = definitely not לחם)
-    text = re.sub(r'(\d+\s*גרם\s+)ל([\u05D0-\u05EA]{3,})', r'\1\2', text)
     text = re.sub(r'(?:מוריד\s+ל[כךו]|מפחית(?:\s+ל[כךו])?)', 'הפחת', text)
     text = re.sub(r'מעלה\s+ל[כךו]', 'העלה', text)
+    _v3_triggered = (text != _text_before_v3)
+    # V3 only: strip ל-preposition from "N גרם לFOOD" (not applied to old-style לNAME format)
+    if _v3_triggered:
+        text = re.sub(r'(\d+\s*גרם\s+)ל([\u05D0-\u05EA]{3,})', r'\1\2', text)
 
     # ── pre-process: נרמול רווחים לפני נקודותיים בשמות שדות ─────────────────
     # "שם :" → "שם:", "ארוחה  :" → "ארוחה:" (רווח לפני :)
