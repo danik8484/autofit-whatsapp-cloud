@@ -276,18 +276,26 @@ def find_user(query: str):
                 _uid_cache[query] = (uid, full_name, True)
                 return uid, full_name, True
 
+    # pre-pass: "ד ני" → נסה גם "דני" (רווח בתוך שם = טעות הקלדה)
+    _collapsed = re.sub(r'\b([א-ת])\s+(?=[א-ת])', r'\1', query)  # "ד ני" → "דני"
+    _extra_variants: list[list[str]] = []
+    if _collapsed != query:
+        _extra_variants = [_collapsed.split()]
+
     # pass 3: חיפוש עמום (Levenshtein) — מוצא גם עם טעויות כתיב
     # מנסה גם וריאציות ו׳ חיבור כדי להגביר סיכוי מציאה
-    best_uid, best_name, best_score = None, None, 999
-    all_variants = [terms] + (_vav_variants(terms) if len(terms) > 1 else [])
+    best_uid, best_name, best_score, best_nwords = None, None, 999, 999
+    all_variants = [terms] + (_vav_variants(terms) if len(terms) > 1 else []) + _extra_variants
     for vt in all_variants:
         vq = " ".join(vt)
         for u in all_users:
             full_name = u.get("name") or f"{u.get('first_name','')} {u.get('last_name','')}".strip()
             if _fuzzy_name_match(vq, full_name):
                 score = sum(min(_levenshtein(qw, nw) for nw in full_name.split()) for qw in vt)
-                if score < best_score:
-                    best_score, best_uid, best_name = score, str(u["id"]), full_name
+                nwords = len(full_name.split())
+                # מעדיף שם קצר יותר כשהציון שווה (דני < אורי דוד דני הקטן)
+                if score < best_score or (score == best_score and nwords < best_nwords):
+                    best_score, best_uid, best_name, best_nwords = score, str(u["id"]), full_name, nwords
 
     if best_uid:
         _uid_cache[query] = (best_uid, best_name, True)
@@ -761,8 +769,8 @@ def parse_message(text: str) -> dict:
     # protect "לאחר/לפני בישול" then lazy-match to find FIRST ב separator
     _t = text.replace('לאחר בישול', 'לאחר״בישול').replace('לפני בישול', 'לפני״בישול')
     _t = re.sub(
-        r'מחליף\s+ל[כךו]\s+(.+?)\s+ב([^\n]+)',
-        lambda m: f'הוסף {m.group(2).strip()} במקום {m.group(1).strip()}',
+        r'מחליף\s+ל[כךו]\s+(.+?)\s+ב-?([^\n]+)',
+        lambda m: f'הוסף {m.group(2).strip().lstrip("-")} במקום {m.group(1).strip()}',
         _t
     )
     text = _t.replace('\u05f4', ' ')
@@ -869,7 +877,7 @@ def parse_message(text: str) -> dict:
                 _op_reduce = bool(re.match(r'^(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|תפחית|תפחיתי|הורידי)\s+', v))
                 v = re.sub(r'^(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|תפחית|תפחיתי|הורידי)\s+', '', v)
                 v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
-                v = re.sub(r'בנוסף\s+ל', 'ל ', v)         # "בנוסף ל X" → "ל X"
+                v = re.sub(r'בנוסף\s+ל-?', 'ל ', v)         # "בנוסף ל X" → "ל X"
                 v = re.sub(r'במקום\s+של', 'ל ', v)      # "במקום של X" → "ל X"
                 v = re.sub(r'במקום', 'ל ', v)            # "במקום X" → "ל X"
                 v = re.sub(r'באופצי(?:ה|ות)?\s+של', 'ל ', v)  # "באופציה/ות של X" → "ל X"
@@ -1021,7 +1029,7 @@ def parse_message(text: str) -> dict:
     if "meal" not in result and "meals" not in result:
         _meal_hits = []
         for w, k in _MEAL_MAP_FT.items():
-            if re.search(r'[בול](?:ארוחת\s+)?ה?' + w + r'\b', full):
+            if re.search(r'[בולמ](?:ארוחת\s+)?ה?' + w + r'\b', full):
                 if k not in _meal_hits:
                     _meal_hits.append(k)
             # מילת ארוחה בסוף משפט ללא prefix — "לפני שינה" → "לילה"
@@ -1052,8 +1060,8 @@ def parse_message(text: str) -> dict:
         elif _meal_hits:
             result["meal"] = _meal_hits[0]
 
-    # נקה ביטויי ארוחה לפני חילוץ שם/מזון — ב/ל prefix ("בצהריים", "לצהריים", "לארוחת בוקר")
-    _meal_re = r'[בל](?:ארוחת\s+)?ה?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b'
+    # נקה ביטויי ארוחה לפני חילוץ שם/מזון — ב/ל/מ prefix ("בצהריים", "לצהריים", "מארוחת צהריים")
+    _meal_re = r'[בלמ](?:ארוחת\s+)?ה?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b'
     full_no_meal = re.sub(_meal_re, '', full)
     # גם "+ארוחה" (כמו "+ערב", "+צהריים")
     full_no_meal = re.sub(r'\s*\+\s*(?:ארוחת\s+)?(?:' + '|'.join(_MEAL_MAP_FT.keys()) + r')\b', '', full_no_meal)
@@ -1071,7 +1079,7 @@ def parse_message(text: str) -> dict:
     full_no_meal = re.sub(r'כתחליף\s+ל', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'כאופציות\b', '', full_no_meal)  # כאופציות ללא ל/של = מחיקה
-    full_no_meal = re.sub(r'בנוסף\s+ל', 'במקום ', full_no_meal)
+    full_no_meal = re.sub(r'בנוסף\s+ל-?', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
 
     # ── V3: חילוץ שם לפני הלוגיקה הכללית ────────────────────────────────────
@@ -1236,9 +1244,9 @@ def parse_message(text: str) -> dict:
     clean_full = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)', 'במקום ', clean_full)
     clean_full = re.sub(r'כאופציות\b', '', clean_full)  # כאופציות ללא ל/של = מחיקה
     clean_full = re.sub(r'כתחליף\s+ל', 'במקום ', clean_full)
-    clean_full = re.sub(r'בנוסף\s+ל', 'במקום ', clean_full)
-    # "תחליפי X ב-Y" / "ב-Y" עם מקף → "X במקום Y"
-    if re.search(r'(?:תחליפ[יה]|תחליף|החלפ[יה]?|החלף|להחליף)\b', text) and 'במקום' not in clean_full:
+    clean_full = re.sub(r'בנוסף\s+ל-?', 'במקום ', clean_full)
+    # "תחליפי X ב-Y" / "מחליף X ב-Y" → "X במקום Y"
+    if re.search(r'(?:תחליפ[יה]|תחליף|החלפ[יה]?|החלף|להחליף|מחליף)\b', text) and 'במקום' not in clean_full:
         clean_full = re.sub(r"(?<=[א-ת%'׳\"])\s+ב-?([א-ת])", r' במקום \1', clean_full, count=1)
     clean_full = re.sub(r'אופציה\s+של\s+', '', clean_full)     # "אופציה של X" → "X"
     clean_full = re.sub(r'אופציה\s+לתחליף\s+', '', clean_full) # "אופציה לתחליף X" → "X"
@@ -1592,8 +1600,8 @@ def execute_request(request_text: str, force: bool = False,
         new_food_raw = add_match.group(1).strip()
         group_hint_raw = (add_match.group(2) or "").strip() if add_match.lastindex and add_match.lastindex >= 2 else ""
 
-        # ניקוי "בערב/בבוקר/בצהריים" ו"לערב/לבוקר/לצהריים" שדלפו לשם המזון
-        new_food_raw = re.sub(r'\s*[בל](?:ארוחת\s+)?ה?(?:ערב|בוקר|צהריים|ביניים|לילה)\b', '', new_food_raw).strip()
+        # ניקוי "בערב/בבוקר/בצהריים", "לערב/לצהריים", "מארוחת..." שדלפו לשם המזון
+        new_food_raw = re.sub(r'\s*[בלמ](?:ארוחת\s+)?ה?(?:ערב|בוקר|צהריים|ביניים|לילה)\b', '', new_food_raw).strip()
 
         # חלץ מסוגריים תחילה — כדי שזיהוי הגרמים יעבוד גם על "(50 גרם אורז)"
         paren = re.search(r'\(([^)]+)\)', new_food_raw)
