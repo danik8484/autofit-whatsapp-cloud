@@ -557,8 +557,8 @@ def _extract_foods(text: str):
     """מחלץ (מזון_חדש, מזון_קיים) מטקסט. מחזיר (new_food, group_hint)."""
     # נרמול synonyms של "כאופציה/באופציה" לפני כל חיפוש
     text = re.sub(r'באופצי(?:ה|ות)?\s+של', 'במקום', text)
-    text = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל|של)', 'במקום ', text)
-    text = re.sub(r'כאופציות\b', '', text)  # כאופציות ללא ל/של = מחיקה
+    text = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)', 'במקום ', text)
+    text = re.sub(r'כאופציות\b', '', text)  # כאופציות ללא ל(קצר)/של = מחיקה
     text = re.sub(r'אופציה\s+של\s+', '', text)  # "אופציה של X במקום Y" → "X במקום Y"
     # סוגריים: (טונה) במקום (אורז)
     parens = re.findall(r"\(([^)]+)\)", text)
@@ -930,7 +930,7 @@ def parse_message(text: str) -> dict:
     # נרמול מוקדם לפני חיפוש שמות — מונע "ל+מזון" אחרי מילות תחליף מלהיות שם אדם
     full_no_meal = re.sub(r'אופציה\s+של\s+', '', full_no_meal)
     full_no_meal = re.sub(r'כתחליף\s+ל', 'במקום ', full_no_meal)
-    full_no_meal = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל|של)', 'במקום ', full_no_meal)
+    full_no_meal = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'כאופציות\b', '', full_no_meal)  # כאופציות ללא ל/של = מחיקה
     full_no_meal = re.sub(r'בנוסף\s+ל', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
@@ -940,8 +940,10 @@ def parse_message(text: str) -> dict:
         _name_cut_end = 0
         _NAME_STOP = r'(?:במקום|בנוסף|כאופציה|כתחליף|ובמקום|אופציה)\b'
 
-        # Fix C: שם לפני מפריד בתחילת משפט ("דני - תוסיפי X" / "דני: X")
-        _pre_sep = re.match(r'^([\u05D0-\u05EA]{2,6})\s*[-:–]\s*', full_no_meal)
+        # Fix C: שם לפני מפריד בתחילת משפט ("דני - תוסיפי X" / "רון וליצקו: X")
+        _pre_sep = re.match(
+            r'^([\u05D0-\u05EA]{2,}(?:\s+[\u05D0-\u05EA]{2,})?)\s*[-:–]\s*', full_no_meal
+        )
         # Fix E: "NAME צריך/רוצה/מבקש X" — שם בתחילה לפני פועל הקשר
         _ctx_verb = re.match(
             r'^([\u05D0-\u05EA]{2,5})\s+(?:צריך|רוצה|מבקש|מקבל|יצטרך|אוכל)\s+',
@@ -952,7 +954,7 @@ def parse_message(text: str) -> dict:
             conf = max(conf, 70)
             clean_full = full_no_meal[_ctx_verb.end():]
             clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-        elif _pre_sep and _pre_sep.group(1) not in _NOT_NAME_VERBS:
+        elif _pre_sep and all(w not in _NOT_NAME_VERBS for w in _pre_sep.group(1).split()):
             result["name"] = _pre_sep.group(1)
             conf = max(conf, 75)
             clean_full = full_no_meal[_pre_sep.end():]
@@ -1035,7 +1037,7 @@ def parse_message(text: str) -> dict:
 
     # נרמול synonyms לפני חילוץ מזון
     clean_full = re.sub(r'באופצי(?:ה|ות)?\s+של', 'במקום', clean_full)   # "באופציה של" / "באופציות של"
-    clean_full = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל|של)', 'במקום ', clean_full)
+    clean_full = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)', 'במקום ', clean_full)
     clean_full = re.sub(r'כאופציות\b', '', clean_full)  # כאופציות ללא ל/של = מחיקה
     clean_full = re.sub(r'כתחליף\s+ל', 'במקום ', clean_full)
     clean_full = re.sub(r'בנוסף\s+ל', 'במקום ', clean_full)
