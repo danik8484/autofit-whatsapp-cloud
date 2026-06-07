@@ -76,6 +76,9 @@ async function sendMessage(phone, text) {
 // תיקונים ממתינים: phone → { type, originalText, alternatives, timestamp }
 const pendingCorrections = new Map();
 
+// זיכרון קונטקסט: sender → { text, opts } — הפקודה האחרונה שהצליחה
+const lastCommands = new Map();
+
 // ─── הרצת autofit ─────────────────────────────────────────────
 function runAutofit(phone, text, opts = {}) {
   const script = path.join(__dirname, 'autofit_api.py');
@@ -211,13 +214,21 @@ function runAutofit(phone, text, opts = {}) {
       }
 
       // שמור גם hintOverride שכבר נבחר — כדי לא לשכוח אותו
-      pendingCorrections.set(phone, { type: 'food', originalText: text, alternatives: alts, foodQuery, nameOverride: opts.nameOverride || '', hintOverride: opts.hintOverride || '', timestamp: Date.now() });
+      // שמור כל האלטרנטיבות לpagination (pageOffset=0 = עמוד ראשון)
+      pendingCorrections.set(phone, { type: 'food', originalText: text, allAlternatives: alts, alternatives: alts.slice(0, 10), pageOffset: 0, foodQuery, nameOverride: opts.nameOverride || '', hintOverride: opts.hintOverride || '', timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
 
     if (!raw.startsWith('CONFIRM')) {
       pendingCorrections.delete(phone);
+    }
+
+    // שמור פקודה אחרונה שהצליחה (לא CONFIRM / OPTIONS)
+    if (code === 0 && !raw.startsWith('CONFIRM') && !raw.startsWith('FOOD_OPTIONS') &&
+        !raw.startsWith('HINT_OPTIONS') && !raw.startsWith('MEAL_OPTIONS') &&
+        !raw.startsWith('NAME_OPTIONS') && !raw.startsWith('NAME_NOT_FOUND')) {
+      lastCommands.set(phone, { text, opts });
     }
 
     await sendMessage(phone, code === 0 ? raw : `❌ ${raw}`);
@@ -384,12 +395,30 @@ app.post('/webhook', async (req, res) => {
         /^(?:תוסיפ[יי]?|הוסיפ[יי]?|הוסף|תוסיף|הכנס|תכניס|הורד|הפחת|תוריד|תחליפ[יי]?|החליפ[יי]?|להוסיף|להחליף)\s/i.test(text.trim());
       if (_isNewCmd) {
         pendingCorrections.delete(sender);
+      } else if (corr.type === 'food' && /^(?:עוד|הצג עוד|עוד אפשרויות)$/i.test(text.trim())) {
+        // pagination — הצג עמוד הבא של 10
+        const allAlts = corr.allAlternatives || corr.alternatives;
+        const nextOffset = (corr.pageOffset || 0) + 10;
+        const nextPage = allAlts.slice(nextOffset, nextOffset + 10);
+        if (nextPage.length === 0) {
+          await sendMessage(sender, 'אין עוד אפשרויות.');
+        } else {
+          const listLines = nextPage.map((name, i) => `${nextOffset + i + 1}. ${name}`).join('\n');
+          const hasMore = allAlts.length > nextOffset + 10;
+          const moreHint = hasMore ? '\n\nשלח *עוד* לעוד אפשרויות.' : '';
+          // עדכן pageOffset ורשימת alternatives הנוכחית
+          pendingCorrections.set(sender, { ...corr, alternatives: nextPage, pageOffset: nextOffset, timestamp: Date.now() });
+          await sendMessage(sender, `${listLines}${moreHint}`);
+        }
+        return;
       } else {
         const numMatch = text.trim().match(/^(\d+)$/);
         let chosen = null;
         if (numMatch) {
+          // המספר הוא גלובלי (1-30), לא יחסי לעמוד
           const idx = parseInt(numMatch[1]) - 1;
-          if (idx >= 0 && idx < corr.alternatives.length) chosen = corr.alternatives[idx];
+          const allAlts = corr.allAlternatives || corr.alternatives;
+          if (idx >= 0 && idx < allAlts.length) chosen = allAlts[idx];
         } else if (text.trim().length >= 2) {
           chosen = text.trim();
         }
@@ -456,8 +485,77 @@ app.post('/webhook', async (req, res) => {
 
   // "אפשרות אחרת" / "אופציה נוספת" — חיפוש חדש, מתעלם מהעדפה שמורה
   const _skipPref = /(?:אפשרות|אופציה)\s+(?:אחרת|נוספת)|תחפש\s+עוד/.test(text);
+
+  // ── context memory: "כמו אתמול" / "שוב" / "עוד X גרם" ───────────────────
+  const _ctxRepeat = /^(?:כמו אתמול|אותו דבר|שוב|חזור על זה|אותו הדבר)$/.test(text.trim());
+  if (_ctxRepeat) {
+    const last = lastCommands.get(sender);
+    if (last) {
+      await sendMessage(sender, '⏳ מבצע שוב...');
+      runAutofit(sender, last.text, { ...last.opts, force: true });
+    } else {
+      await sendMessage(sender, 'אין פקודה קודמת לחזרה.');
+    }
+    return;
+  }
+
+  const _extraGramsM = /^(?:עוד|תוסיפ[יי]?\s+עוד)\s+(\d+)\s*גרם$/.exec(text.trim());
+  if (_extraGramsM) {
+    const last = lastCommands.get(sender);
+    if (last) {
+      const addGrams = parseInt(_extraGramsM[1]);
+      const prevGramsM = last.text.match(/(\d+)\s*גרם/);
+      let newText;
+      if (prevGramsM) {
+        const newGrams = parseInt(prevGramsM[1]) + addGrams;
+        newText = last.text.replace(/\d+\s*גרם/, `${newGrams} גרם`);
+      } else {
+        newText = last.text + ` עוד ${addGrams} גרם`;
+      }
+      await sendMessage(sender, '⏳ מבצע...');
+      runAutofit(sender, newText, { ...last.opts, force: true });
+    } else {
+      await sendMessage(sender, 'אין פקודה קודמת — שלח פקודה מלאה.');
+    }
+    return;
+  }
+
+  // ── ריבוי לקוחות: "לרון ולדני 120 גרם חזה עוף" ─────────────────────────
+  const _multiNames = _extractMultiNames(text);
+  if (_multiNames && _multiNames.length >= 2) {
+    const baseText = _stripMultiNamesPrefix(text, _multiNames);
+    await sendMessage(sender, `⏳ מבצע עבור ${_multiNames.join(', ')}...`);
+    for (const name of _multiNames) {
+      runAutofit(sender, baseText, { nameOverride: name, ..._skipPref ? { skipFoodPref: true } : {} });
+    }
+    return;
+  }
+
   runAutofit(sender, text, _skipPref ? { skipFoodPref: true } : {});
 });
+
+// חילוץ ריבוי שמות מ-"לרון ולדני" / "לרון, דני ומיכל"
+function _extractMultiNames(text) {
+  // "לNAME ולNAME" או "לNAME, NAME ומיכל"
+  const m = text.match(/ל([א-ת]{2,}(?:\s+[א-ת]{2,})?)\s+ול([א-ת]{2,}(?:\s+[א-ת]{2,})?)/);
+  if (m) {
+    const names = [m[1].trim(), m[2].trim()];
+    // בדוק אם יש שם שלישי: "לרון ולדני ולמיכל"
+    const thirdM = text.slice(text.indexOf(m[0]) + m[0].length).match(/^\s+ול([א-ת]{2,}(?:\s+[א-ת]{2,})?)/);
+    if (thirdM) names.push(thirdM[1].trim());
+    return names;
+  }
+  return null;
+}
+
+// הסרת "לNAME ולNAME" מתחילת המשפט — מחזיר את שאר הטקסט
+function _stripMultiNamesPrefix(text, names) {
+  // החלף "לNAME ולNAME ..." בתחילת הטקסט בהסרת השמות
+  let result = text;
+  result = result.replace(/ל[א-ת]{2,}(?:\s+[א-ת]{2,})?\s+(?:ול[א-ת]{2,}(?:\s+[א-ת]{2,})?\s*)+/g, '');
+  result = result.replace(/^(?:תוסיפ[יי]?|הוסיפ[יי]?|הוסף)\s+/, ''); // הסר פועל מהתחלה אם נשאר
+  return result.trim() || text;
+}
 
 // ════════════════════════════════════════════════════════════════
 // ══  BOT V3 — WhatsApp Business (הודעות יוצאות של דני)       ══

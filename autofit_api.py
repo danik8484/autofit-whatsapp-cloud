@@ -461,15 +461,15 @@ def find_best_food(query: str, coach_id: str = ""):
             starts2   = [f for f in foods2 if f.get("food_name","").lower().startswith(q2)]
             contains2 = [f for f in foods2 if q2 in f.get("food_name","").lower()]
             if exact2:
-                return exact2, foods2[:10]
+                return exact2, foods2[:30]
             elif len(starts2) == 1:
-                return starts2[0], foods2[:10]
+                return starts2[0], foods2[:30]
             elif len(contains2) == 1:
-                return contains2[0], foods2[:10]
+                return contains2[0], foods2[:30]
             elif contains2:
                 foods = contains2  # עדיף תוצאות מקוריות על פני תוצאות מנורמלות רעות
 
-    return best, foods[:10]
+    return best, foods[:30]
 
 
 # ─── Update / Add food to meal ───────────────────────────────────────────────
@@ -864,10 +864,15 @@ def parse_message(text: str) -> dict:
         full = re.sub(r'\bמזון\s+חדש\b', '', full)
         full = re.sub(r'\s+', ' ', full).strip()
 
-    # "הורד/הפחת X גרם" = פקודת הפחתה
-    _reduce = bool(re.search(r'\b(?:להוריד|להפחית|הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|תפחית|תפחיתי|הורידי|הוריד)\b', full))
+    # נרמול שמות עצם של הפחתה → פועל
+    full = re.sub(r'(?<![א-ת])(?:הפחתה|הורדה)\s+של', 'הפחת', full)
+    full = re.sub(r'(?<![א-ת])(?:הפחתה|הורדה)', 'הפחת', full)
+
+    # "הורד/הפחת X גרם" = פקודת הפחתה — כולל קידומת ש/ו (שתורידי, ותורידי)
+    _REDUCE_PAT = r'(?<![א-ת])(?:[שוב]?)(?:להוריד|להפחית|הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|תפחית|תפחיתי|הורידי|הוריד)(?![א-ת])'
+    _reduce = bool(re.search(_REDUCE_PAT, full))
     if _reduce:
-        full = re.sub(r'\b(?:להוריד|להפחית|הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|תפחית|תפחיתי|הורידי|הוריד)\s+', '', full)
+        full = re.sub(_REDUCE_PAT + r'\s*', '', full)
         # "מ-FOOD" / "מה-FOOD" אחרי גרמים — strip prefix מ/מה לפני שם מזון
         full = re.sub(r'(\d+\s*גרם\s+)מה?\s*', r'\1', full)
         full = re.sub(r'\s+', ' ', full).strip()
@@ -1454,11 +1459,12 @@ def execute_request(request_text: str, force: bool = False,
                 if not best_food:
                     if alternatives:
                         options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:10]))
-                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives[:10])
+                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives)
+                        more_hint = f"\n\nשלח *עוד* לעוד אפשרויות." if len(alternatives) > 10 else ""
                         return (f"FOOD_OPTIONS:{normalize_food_query(food_override)}||{alts_pipe}\n"
                                 f"לא מצאתי {food_override} כאופציה, מה שכן מצאתי זה:\n"
                                 f"{options}\n\n"
-                                f"שלח מספר לבחירה, או שם מדויק יותר.")
+                                f"שלח מספר לבחירה, או שם מדויק יותר.{more_hint}")
                     all_results.append(f"❓ לא נמצא '{food_override}' במאגר.")
                     continue
         else:
@@ -1467,11 +1473,12 @@ def execute_request(request_text: str, force: bool = False,
                 if len(ops_list) == 1:
                     if alternatives:
                         options = "\n".join(f"{i+1}. {f['food_name']}" for i, f in enumerate(alternatives[:10]))
-                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives[:10])
+                        alts_pipe = "|".join(f.get("food_name","") for f in alternatives)
+                        more_hint = f"\n\nשלח *עוד* לעוד אפשרויות." if len(alternatives) > 10 else ""
                         return (f"FOOD_OPTIONS:{new_food_query}||{alts_pipe}\n"
                                 f"לא מצאתי {new_food_query} כאופציה, מה שכן מצאתי זה:\n"
                                 f"{options}\n\n"
-                                f"שלח מספר לבחירה, או שם מדויק יותר.")
+                                f"שלח מספר לבחירה, או שם מדויק יותר.{more_hint}")
                     return (f"לא מצאתי {new_food_query} במאגר.\n"
                             f"נסה שם ספציפי יותר — לדוגמא: 'פסטה מבושלת', 'גבינה 5% שומן'.")
                 all_results.append(f"⚠️ לא מצאתי '{new_food_query}' — דלגתי")
