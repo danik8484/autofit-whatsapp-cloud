@@ -1232,7 +1232,7 @@ def execute_request(request_text: str, force: bool = False,
 
     parsed = parse_message(request_text)
     # V3: שם מגיע דרך --name (name_override), לא מתוך הטקסט
-    if name_override and "name" not in parsed:
+    if name_override:
         parsed["name"] = name_override
     if "name" not in parsed or "change" not in parsed:
         missing = []
