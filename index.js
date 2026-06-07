@@ -863,22 +863,15 @@ async function handleBizGroupResponse(text) {
   }
 }
 
-// ─── Webhook v3 — הודעות יוצאות מהחשבון העסקי ─────────────────
-const bizDebugLog = []; // מאגר webhooks אחרונים לdebug
-const v3Log = []; // לוג V3
-app.post('/webhook-business', async (req, res) => {
-  res.sendStatus(200);
-  const body = req.body;
-  bizDebugLog.push({ ts: Date.now(), body });
-  if (bizDebugLog.length > 30) bizDebugLog.shift();
-  console.log('[biz-raw] typeWebhook=' + (body.typeWebhook||'?') + ' chatId=' + (body.senderData?.chatId||'?'));
-  if (!BIZ_ID || !BIZ_GROUP) return; // לא מוגדר → עצור
+// ─── V3 — עיבוד הודעה מ-BIZ instance ─────────────────────────
+const bizDebugLog = [];
+const v3Log = [];
 
-  // כל הודעה שהבוט עצמו שלח — התעלם (מניעת לולאה)
+async function processBizBody(body) {
+  if (!BIZ_ID || !BIZ_GROUP) return;
+
   const msgId = body.idMessage;
   if (msgId && bizBotSentIds.has(msgId)) return;
-
-  // dedup
   if (msgId) {
     if (bizProcessedIds.has(msgId)) return;
     bizProcessedIds.add(msgId);
@@ -894,46 +887,61 @@ app.post('/webhook-business', async (req, res) => {
   if (!text) return;
 
   const chatId = body.senderData?.chatId || '';
-  console.log(`[biz-wh] type=${body.typeWebhook} chatId=${chatId} text="${text.slice(0,40)}"`);
+  console.log(`[biz] type=${body.typeWebhook} chatId=${chatId} text="${text.slice(0,40)}"`);
 
-  // ── תגובות דני בקבוצה ──────────────────────────────────────────────
+  // תגובות דני בקבוצה
   if (chatId === BIZ_GROUP || chatId.replace('@g.us','') === (BIZ_GROUP || '').replace('@g.us','')) {
-    // הודעות יוצאות מהחשבון בקבוצה = תגובות דני
     if (body.typeWebhook === 'outgoingMessageReceived') {
       await handleBizGroupResponse(text);
     }
     return;
   }
 
-  // ── שיחות 1-on-1 עם לקוחות ─────────────────────────────────────────
-  // קולט רק הודעות יוצאות (דני שולח ללקוח)
+  // שיחות 1-on-1 — רק הודעות יוצאות
   if (body.typeWebhook !== 'outgoingMessageReceived') return;
-  if (chatId.includes('@g.us')) return; // דלג על קבוצות
+  if (chatId.includes('@g.us')) return;
 
-  // מצב ניסוי: עבד רק מסרים לטלפון הזה
-  const BIZ_TEST_PHONE = process.env.BIZ_TEST_PHONE; // ריק = כולם
+  const BIZ_TEST_PHONE = process.env.BIZ_TEST_PHONE;
   if (BIZ_TEST_PHONE) {
     const phone = chatId.replace('@c.us', '').replace(/^972/, '0');
     const phoneAlt = chatId.replace('@c.us', '');
     if (phone !== BIZ_TEST_PHONE && phoneAlt !== BIZ_TEST_PHONE && phoneAlt !== '972' + BIZ_TEST_PHONE.replace(/^0/, '')) return;
   }
 
-  // בדוק מילות מפתח
   if (!hasTriggerWord(text)) return;
-
   console.log(`[biz] פקודה: chatId=${chatId} | "${text.slice(0,60)}"`);
 
-  // שלוף שם איש הקשר
   const contactName = await getContactName(chatId);
   const clientPhone = chatId.replace('@c.us', '');
   console.log(`[biz] לקוח: "${contactName}" (${clientPhone})`);
 
-  // בדוק cache שמות
   const cachedId = bizNamePrefs.get(contactName.toLowerCase());
   const extraOpts = cachedId ? { userIdOverride: cachedId } : {};
-
   runAutofitBiz(contactName, clientPhone, text, extraOpts);
-});
+}
+
+// ─── BIZ Polling loop (במקום webhook) ─────────────────────────
+async function bizPollLoop() {
+  while (true) {
+    try {
+      const resp = await fetch(`${BIZ_BASE}/receiveNotification/${BIZ_TOKEN}?receiveTimeout=5`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data && data.body) {
+          bizDebugLog.push({ ts: Date.now(), body: data.body });
+          if (bizDebugLog.length > 30) bizDebugLog.shift();
+          await processBizBody(data.body);
+          await fetch(`${BIZ_BASE}/deleteNotification/${BIZ_TOKEN}/${data.receiptId}`, { method: 'DELETE' });
+        }
+      }
+    } catch (e) {
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+}
+
+// endpoint לdebug בלבד (לא מקבל webhooks יותר)
+app.post('/webhook-business', (req, res) => res.sendStatus(200));
 
 // ─── Debug V3 log ─────────────────────────────────────────────
 app.get('/debug-v3', (_, res) => {
@@ -987,25 +995,9 @@ app.listen(PORT, async () => {
     console.log('⚠️  WEBHOOK_URL not set — set it in Railway env vars');
   }
 
-  // ── Webhook v3 (חשבון עסקי) ──────────────────────────────────────
-  const bizWebhookUrl = process.env.WEBHOOK_URL_BIZ;
-  if (BIZ_BASE && BIZ_TOKEN && bizWebhookUrl) {
-    try {
-      await fetch(`${BIZ_BASE}/setSettings/${BIZ_TOKEN}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          webhookUrl: bizWebhookUrl,
-          outgoingWebhook: 'yes',        // קבלת הודעות יוצאות
-          outgoingMessageWebhook: 'yes', // גיבוי
-          incomingWebhook: 'yes',        // קבלת הודעות נכנסות (לתגובות בקבוצה)
-        }),
-      });
-      console.log('✅ Webhook v3 (biz) set:', bizWebhookUrl);
-    } catch (e) {
-      console.error('Webhook v3 setup error:', e.message);
-    }
-  } else if (BIZ_ID) {
-    console.log('⚠️  BIZ instance מוגדר אבל WEBHOOK_URL_BIZ חסר');
+  // ── BIZ Polling v3 ───────────────────────────────────────────────
+  if (BIZ_BASE && BIZ_TOKEN) {
+    console.log('✅ BIZ polling started (instance', BIZ_ID, ')');
+    bizPollLoop(); // לולאה אסינכרונית — לא חוסמת
   }
 });
