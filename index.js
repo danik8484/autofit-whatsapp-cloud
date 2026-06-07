@@ -706,11 +706,14 @@ async function handleBizGroupResponse(text) {
 }
 
 // ─── Webhook v3 — הודעות יוצאות מהחשבון העסקי ─────────────────
+const bizDebugLog = []; // מאגר webhooks אחרונים לdebug
 app.post('/webhook-business', async (req, res) => {
   res.sendStatus(200);
-  if (!BIZ_ID || !BIZ_GROUP) return; // לא מוגדר → עצור
-
   const body = req.body;
+  bizDebugLog.push({ ts: Date.now(), body });
+  if (bizDebugLog.length > 30) bizDebugLog.shift();
+  console.log('[biz-raw] typeWebhook=' + (body.typeWebhook||'?') + ' chatId=' + (body.senderData?.chatId||'?'));
+  if (!BIZ_ID || !BIZ_GROUP) return; // לא מוגדר → עצור
 
   // כל הודעה שהבוט עצמו שלח — התעלם (מניעת לולאה)
   const msgId = body.idMessage;
@@ -771,6 +774,17 @@ app.post('/webhook-business', async (req, res) => {
   const extraOpts = cachedId ? { userIdOverride: cachedId } : {};
 
   runAutofitBiz(contactName, clientPhone, text, extraOpts);
+});
+
+// ─── Debug BIZ webhooks ────────────────────────────────────────
+app.get('/debug-biz', (_, res) => {
+  const entries = bizDebugLog.slice(-10).reverse().map(e => ({
+    ago: Math.round((Date.now()-e.ts)/1000)+'s ago',
+    typeWebhook: e.body.typeWebhook,
+    chatId: e.body.senderData?.chatId,
+    text: e.body.messageData?.textMessageData?.textMessage?.slice(0,60)
+  }));
+  res.json({ count: bizDebugLog.length, last10: entries });
 });
 
 // ─── Health check ─────────────────────────────────────────────
