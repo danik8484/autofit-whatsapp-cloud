@@ -1979,8 +1979,9 @@ def execute_request(request_text: str, force: bool = False,
                                 f"לא מצאתי *{new_food_query}*, מה שמצאתי:\n"
                                 f"{options}\n\n"
                                 f"בחר מספר, כתוב שם אחר, או שלח *עוד*.{more_hint}")
-                    return (f"לא מצאתי {new_food_query} במאגר.\n"
-                            f"נסה שם ספציפי יותר — לדוגמא: 'פסטה מבושלת', 'גבינה 5% שומן'.")
+                    return (f"FOOD_OPTIONS:{new_food_query}||\n"
+                            f"לא מצאתי *{new_food_query}* במאגר 🤔\n"
+                            f"כתוב שם מזון אחר:")
                 all_results.append(f"⚠️ לא מצאתי '{new_food_query}' — דלגתי")
                 continue
 
