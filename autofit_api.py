@@ -547,7 +547,7 @@ def search_food(query: str, coach_id: str = "") -> list:
         return raw.get("foods", [])
     return []
 
-_PROTECT_L = frozenset({"לפני", "לאחר"})  # מילות עזר שלא מנקים את ל' שלהן
+_PROTECT_L = frozenset({"לפני", "לאחר", "לבנה", "לבן", "לחה", "לחים", "לחות"})  # מילות עזר ותארים שלא מנקים את ל' שלהן
 _PROTECT_H = frozenset({"הודו"})  # מילים שה' חלק מהמילה (לא ה' הידיעה)
 
 def normalize_food_query(q: str) -> str:
@@ -1246,6 +1246,17 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
     # נרמול מוקדם לפני חיפוש שמות — מונע "ל+מזון" אחרי מילות תחליף מלהיות שם אדם
     full_no_meal = re.sub(r'(\d+\s*גרם)\s+של\s+', r'\1 ', full_no_meal)  # '50 גרם של חזה עוף' → '50 גרם חזה עוף'
     full_no_meal = re.sub(r'כתחליף\s+ל', 'במקום ', full_no_meal)
+    # "VERB כאופציה לNAME FOOD" (V2: שם אחרי "כאופציה ל") → "VERB לNAME FOOD"
+    # חייב לפני "כאופציה ל→במקום" כדי שהשם לא יהפוך ל"במקום קובי"
+    if not _v3_triggered and not skip_name:
+        _opt_nm = re.match(
+            r'^(.+?)\s+כאופצי(?:ה|ות)?\s+ל([א-ת׳\']{2,8}'
+            r'(?:\s+[א-ת׳\']{2,8})?)\ +(.+)$',
+            full_no_meal, re.UNICODE
+        )
+        if _opt_nm:
+            full_no_meal = f"{_opt_nm.group(1)} ל{_opt_nm.group(2)} {_opt_nm.group(3)}"
+            full_no_meal = re.sub(r'\s+', ' ', full_no_meal).strip()
     full_no_meal = re.sub(r'כאופצי(?:ה|ות)?\s+(?:ל(?=[א-ת]{3,})|של)\s*', 'במקום ', full_no_meal)
     full_no_meal = re.sub(r'באופצי(?:ה|ות)?\s+של\s*ה?', 'במקום ', full_no_meal)  # V3: "באופציה של X"
     full_no_meal = re.sub(r'אופציה\s+של\s+', '', full_no_meal)  # standalone — לאחר כ/ב כבר טופלו
@@ -1319,7 +1330,7 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
                     'תן', 'תני', 'תתן', 'יש', 'האם', 'חשוב', 'תעשה', 'תעשי',
                     'בכל', 'ותוסיפי', 'שני', 'תקן', 'תקני', 'ותחליף', 'ותוריד',
                     'מקרה', 'חשבתי', 'מציע', 'מאוד', 'בסוף', 'הגיע', 'מוצע',
-                    'וסיפי', 'פחת',
+                    'וסיפי', 'פחת', 'יפי', 'יופי', 'במקום',
                 }
                 while _pos < len(_wds) and (
                     re.match(_VERB_PAT + r'$', _wds[_pos])
@@ -1993,6 +2004,9 @@ def execute_request(request_text: str, force: bool = False,
                 if upd_row:
                     curr_q = float(upd_row.get("quantity") or upd_row.get("quantity_to_calculate") or 0)
                     if _is_reduce:
+                        if curr_q <= 0:
+                            all_results.append(f"⚠️ '{new_food_query}' כבר ב-0 גרם ב{full_meal}")
+                            continue
                         new_q = max(0.0, curr_q - float(extra_grams))
                         action_label = "הופחת"
                         arrow = "↓"
@@ -2090,7 +2104,10 @@ def execute_request(request_text: str, force: bool = False,
                     if _actual_grams_used:
                         try:
                             _ag_f = float(_actual_grams_used)
-                            new_disp = f" ({int(_ag_f) if _ag_f == int(_ag_f) else round(_ag_f,1)} גרם)"
+                            if _ag_f > 0:
+                                new_disp = f" ({int(_ag_f) if _ag_f == int(_ag_f) else round(_ag_f,1)} גרם)"
+                            else:
+                                new_disp = ""
                         except: new_disp = f" ({_actual_grams_used} גרם)"
                     elif extra_grams:
                         new_disp = f" ({extra_grams} גרם)"
