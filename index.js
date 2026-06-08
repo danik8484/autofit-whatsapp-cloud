@@ -201,7 +201,7 @@ function runAutofit(phone, text, opts = {}) {
     if (raw.startsWith('NAME_NOT_FOUND:')) {
       const badName = raw.slice('NAME_NOT_FOUND:'.length).trim();
       pendingCorrections.set(phone, { type: 'name', originalText: text, timestamp: Date.now() });
-      await sendMessage(phone, `❌ לא מצאתי מתאמן בשם *${badName}*.\n\nשלח את השם המלא כפי שרשום ב-auto-fit ואנסה שוב.`);
+      await sendMessage(phone, `לא מצאתי *${badName}* 🤔\nמה שם המתאמן?`);
       return;
     }
 
