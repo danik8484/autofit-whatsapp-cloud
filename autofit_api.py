@@ -2792,6 +2792,48 @@ _EXERCISE_NAME_GROUP = {
     "גוד מורנינג": "רגליים",   # good morning — ירך אחורית
 }
 
+# שמות מדוברים/נרדפים/לועזיים שמאמן כותב → מילות-מפתח של השם הרשמי בספרייה.
+# מוחל ב-match_exercises רק על התאמה-מלאה של המונח (override), כדי לתפוס גם
+# מונחים שכיום מחזירים תוצאה שגויה (למשל 'עגלים'). ניתן להרחבה לפי בקשת המאמן.
+_EXERCISE_SYNONYMS = {
+    # כתפיים
+    "הרחקות צד": "הרחקה לצדדים", "הרחקות צדדים": "הרחקה לצדדים",
+    "כתף צד": "הרחקה לצדדים", "לטרל רייז": "הרחקה לצדדים",
+    "שולדר פרס": "לחיצת כתפיים", "שראגים": "טרפזים", "כתף קדמית": "כתף קידמית",
+    # חזה
+    "שכיבות שמיכה": "שכיבות סמיכה", "פוש אפ": "שכיבות סמיכה", "בנץ פרס": "לחיצת חזה",
+    # גב
+    "לאט פולדאון": "פולי עליון אחיזה רחבה", "בנדאובר": "בנט אובר",
+    # ידיים
+    "כפיפת מרפק": "יד קדמית", "כפיפות מרפק": "יד קדמית",
+    "האמר": "פטישים", "פושדאון": "פשיטת מרפקים", "דיפס": "מקבילים",
+    # רגליים
+    "לאנגים": "מכרעיים", "לאנג": "מכרעיים", "לאנג׳": "מכרעיים",
+    "לג פרס": "לחיצת רגליים", "לג קרל": "כפיפת ברכיים", "לג אקסטנשן": "פשיטת ברכיים",
+    "מקרבים": "קירוב ירך", "אדוקטור": "קירוב ירך",
+    "מרחיקים": "הרחקת ירך", "אבדוקטור": "הרחקת ירך",
+    "קאף": "תאומים", "עגלים": "תאומים",
+    # בטן
+    "קראנץ": "כפיפות בטן",
+}
+_SYN_NORM = {_norm_heb(k): v for k, v in _EXERCISE_SYNONYMS.items()}
+
+# ─── ניטור: תרגילים שלא נמצאו (לתפיסת שמות מדוברים שחסר להם נרדף) ──────────────
+_UNMATCHED_LOG = Path("/data" if os.path.isdir("/data") else str(Path(__file__).parent)) / "unmatched_exercises.log"
+
+def _log_unmatched_exercise(term: str, full_name: str, kind: str = "old") -> None:
+    """רושם מונח-תרגיל שהבוט לא מצא — כדי לזהות שמות מדוברים שחסר להם
+    ערך ב-_EXERCISE_SYNONYMS. נכתב ל-stderr (תג [EX-NOT-FOUND] לחיפוש מהיר
+    ב-Railway logs) ולקובץ מרוכז ב-volume הקבוע (/data, שורד deploys).
+    לעולם לא ל-stdout — שם נשלח לוואטסאפ."""
+    import sys
+    print(f"[EX-NOT-FOUND] kind={kind} term={term!r} user={full_name!r}", file=sys.stderr, flush=True)
+    try:
+        with open(_UNMATCHED_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{kind}\t{term}\t{full_name}\n")
+    except Exception:
+        pass
+
 def _detect_muscle_groups(term: str) -> list:
     """אם המונח הוא שם קבוצת שריר (ולא תרגיל ספציפי) — מחזיר את הקבוצות.
     'הרגליים'→['רגליים'], 'ידיים'→['יד קדמית','יד אחורית'], 'סקוואט'→[].
@@ -2874,6 +2916,10 @@ def match_exercises(all_ex: list, search_term: str) -> list:
     שלב 1: התאמת תת-מחרוזת (כולל נרמול כתיב מלא/חסר).
     שלב 2 (אם אין): התאמה לפי מילים משמעותיות (לחיצת חזה כנגד = עם).
     """
+    # שם מדובר/נרדף → השם הרשמי בספרייה (override רק בהתאמה-מלאה של המונח)
+    _syn = _SYN_NORM.get(_norm_heb(search_term))
+    if _syn:
+        search_term = _syn
     term = search_term.strip().lower()
     term_no_heh = re.sub(r'^ה(?=[א-ת])', '', term)
     term_norm = _norm_heb(search_term)
@@ -3127,6 +3173,7 @@ def execute_set_command(uid: str, full_name: str, op: str, reps, exercise_hint: 
     all_ex = _collect_user_exercises(uid)
     matches = match_exercises(all_ex, exercise_hint)
     if not matches:
+        _log_unmatched_exercise(exercise_hint, full_name, kind="set")
         return f"❌ לא מצאתי תרגיל '{exercise_hint}' בתוכנית של {full_name}"
     _all_word = bool(raw_text and re.search(r'לשניהם|לשתיהן|לשלושתם|לכולם|לכל ה', raw_text))
     # כפילות (אותו תרגיל בכמה אימונים) — סנן לפי שם אימון שדני ציין (A/B/C / "אימון X")
@@ -3192,6 +3239,7 @@ def execute_exercise_swap(
         all_ex = _collect_user_exercises(user_id)
         candidates, group_label = swap_candidates(all_ex, old_exercise)
         if not candidates:
+            _log_unmatched_exercise(old_exercise, full_name, kind="swap")
             return f"❌ לא מצאתי תרגיל '{old_exercise}' בתוכנית של {full_name}"
 
         if len(candidates) == 1 and not group_label:
