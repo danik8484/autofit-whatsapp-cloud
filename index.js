@@ -2,6 +2,8 @@ const { spawn } = require('child_process');
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+// זיכרון קבוע: /data = Railway Volume ששורד deploys. נופל ל-__dirname מקומית.
+const DATA_DIR = fs.existsSync('/data') ? '/data' : __dirname;
 
 const ID    = process.env.GREEN_API_ID    || '7107642551';
 const TOKEN = process.env.GREEN_API_TOKEN || '5b7315dfa1cd46beaed1f82da183a246471219b64d674e029d';
@@ -31,7 +33,7 @@ const hintPrefs = new Map();
 // זיכרון שמות: rawName → correctedName (למניעת CONFIRM חוזר)
 const namePrefs = new Map();
 
-const PREFS_FILE = path.join(__dirname, 'prefs.json');
+const PREFS_FILE = path.join(DATA_DIR, 'prefs.json');
 
 function loadPrefs() {
   try {
@@ -61,25 +63,34 @@ function savePrefs() {
 
 loadPrefs();
 
-// ─── שליחת הודעה ─────────────────────────────────────────────
+// ─── שליחת הודעה (עם retry — שלא לאבד קבלות בגלל rate-limit/5xx) ──
 async function sendMessage(phone, text) {
   const chatId = phone.includes('@') ? phone : `${phone}@c.us`;
   const body = JSON.stringify({ chatId, message: text });
-  try {
-    const res = await fetch(`${BASE}/sendMessage/${TOKEN}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    });
-    if (!res.ok) {
+  // עד 4 ניסיונות: כשל זמני (429 rate-limit / 5xx / רשת) → המתן ונסה שוב
+  const delays = [800, 2000, 4000];
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      const res = await fetch(`${BASE}/sendMessage/${TOKEN}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      if (res.ok) {
+        const j = await res.json().catch(() => ({}));
+        return j.idMessage || true;  // מחזיר את ID ההודעה (לזיהוי תגובה בתיוג), או true אם חסר
+      }
       const errBody = await res.text().catch(() => '');
-      console.error(`[sendMessage] FAILED ${res.status} to ${chatId}: ${errBody.slice(0,100)}`);
+      const transient = res.status === 429 || res.status >= 500;
+      console.error(`[sendMessage] FAILED ${res.status} to ${chatId} (attempt ${attempt+1}): ${errBody.slice(0,100)}`);
+      if (!transient || attempt === delays.length) return false;
+    } catch (e) {
+      console.error(`[sendMessage] EXCEPTION to ${chatId} (attempt ${attempt+1}): ${e.message}`);
+      if (attempt === delays.length) return false;
     }
-    return res.ok;
-  } catch (e) {
-    console.error(`[sendMessage] EXCEPTION to ${chatId}: ${e.message}`);
-    return false;
+    await new Promise(r => setTimeout(r, delays[attempt]));
   }
+  return false;
 }
 
 // תיקונים ממתינים: phone → { type, originalText, alternatives, timestamp }
@@ -323,8 +334,8 @@ app.post('/webhook', async (req, res) => {
     if (v3Log.length > 50) v3Log.shift();
     if (!BIZ_GROUP) return;
     const outMsg = body.messageData;
-    if (!outMsg || outMsg.typeMessage !== 'textMessage') { console.log('[v3] no textMessage, type=' + outMsg?.typeMessage); return; }
-    const outText = outMsg.textMessageData?.textMessage?.trim();
+    if (!outMsg || !QUOTED_TYPES.includes(outMsg.typeMessage)) { console.log('[v3] no text, type=' + outMsg?.typeMessage); return; }
+    const outText = normalizeBizText(extractMsgText(outMsg).text);
     if (!outText) return;
     const outChatId = body.senderData?.chatId || '';
     if (outChatId.includes('@g.us')) return; // דלג קבוצות
@@ -348,14 +359,20 @@ app.post('/webhook', async (req, res) => {
     const outName = body.senderData?.chatName || outPhone;
     console.log(`[v3] פקודה יוצאת: "${outName}" (${outPhone}) | "${outText.slice(0,60)}"`);
     v3Log.push({ ts: Date.now(), step: 'trigger', name: outName, phone: outPhone, text: outText.slice(0,40) });
-    runAutofitBiz(outName, outPhone, outText, { nameOverride: outPhone });
+    if (hasSetCommand(outText)) {
+      runExerciseSetBiz(outName, outPhone, outText, { nameOverride: outPhone });
+    } else if (hasExerciseTrigger(outText)) {
+      runExerciseSwapBiz(outName, outPhone, outText, { nameOverride: outPhone });
+    } else {
+      runAutofitBiz(outName, outPhone, outText, { nameOverride: outPhone });
+    }
     return;
   }
 
   if (body.typeWebhook !== 'incomingMessageReceived') return;
 
   const msg = body.messageData;
-  if (!msg || msg.typeMessage !== 'textMessage') return;
+  if (!msg || !QUOTED_TYPES.includes(msg.typeMessage)) return;
 
   // התעלם מ-webhooks ישנים (מעל 3 דקות לפני start) — retries קצרים אחרי restart עוברים
   const msgTimestamp = body.timestamp;
@@ -375,17 +392,17 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  const text = msg.textMessageData?.textMessage?.trim();
+  const { text, quotedId } = extractMsgText(msg);
   if (!text) return;
 
   const sender = body.senderData?.sender?.replace('@c.us', '');
   if (!ALLOWED.includes(sender)) return;
 
-  // ── תגובות דני מהטלפון האישי בקבוצת הצוות ──────────────────
+  // ── תגובות דני/רון בקבוצת הצוות (כולל תשובה בתיוג/reply להודעת הבוט) ──────
   const inChatId = body.senderData?.chatId || '';
   if (BIZ_GROUP && (inChatId === BIZ_GROUP || inChatId.replace('@g.us','') === (BIZ_GROUP||'').replace('@g.us',''))) {
-    console.log(`[group-reply] ${sender}: "${text.slice(0,40)}"`);
-    await handleBizGroupResponse(text);
+    console.log(`[group-reply] ${sender}${quotedId ? ' ↩תיוג' : ''}: "${text.slice(0,40)}"`);
+    await handleBizGroupResponse(text, quotedId);
     return;
   }
 
@@ -708,10 +725,264 @@ const TRIGGER_WORDS = [
   'הורדתי לך', 'הורדתי לו', 'להוריד', 'להפחית',
   'מחליף לך', 'מחליף לו', 'תחליף לך', 'תחליף לו', 'להחליף',
   'החלפתי לך', 'החלפתי לו',
+  'משנה לך', 'משנה לו', 'שמתי לך', 'שמתי לו', 'הוספתי לך', 'הוספתי לו', 'הורדתי לך', 'הורדתי לו',
+  'מכניס לך', 'מכניס לו', 'תכניס לך', 'תכניס לו', 'הכנסתי לך', 'הכנסתי לו',
 ];
+
+// WhatsApp / תיקון-שגיאות מכניס לעיתים מקף או רווח כפול בין מילים:
+// "מוסיף-לך" / "מוסיף  לך" → "מוסיף לך". מנרמל כדי שזיהוי הטריגר לא יתפספס.
+function normalizeBizText(text) {
+  return text
+    .replace(/([א-ת])[־–—\-]([א-ת])/g, '$1 $2')  // מקף (כולל ־/–/—) בין אותיות עבריות → רווח
+    .replace(/[^\S\n]+/g, ' ');                    // רווחים/טאבים כפולים → רווח אחד (שומר שורות חדשות)
+}
+
+// מחלץ טקסט מהודעה — תומך בטקסט רגיל וגם בהודעה *מתויגת* (reply/quote).
+// בתיוג Green API שולח typeMessage=quotedMessage/extendedTextMessage, והטקסט נמצא
+// ב-extendedTextMessageData.text (לא ב-textMessageData) + stanzaId של ההודעה שצוטטה.
+const QUOTED_TYPES = ['textMessage', 'extendedTextMessage', 'quotedMessage'];
+function extractMsgText(msg) {
+  if (!msg) return { text: '', quotedId: null };
+  if (msg.typeMessage === 'textMessage') {
+    return { text: (msg.textMessageData?.textMessage || '').trim(), quotedId: null };
+  }
+  if (msg.typeMessage === 'extendedTextMessage' || msg.typeMessage === 'quotedMessage') {
+    return {
+      text: (msg.extendedTextMessageData?.text || '').trim(),
+      quotedId: msg.extendedTextMessageData?.stanzaId || null,
+    };
+  }
+  return { text: '', quotedId: null };
+}
 
 function hasTriggerWord(text) {
   return TRIGGER_WORDS.some(w => text.includes(w));
+}
+
+// הקשר תרגיל: "אימון" וגם "תוכנית" (בקשת דני) — באימון/לאימון/תוכנית/בתוכנית/התוכנית/לתוכנית
+const EX_CONTEXT = /באימון|לאימון|[בלה]?ת[ו]?כנית/;
+
+function hasExerciseTrigger(text) {
+  return hasTriggerWord(text) && EX_CONTEXT.test(text);
+}
+
+// פקודת סט: טריגר + המילה "סט"/"סטים" כמילה עצמאית (לא "סטייק"/"סטטוס")
+function hasSetCommand(text) {
+  return hasTriggerWord(text) && /(?:^|\s)סט(?:ים)?(?=$|\s)/.test(text);
+}
+
+function parseExerciseSwap(text) {
+  // "מחליף לך בתוכנית את לחיצת חזה ב-לחיצת ספסל"
+  const mFull = text.match(/(?:באימון|לאימון|[בלה]?ת[ו]?כנית)\s+(?:את\s+)?(.+?)\s+ב-?(.+)$/);
+  if (mFull) return { oldExercise: mFull[1].trim(), newExercise: mFull[2].trim() };
+  // "מחליף לך בתוכנית את לחיצת חזה" (בלי תרגיל חדש)
+  const mOld = text.match(/(?:באימון|לאימון|[בלה]?ת[ו]?כנית)\s+(?:את\s+)?(.+)$/);
+  if (mOld) return { oldExercise: mOld[1].trim(), newExercise: '' };
+  return null;
+}
+
+// הוספת/הורדת סט לתרגיל — "מוסיף לך עוד סט בלחיצת חזה" / "סט של 20 חזרות" / "מוריד לך סט"
+function runExerciseSetBiz(contactName, clientPhone, commandText, opts = {}) {
+  const script = path.join(__dirname, 'autofit_api.py');
+  const args = ['--force', '--set-command', commandText.replace(/^אני\s+/, '')];
+  if (opts.userIdOverride) {
+    args.push('--user-id', String(opts.userIdOverride));
+    if (contactName) args.push('--name', contactName);
+  } else {
+    const nameArg = opts.nameOverride || clientPhone;
+    args.push('--name', nameArg);
+    if (nameArg === clientPhone) args.push('--allow-phone');
+  }
+  const proc = spawn('python3', [script, ...args]);
+  let output = ''; let timedOut = false;
+  const killTimer = setTimeout(() => {
+    timedOut = true; proc.kill();
+    if (BIZ_GROUP) sendBizMessage(BIZ_GROUP, `❌ *${contactName}* — פעולת הסט לקחה יותר מדי זמן`);
+  }, 40000);
+  proc.stdout.on('data', d => { output += d.toString(); });
+  proc.stderr.on('data', d => console.error('[ex-set err]', d.toString().trim()));
+  proc.on('close', async code => {
+    clearTimeout(killTimer);
+    if (timedOut || !BIZ_GROUP) return;
+    const raw = output.trim() || (code === 0 ? '✅ בוצע' : '❌ שגיאה');
+    console.log(`[ex-set→] ${raw.slice(0,100).replace(/\n/g,' | ')}`);
+    if (raw.startsWith('NAME_NOT_FOUND:')) {
+      if (opts.nameOverride === clientPhone) {
+        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}* (${clientPhone.replace(/^972/,'0')})`);
+      } else {
+        runExerciseSetBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+      }
+      return;
+    }
+    await sendBizMessage(BIZ_GROUP, raw);
+  });
+}
+
+function runExerciseSwapBiz(contactName, clientPhone, commandText, opts = {}) {
+  const script = path.join(__dirname, 'autofit_api.py');
+  const args = ['--force', '--swap-exercise'];
+
+  if (opts.assignmentId) {
+    // שלב שני: המשתמש כבר בחר assignment — העבר ישירות
+    args.push('--assignment-id', String(opts.assignmentId));
+    if (opts.oldName) args.push('--old-name', opts.oldName);
+    if (opts.newExerciseId) args.push('--new-exercise-id', String(opts.newExerciseId));
+    if (opts.replaceMuscle) args.push('--replace-muscle', opts.replaceMuscle);
+    if (opts.newExercise) args.push('--new-exercise', opts.newExercise);
+  } else if (opts.oldExercise) {
+    // תיקון שריר / חיפוש מחדש עם שם תרגיל/שריר אחר
+    args.push('--old-exercise', opts.oldExercise);
+    if (opts.newExercise) args.push('--new-exercise', opts.newExercise);
+  } else if (commandText) {
+    // שלב ראשון: העבר טקסט גולמי ל-Python שיפרסר (כמו בוט תזונה)
+    args.push('--command', commandText);
+    if (opts.newExercise) args.push('--new-exercise', opts.newExercise);
+  } else {
+    if (BIZ_GROUP) sendBizMessage(BIZ_GROUP, `❌ חסרה פקודה להחלפת תרגיל`);
+    return;
+  }
+
+  if (opts.userIdOverride) {
+    args.push('--user-id', String(opts.userIdOverride));
+    if (contactName) { args.push('--name', contactName); }
+  } else {
+    const nameArg = opts.nameOverride || clientPhone;
+    args.push('--name', nameArg);
+    if (nameArg === clientPhone) args.push('--allow-phone');
+  }
+
+  const proc = spawn('python3', [script, ...args]);
+  let output = '';
+  let timedOut = false;
+  const killTimer = setTimeout(() => {
+    timedOut = true; proc.kill();
+    if (BIZ_GROUP) sendBizMessage(BIZ_GROUP, `❌ *${contactName}* — החלפת תרגיל לקחה יותר מדי זמן`);
+  }, 40000);
+
+  proc.stdout.on('data', d => { output += d.toString(); });
+  proc.stderr.on('data', d => console.error('[ex-swap err]', d.toString().trim()));
+
+  proc.on('close', async code => {
+    clearTimeout(killTimer);
+    if (timedOut || !BIZ_GROUP) return;
+    const raw = output.trim() || (code === 0 ? '✅ בוצע' : '❌ שגיאה');
+    console.log(`[ex-swap→] ${raw.slice(0,100).replace(/\n/g,' | ')}`);
+
+    if (raw.startsWith('NAME_NOT_FOUND:')) {
+      if (opts.nameOverride === clientPhone) {
+        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}* (${clientPhone.replace(/^972/,'0')})`);
+      } else {
+        runExerciseSwapBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+      }
+      return;
+    }
+
+    if (raw.startsWith('NAME_OPTIONS:')) {
+      const [header] = raw.split('\n');
+      const headerBody = header.slice('NAME_OPTIONS:'.length);
+      const sepIdx = headerBody.indexOf('||');
+      const ids = (sepIdx >= 0 ? headerBody.slice(0, sepIdx) : headerBody).split('|');
+      const names = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : '').split('|');
+      bizPending = { type: 'ex_name_options', contactName, clientPhone, commandText, alternatives: names, userIds: ids, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `👥 *${contactName}* — נמצאו ${names.length} לקוחות:\n${names.map((n,i)=>`${i+1}. ${n}`).join('\n')}\n\n_השב_ *בחר N*`);
+      return;
+    }
+
+    // כמה תרגילים ישנים נמצאו — דני צריך לבחור איזה לבחור
+    if (raw.startsWith('EXERCISE_CHOICE:')) {
+      const lines = raw.split('\n');
+      const choiceData = lines[0].slice('EXERCISE_CHOICE:'.length);
+      // שורת NEW= אופציונלית — תרגיל חדש שצוין inline בפקודה
+      let bodyStart = 1;
+      let inlineNew = '';
+      if (lines[1] && lines[1].startsWith('NEW=')) {
+        inlineNew = lines[1].slice(4).trim();
+        bodyStart = 2;
+      }
+      const bodyText = lines.slice(bodyStart).join('\n');
+      const assignments = choiceData.split('|').map(seg => {
+        const parts = seg.split(':');
+        return { id: parts[0], name: parts[1] || '', tmpl: parts[2] || '', sets: parts[3] || '', reps: parts[4] || '' };
+      }).filter(a => a.id);
+      bizPending = {
+        type: 'ex_old_choice',
+        contactName, clientPhone, commandText,
+        assignments,
+        newExercise: inlineNew || opts.newExercise || '',
+        opts,
+        timestamp: Date.now()
+      };
+      await sendBizMessage(BIZ_GROUP, bodyText || `❓ בחר מספר תרגיל להחלפה`);
+      return;
+    }
+
+    // מצאנו את התרגיל הישן + זיהינו שריר → רשימת תרגילי הספרייה להחלפה
+    if (raw.startsWith('EXERCISE_REPLACE:')) {
+      const lines = raw.split('\n');
+      const head = lines[0].slice('EXERCISE_REPLACE:'.length);
+      const ci = head.indexOf(':');
+      const aid = ci >= 0 ? head.slice(0, ci) : head;
+      const oldName = ci >= 0 ? head.slice(ci + 1) : '';
+      const optsLine = lines.find(l => l.startsWith('OPTS:')) || 'OPTS:';
+      const libOptions = optsLine.slice(5).split('|').map(s => {
+        const c = s.indexOf(':');
+        return c >= 0 ? { id: s.slice(0, c), name: s.slice(c + 1) } : null;
+      }).filter(Boolean);
+      const bodyText = lines.filter(l => !l.startsWith('OPTS:')).slice(1).join('\n');
+      bizPending = {
+        type: 'ex_replace',
+        contactName, clientPhone,
+        assignmentId: aid,
+        oldName,
+        libOptions,
+        opts,
+        timestamp: Date.now()
+      };
+      await sendBizMessage(BIZ_GROUP, bodyText || `🔁 בחר תרגיל חלופי`);
+      return;
+    }
+
+    // מצאנו את התרגיל הישן אבל דני לא ציין במה להחליף — נשאל אותו
+    if (raw.startsWith('EXERCISE_NEED_NEW:')) {
+      const lines = raw.split('\n');
+      const head = lines[0].slice('EXERCISE_NEED_NEW:'.length);
+      const ci = head.indexOf(':');
+      const aid = ci >= 0 ? head.slice(0, ci) : head;
+      const oldName = ci >= 0 ? head.slice(ci + 1) : '';
+      const bodyText = lines.slice(1).join('\n');
+      bizPending = {
+        type: 'ex_need_new',
+        contactName, clientPhone,
+        assignmentId: aid,
+        oldName,
+        opts,
+        timestamp: Date.now()
+      };
+      await sendBizMessage(BIZ_GROUP, bodyText || `❓ במה להחליף?`);
+      return;
+    }
+
+    // כמה תרגילים חדשים נמצאו בספרייה — דני צריך לבחור
+    if (raw.startsWith('EXERCISE_OPTIONS:')) {
+      const [header] = raw.split('\n');
+      const headerBody = header.slice('EXERCISE_OPTIONS:'.length);
+      const sepIdx = headerBody.indexOf('||');
+      const exQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const altNames = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
+      bizPending = { type: 'ex_choice', contactName, clientPhone, commandText, alternatives: altNames, exQuery, opts, newExercise, assignmentId: opts.assignmentId, oldName: opts.oldName, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — מה תרגיל חלופי?\n${altNames.map((n,i)=>`${i+1}. ${n}`).join('\n')}\n\n_השב_ *בחר N*`);
+      return;
+    }
+
+    const time = new Date().toLocaleTimeString('he-IL', { timeZone: 'Asia/Jerusalem', hour: '2-digit', minute: '2-digit' });
+    const phoneDisplay = clientPhone.replace(/^972/, '0');
+    const nmMatch = raw.match(/של ([א-ת׳']+(?:\s+[א-ת׳']+)*)/);
+    const clientNameDisplay = nmMatch ? nmMatch[1].trim() : contactName;
+    const msg = code === 0
+      ? `👤 *${clientNameDisplay}* (${phoneDisplay}) | 🕐 ${time}\n${raw}`
+      : `❌ *${clientNameDisplay}* (${phoneDisplay})\n${raw}`;
+    await sendBizMessage(BIZ_GROUP, msg);
+  });
 }
 
 // מניעת כפילויות v3
@@ -721,7 +992,7 @@ const bizBotSentIds = new Set();
 
 // namePrefs v3: שם WhatsApp (lowercase) → auto-fit user_id (אחרי אישור דני)
 const bizNamePrefs = new Map();
-const BIZ_PREFS_FILE = path.join(__dirname, 'biz_prefs.json');
+const BIZ_PREFS_FILE = path.join(DATA_DIR, 'biz_prefs.json');
 
 function loadBizPrefs() {
   try {
@@ -752,7 +1023,14 @@ const BIZ_PENDING_TTL = 10 * 60 * 1000; // 10 דקות
 async function sendBizMessage(chatId, text) {
   const id = chatId.includes('@') ? chatId : `${chatId}@c.us`;
   // שלח דרך האינסטנס הרגיל (BIZ instance מחזיר idMessage גם כשלא מחובר)
-  await sendMessage(id, text);
+  const idMessage = await sendMessage(id, text);
+  // אם נשלחה שאלה לקבוצה כשיש pending פעיל — שמור את ID ההודעה,
+  // כדי לזהות תגובה בתיוג (reply) שמצביעה דווקא עליה גם אם נכנסו הודעות באמצע.
+  if (typeof idMessage === 'string' && bizPending &&
+      (id === BIZ_GROUP || id.replace('@g.us', '') === (BIZ_GROUP || '').replace('@g.us', ''))) {
+    bizPending.questionMsgId = idMessage;
+  }
+  return idMessage;
 }
 
 // ─── שם איש קשר מ-Green API (השם שדני שמר בטלפון) ──────────────
@@ -812,6 +1090,15 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
 
   proc.stdout.on('data', d => { output += d.toString(); });
   proc.stderr.on('data', d => console.error('[biz-py err]', d.toString().trim()));
+
+  // כשל בהרצת התהליך (לא timeout) → התראה מיידית במקום להמתין 30 שניות
+  proc.on('error', (err) => {
+    clearTimeout(killTimer);
+    if (timedOut) return;
+    timedOut = true; // מנע close כפול
+    console.error('[biz-py spawn error]', err.message);
+    if (BIZ_GROUP) sendBizMessage(BIZ_GROUP, `❌ *${contactName}* — תקלה בהרצה. נסה שוב.`);
+  });
 
   proc.on('close', async code => {
     clearTimeout(killTimer);
@@ -877,8 +1164,20 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       const rawAlts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const altObjs = rawAlts.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? { name: a.slice(0, ci), cal: parseInt(a.slice(ci+1)) || 0 } : { name: a, cal: 0 }; });
       const altNames = altObjs.map(o => o.name);
+      // ── זוכר בחירה קודמת: אם דני כבר בחר אופציה ל-foodQuery הזה → בצע אוטומטית ──
+      const _fpref = foodQuery && !opts.skipFoodPref && !opts.foodOverride && foodPrefs.get(foodQuery.toLowerCase());
+      if (_fpref && altNames.includes(_fpref)) {
+        console.log(`[biz food-pref] "${foodQuery}" → "${_fpref}" (auto, זוכר בחירה)`);
+        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, foodOverride: _fpref });
+        return;
+      }
       const listMsg = altObjs.map((o, i) => `${i+1}. ${o.name}${o.cal > 0 ? ` — ${o.cal} קל` : ''}`).join('\n');
       bizPending = { type: 'food_choice', contactName, clientPhone, commandText, alternatives: altNames, foodQuery, opts, timestamp: Date.now() };
+      // דיווח חלקי: ה-body מ-Python כולל קבלה (✅) של מה שכבר בוצע — שלח אותה קודם, ואז את החסר
+      const _fbody = rest.join('\n');
+      const _qIdx = _fbody.indexOf('❓');
+      const _receipt = _qIdx > 0 ? _fbody.slice(0, _qIdx).trim() : '';
+      if (_receipt) await sendBizMessage(BIZ_GROUP, _receipt);
       await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי *${foodQuery}*, מה שמצאתי:\n${listMsg}\n\n_השב_ *בחר N*, כתוב שם אחר, או *עוד*`);
       return;
     }
@@ -892,9 +1191,26 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       const rawAlts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const altObjs = rawAlts.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? { name: a.slice(0, ci), cal: parseInt(a.slice(ci+1)) || 0 } : { name: a, cal: 0 }; });
       const altNames = altObjs.map(o => o.name);
+      // ── זוכר בחירה קודמת: אם דני כבר בחר תחליף ל-hintQuery הזה → בצע אוטומטית ──
+      const _hpref = hintQuery && !opts.skipFoodPref && !opts.hintOverride && hintPrefs.get(hintQuery.toLowerCase());
+      if (_hpref && altNames.includes(_hpref)) {
+        console.log(`[biz hint-pref] "${hintQuery}" → "${_hpref}" (auto, זוכר בחירה)`);
+        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, hintOverride: _hpref });
+        return;
+      }
       const listMsg = altObjs.map((o, i) => `${i+1}. ${o.name}${o.cal > 0 ? ` — ${o.cal} קל` : ''}`).join('\n');
       bizPending = { type: 'hint_choice', contactName, clientPhone, commandText, alternatives: altNames, hintQuery, opts, timestamp: Date.now() };
       await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי *${hintQuery}*, מה שמצאתי:\n${listMsg}\n\n_השב_ *בחר N*, כתוב שם אחר, או *עוד*`);
+      return;
+    }
+
+    // ── המאכל-להחלפה בכמה ארוחות → שאל איזו / הכל ──────────────────
+    if (raw.startsWith('MULTIMEAL:')) {
+      const [header, ...rest] = raw.split('\n');
+      const meals = header.slice('MULTIMEAL:'.length).split('|').filter(Boolean);
+      const userMsg = rest.join('\n');
+      bizPending = { type: 'multimeal', contactName, clientPhone, commandText, alternatives: meals, opts, timestamp: Date.now() };
+      await sendBizMessage(BIZ_GROUP, `*${contactName}*\n${userMsg}`);
       return;
     }
 
@@ -922,10 +1238,16 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
 }
 
 // ─── טיפול בתגובת דני בקבוצה ("כן" / "בחר N") ─────────────────
-async function handleBizGroupResponse(text) {
+async function handleBizGroupResponse(text, quotedId = null) {
   if (!bizPending) return;
   if (Date.now() - bizPending.timestamp > BIZ_PENDING_TTL) {
     bizPending = null;
+    return;
+  }
+  // תגובה בתיוג (reply): ה-stanzaId מצביע על ההודעה שצוטטה. אם היא מתייגת *שאלה אחרת*
+  // (לא שאלת הבוט הנוכחית) — התעלם, כדי לא לבצע בחירה על ה-pending הלא-נכון.
+  if (quotedId && bizPending.questionMsgId && quotedId !== bizPending.questionMsgId) {
+    console.log(`[group-reply] תיוג מצביע על שאלה אחרת (quoted=${quotedId} ≠ pending=${bizPending.questionMsgId}) — מתעלם`);
     return;
   }
 
@@ -944,6 +1266,26 @@ async function handleBizGroupResponse(text) {
     return;
   }
 
+  // ── בחירת ארוחה כשהמאכל בכמה (MULTIMEAL): מספר / "הכל" ─────────────
+  if (type === 'multimeal') {
+    bizPending = null;
+    const tl = t.replace(/[*]/g, '').trim();
+    if (['הכל','הכול','כולן','כולם','שניהם','שתיהן','גם','גם וגם','all'].includes(tl)) {
+      alternatives.forEach((meal, i) => {
+        setTimeout(() => runAutofitBiz(contactName, clientPhone, commandText, { ...opts, mealOverride: meal }), i * 3500);
+      });
+      return;
+    }
+    const nm = t.match(/^(?:בחר\s+)?(\d+)$/);
+    if (nm) {
+      const idx = parseInt(nm[1]) - 1;
+      if (idx >= 0 && idx < alternatives.length) {
+        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, mealOverride: alternatives[idx] });
+      }
+    }
+    return;
+  }
+
   // ── אישור שם fuzzy ─────────────────────────────────────────────────
   if (type === 'name_confirm') {
     if (t === 'כן' || t === 'yes') {
@@ -956,6 +1298,109 @@ async function handleBizGroupResponse(text) {
       bizPending = null;
       await sendBizMessage(BIZ_GROUP, `❌ פעולה בוטלה`);
     }
+    return;
+  }
+
+  // ── בחירת שם לקוח (NAME_OPTIONS) עבור פקודת תרגיל ──────────────────
+  if (type === 'ex_name_options') {
+    const numMatch = t.match(/^(?:בחר\s+)?(\d+)$/);
+    if (!numMatch) return;
+    const idx = parseInt(numMatch[1]) - 1;
+    const { alternatives, userIds, opts: pendOpts, contactName: cn, clientPhone: cp, commandText: ct } = bizPending;
+    if (idx < 0 || idx >= alternatives.length) return;
+    const chosenId = userIds[idx];
+    const chosenName = alternatives[idx];
+    bizPending = null;
+    runExerciseSwapBiz(cn, cp, ct, { ...pendOpts, userIdOverride: chosenId, nameOverride: chosenName });
+    return;
+  }
+
+  // ── בחירת תרגיל ישן מרשימה (EXERCISE_CHOICE) ─────────────────────────
+  if (type === 'ex_old_choice') {
+    const { assignments, newExercise: nex, opts: pendOpts, contactName: cn, clientPhone: cp } = bizPending;
+    const numMatch = t.match(/^(?:בחר\s+)?(\d+)$/);
+    if (numMatch) {
+      const idx = parseInt(numMatch[1]) - 1;
+      if (idx < 0 || idx >= assignments.length) return;
+      const chosen = assignments[idx];
+      bizPending = null;
+      runExerciseSwapBiz(cn, cp, '', {
+        ...pendOpts,
+        assignmentId: chosen.id,
+        oldName: chosen.name,
+        newExercise: nex,
+        nameOverride: cp,
+      });
+      return;
+    }
+    // לא מספר — אולי תיקון שריר ("חזה"/"רגליים") או שם תרגיל אחר → חיפוש מחדש
+    const correction = t.replace(/[*]/g, '').trim();
+    if (correction.length >= 2 && !correction.includes('\n')) {
+      bizPending = null;
+      runExerciseSwapBiz(cn, cp, '', {
+        ...pendOpts,
+        oldExercise: correction,
+        newExercise: nex,
+        nameOverride: cp,
+      });
+    }
+    return;
+  }
+
+  // ── בחירת תרגיל חלופי מרשימת הספרייה (EXERCISE_REPLACE) ──────────────
+  if (type === 'ex_replace') {
+    const { assignmentId: aid, oldName: on, libOptions, opts: pendOpts, contactName: cn, clientPhone: cp } = bizPending;
+    const numMatch = t.match(/^(?:בחר\s+)?(\d+)$/);
+    if (numMatch) {
+      const idx = parseInt(numMatch[1]) - 1;
+      if (idx < 0 || idx >= libOptions.length) return;
+      const chosen = libOptions[idx];
+      bizPending = null;
+      runExerciseSwapBiz(cn, cp, '', {
+        ...pendOpts,
+        assignmentId: aid,
+        oldName: on,
+        newExerciseId: chosen.id,
+        newExercise: chosen.name,
+        nameOverride: cp,
+      });
+      return;
+    }
+    // לא מספר — תיקון שריר ("חזה"/"רגליים") → רשימה חדשה לאותו תרגיל ישן
+    const muscle = t.replace(/[*]/g, '').trim();
+    if (muscle.length >= 2 && !muscle.includes('\n')) {
+      bizPending = null;
+      runExerciseSwapBiz(cn, cp, '', {
+        ...pendOpts,
+        assignmentId: aid,
+        oldName: on,
+        replaceMuscle: muscle,
+        nameOverride: cp,
+      });
+    }
+    return;
+  }
+
+  // ── דני מספק שם תרגיל חדש אחרי "במה להחליף?" (EXERCISE_NEED_NEW) ──────
+  if (type === 'ex_need_new') {
+    const { assignmentId: aid, oldName: on, opts: pendOpts, contactName: cn, clientPhone: cp } = bizPending;
+    const newName = t.replace(/^ב-?/, '').trim();  // "בלחיצת רגליים" → "לחיצת רגליים"
+    if (!newName || newName.length < 2) return;
+    bizPending = null;
+    runExerciseSwapBiz(cn, cp, '', { ...pendOpts, assignmentId: aid, oldName: on, newExercise: newName, nameOverride: cp });
+    return;
+  }
+
+  // ── בחירת תרגיל חדש מספרייה (EXERCISE_OPTIONS) ───────────────────────
+  if (type === 'ex_choice') {
+    const numMatch = t.match(/^(?:בחר\s+)?(\d+)$/);
+    if (!numMatch) return;
+    const idx = parseInt(numMatch[1]) - 1;
+    const { alternatives, opts: pendOpts, contactName: cn, clientPhone: cp, commandText: ct, assignmentId: aid, oldName: on } = bizPending;
+    if (idx < 0 || idx >= alternatives.length) return;
+    const chosenName = alternatives[idx];
+    bizPending = null;
+    runExerciseSwapBiz(cn, cp, ct || '', { ...pendOpts, newExercise: chosenName, assignmentId: aid, oldName: on });
     return;
   }
 
@@ -1025,17 +1470,18 @@ async function processBizBody(body) {
   }
 
   const msg = body.messageData;
-  if (!msg || msg.typeMessage !== 'textMessage') return;
-  const text = msg.textMessageData?.textMessage?.trim();
+  if (!msg || !QUOTED_TYPES.includes(msg.typeMessage)) return;
+  const { text: _bizRaw, quotedId: _bizQuoted } = extractMsgText(msg);
+  const text = normalizeBizText(_bizRaw);
   if (!text) return;
 
   const chatId = body.senderData?.chatId || '';
-  console.log(`[biz] type=${body.typeWebhook} chatId=${chatId} text="${text.slice(0,40)}"`);
+  console.log(`[biz] type=${body.typeWebhook} chatId=${chatId}${_bizQuoted ? ' ↩תיוג' : ''} text="${text.slice(0,40)}"`);
 
   // תגובות דני בקבוצה
   if (chatId === BIZ_GROUP || chatId.replace('@g.us','') === (BIZ_GROUP || '').replace('@g.us','')) {
     if (body.typeWebhook === 'outgoingMessageReceived') {
-      await handleBizGroupResponse(text);
+      await handleBizGroupResponse(text, _bizQuoted);
     }
     return;
   }
@@ -1060,14 +1506,29 @@ async function processBizBody(body) {
   const contactName = body?.senderData?.chatName || clientPhone; // לתצוגה בקבלה בלבד
   console.log(`[biz] לקוח: "${contactName}" (${clientPhone})`);
   // חיפוש לפי טלפון תמיד — מהיר ואמין יותר
-  runAutofitBiz(contactName, clientPhone, text, { nameOverride: clientPhone });
+  if (hasSetCommand(text)) {
+    runExerciseSetBiz(contactName, clientPhone, text, { nameOverride: clientPhone });
+  } else if (hasExerciseTrigger(text)) {
+    runExerciseSwapBiz(contactName, clientPhone, text, { nameOverride: clientPhone });
+  } else {
+    runAutofitBiz(contactName, clientPhone, text, { nameOverride: clientPhone });
+  }
 }
 
 // ─── BIZ Polling loop — lastOutgoingMessages ──────────────────
+const BIZ_WATERMARK_FILE = require('path').join(DATA_DIR, 'biz_watermark.json');
 async function bizPollLoop() {
-  const startTs = Math.floor(Date.now() / 1000);
-  let lastTs = startTs;
-  console.log('[biz-poll] starting, watermark=', new Date(startTs * 1000).toISOString());
+  const nowTs = Math.floor(Date.now() / 1000);
+  let lastTs = nowTs;
+  // שחזר watermark מקובץ — שלא לאבד הודעות שנשלחו בזמן restart (עד 10 דק אחורה)
+  try {
+    const saved = JSON.parse(require('fs').readFileSync(BIZ_WATERMARK_FILE, 'utf8'));
+    if (saved && saved.ts && (nowTs - saved.ts) < 600) {
+      lastTs = saved.ts;
+      console.log('[biz-poll] ✅ watermark שוחזר מקובץ (' + (nowTs - saved.ts) + 's אחורה — לא מאבד הודעות restart)');
+    }
+  } catch (e) { /* אין קובץ — התחלה רגילה */ }
+  console.log('[biz-poll] starting, watermark=', new Date(lastTs * 1000).toISOString());
   while (true) {
     await new Promise(r => setTimeout(r, 10000)); // כל 10 שניות
     try {
@@ -1091,6 +1552,7 @@ async function bizPollLoop() {
         });
       }
       lastTs = maxTs;
+      try { require('fs').writeFileSync(BIZ_WATERMARK_FILE, JSON.stringify({ ts: lastTs })); } catch (e) {}
     } catch (e) {
       console.error('[biz-poll error]', e.message);
     }
@@ -1099,6 +1561,23 @@ async function bizPollLoop() {
 
 // endpoint לdebug בלבד (לא מקבל webhooks יותר)
 app.post('/webhook-business', (req, res) => res.sendStatus(200));
+
+// ─── BIZ Webhook endpoint (outgoing messages from BIZ phone) ──
+app.post('/webhook-biz', async (req, res) => {
+  res.sendStatus(200);
+  const body = req.body;
+  if (!body || !body.typeWebhook) return;
+  // עבד רק הודעות *יוצאות* (דני מקליד בטלפון). incoming מהלקוח / state / status —
+  // מועברים עם הסוג המקורי כדי ש-processBizBody יסנן אותם (הגנה מעיבוד הודעת לקוח כפקודה)
+  const tw = body.typeWebhook;
+  const isOutgoing = (tw === 'outgoingMessageReceived' || tw === 'outgoingAPIMessageReceived');
+  const normBody = isOutgoing
+    ? Object.assign({}, body, { typeWebhook: 'outgoingMessageReceived' })
+    : body;
+  bizDebugLog.push({ ts: Date.now(), body: normBody });
+  if (bizDebugLog.length > 30) bizDebugLog.shift();
+  await processBizBody(normBody);
+});
 
 // ─── Debug V3 log ─────────────────────────────────────────────
 app.get('/debug-v3', (_, res) => {
@@ -1134,6 +1613,13 @@ app.get('/test', (req, res) => { const {spawn}=require('child_process'); const p
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT}`);
+  console.log(`💾 זיכרון: ${DATA_DIR === '/data' ? 'Volume קבוע (/data) — שורד deploys' : 'דיסק זמני (' + DATA_DIR + ')'}`);
+  try {
+    const _wm = path.join(DATA_DIR, 'biz_watermark.json');
+    const _pf = path.join(DATA_DIR, 'prefs.json');
+    const _wmAge = fs.existsSync(_wm) ? Math.round((Date.now()/1000) - (JSON.parse(fs.readFileSync(_wm,'utf8')).ts||0)) + 's' : 'חסר';
+    console.log(`📂 /data: watermark=${_wmAge}, prefs=${fs.existsSync(_pf)?'קיים':'חסר'} ← אם קיים מ-deploy קודם = persistence עובד`);
+  } catch(e) { console.log('📂 /data diag error:', e.message); }
 
   // ── Webhook v1/v2 (חשבון אישי) ──────────────────────────────────
   const webhookUrl = process.env.WEBHOOK_URL;
@@ -1142,11 +1628,40 @@ app.listen(PORT, async () => {
       await fetch(`${BASE}/setSettings/${TOKEN}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ webhookUrl, webhookUrlToken: '' }),
+        body: JSON.stringify({
+          webhookUrl,
+          webhookUrlToken: '',
+          incomingWebhook: 'yes',          // V1/V2 + תגובות דני בקבוצה מהטלפון האישי
+          outgoingMessageWebhook: 'no',    // נעילה: שהבוט לא יעבד את ההודעות של עצמו (לולאת משוב)
+          outgoingAPIMessageWebhook: 'no',
+          stateWebhook: 'no',
+        }),
       });
       console.log('✅ Webhook v1 set:', webhookUrl);
     } catch (e) {
       console.error('Webhook v1 setup error:', e.message);
+    }
+    // הגדר webhook גם לאינסטנס BIZ כדי שהודעות יוצאות יגיעו מיד
+    if (BIZ_BASE && BIZ_TOKEN) {
+      try {
+        const bizWh = webhookUrl.replace(/\/webhook$/, '') + '/webhook-biz';
+        await fetch(`${BIZ_BASE}/setSettings/${BIZ_TOKEN}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            webhookUrl: bizWh,
+            webhookUrlToken: '',
+            outgoingMessageWebhook: 'yes',   // דני מקליד בטלפון → מגיע מיד
+            outgoingAPIMessageWebhook: 'no',
+            incomingWebhook: 'no',           // לא לעבד הודעות לקוח כפקודה
+            stateWebhook: 'no',
+            pollMessageWebhook: 'no',
+          }),
+        });
+        console.log('✅ BIZ Webhook set:', bizWh);
+      } catch (e) {
+        console.error('BIZ Webhook setup error:', e.message);
+      }
     }
   } else {
     console.log('⚠️  WEBHOOK_URL not set — set it in Railway env vars');
