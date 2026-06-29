@@ -478,6 +478,58 @@ check("ריבוי ארוחות 'בוקר וצהריים' (מנגנון קיים)
 check("שגיאת הקלדה אות כפולה 'פפרגיות' → פרגיות",
       _afc._collapse_doubled_letters("פפרגיות"), "פרגיות")
 
+# ── 17. כתיב מלא/חסר (יוטבתה→יטבתה) — fallback למזון לא-נמצא ──
+print("\n── 17. כתיב מלא/חסר + תת-קבוצת מילים ──────────────────────")
+check("כתיב מלא/חסר: 'יוטבתה' → כולל 'יטבתה'",
+      "יטבתה" in _afc._spelling_variants("יוטבתה"), True)
+check("כתיב מלא/חסר: 'משקה פרו יוטבתה' → כולל 'משקה פרו יטבתה'",
+      "משקה פרו יטבתה" in _afc._spelling_variants("משקה פרו יוטבתה"), True)
+check("כתיב מלא/חסר: ו' בראש מילה לא מוסרת ('ויטמין' → רק פנימיות)",
+      _afc._spelling_variants("ויטמין"), ["וטמין", "ויטמן"])  # ה-ו' בראש נשמרת
+check("כתיב מלא/חסר: מילה בלי אם-קריאה פנימית → אין וריאציות",
+      _afc._spelling_variants("בשר"), [])
+
+# ── 18. ריבוי-ארוחות "כאופציה" + שגיאת-כתיב (הבאג של עמית אביב) ──
+# (א) typo בשם המזון ("ביציה M") עם find_best_food שמחזיר רק וריאציית-כתיב,
+#     (ב) ריבוי-ארוחות "צהריים +ערב" מבצע לשתי הארוחות, לא נופל לאזהרת multi-task,
+#     (ג) מזון עמום בריבוי-ארוחות → FOOD_OPTIONS *אחד* (לא "שלח אותו בנפרד").
+print("\n── 18. ריבוי-ארוחות 'כאופציה' + שגיאת-כתיב ──────────────")
+_orig = (_afc.find_user, _afc.get_user_meals, _afc.load_coach_id,
+         _afc.find_best_food, _afc.search_food, _afc.add_food_to_meal)
+try:
+    _afc.find_user = lambda q: ("999", "עמית אביב", False)
+    _chicken = {"food_name": "חזה עוף מבושל", "id": 1, "calories": 120, "gram_value": 150}
+    _afc.get_user_meals = lambda uid: [
+        {"id": 10, "meal_name": "ארוחת צהריים", "mealFoods": [_chicken]},
+        {"id": 11, "meal_name": "ארוחת ערב",    "mealFoods": [_chicken]}]
+    _afc.load_coach_id = lambda: "469"
+    _added = []
+    _afc.add_food_to_meal = lambda uid, mid, bf, fr, g, is_addition_as_option=False: (
+        _added.append((mid, bf.get("food_name"), is_addition_as_option)) or "✅ נוסף|GRAMS=50")
+    # (א)+(ב): "ביציה M" (typo) נפתר → ביצוע לשתי הארוחות כאופציה
+    _EGG = {"food_name": "ביצה M", "calories": 70, "gram_value": 50, "food_id": 7}
+    _afc.find_best_food = lambda q, cid="": (_EGG, [_EGG]) if "ביצ" in q else (None, [])
+    _afc.search_food    = lambda q, cid="": [_EGG] if "ביצ" in q else []
+    _added.clear()
+    _re = _afc.execute_request("מוסיף לך ביציה M כאופציה לחזה עוף בצהריים +ערב",
+                               force=True, name_override="עמית אביב", user_id_override="999")
+    check("multimeal: typo 'ביציה' בוצע ל-2 ארוחות", len({a[0] for a in _added}), 2)
+    check("multimeal: נוסף כאופציה (לא החלפה)", all(a[2] for a in _added), True)
+    check_not_contains("multimeal: בלי אזהרת 'שלח בנפרד'", _re, "שלח אותו בנפרד")
+    # (ג): מזון עמום אמיתי → FOOD_OPTIONS אחד מאוחד
+    _afc.find_best_food = lambda q, cid="": (None, [
+        {"food_name": "גבינה לבנה 5%", "calories": 60},
+        {"food_name": "גבינה לבנה 9%", "calories": 90}])
+    _afc.search_food = lambda q, cid="": []
+    _r_amb = _afc.execute_request("מוסיף לך גבינה כאופציה לחזה עוף בצהריים +ערב",
+                                  force=True, name_override="עמית אביב", user_id_override="999")
+    check("multimeal: מזון עמום → FOOD_OPTIONS אחד",
+          _r_amb.split("\n")[0].startswith("FOOD_OPTIONS:"), True)
+    check_not_contains("multimeal: עמום בלי אזהרת 'שלח בנפרד'", _r_amb, "שלח אותו בנפרד")
+finally:
+    (_afc.find_user, _afc.get_user_meals, _afc.load_coach_id,
+     _afc.find_best_food, _afc.search_food, _afc.add_food_to_meal) = _orig
+
 # ══════════════════════════════════════════════════════════════════
 print(f"\n{'═'*50}")
 print(f"תוצאה: {PASS} עברו, {FAIL} נכשלו")

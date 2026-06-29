@@ -9,6 +9,20 @@ const ID    = process.env.GREEN_API_ID    || '7107642551';
 const TOKEN = process.env.GREEN_API_TOKEN || '5b7315dfa1cd46beaed1f82da183a246471219b64d674e029d';
 const BASE  = `https://api.green-api.com/waInstance${ID}`;
 
+// ── תמלול הקלטות קוליות דרך Groq Whisper ──
+const GROQ_API_KEY       = process.env.GROQ_API_KEY || '';
+// ── ניטור שינויים בחשבון מודעות פייסבוק (התראות וואטסאפ לדני) ──
+const FB_ADS_TOKEN   = process.env.FB_ADS_TOKEN || '';            // טוקן Graph API קבוע (ads_read)
+const FB_AD_ACCOUNT  = process.env.FB_AD_ACCOUNT || '722204420291481';
+const FB_ALERT_PHONE = process.env.FB_ALERT_PHONE || '972547198498'; // דני
+// סוגי אירועים שהם רעש מערכת ולא "שינוי" — לא שולחים עליהם
+const FB_NOISE_EVENTS = new Set(['first_delivery_event', 'ad_account_billing_charge']);
+const FB_PAGE_ID = process.env.FB_PAGE_ID || '512426488630431'; // עמוד דני (לשליפת לידים)
+// ניטור הלידים דורש טוקן נפרד עם leads_retrieval + גישת עמוד (לא ads_read).
+// כבוי עד שיוגדר FB_LEADS_TOKEN — כדי לא להציף את הלוג בשגיאות הרשאה.
+const FB_LEADS_TOKEN = process.env.FB_LEADS_TOKEN || '';
+const TRANSCRIBE_TRIGGERS = (process.env.TRANSCRIBE_TRIGGER || 'שומע,מקשיב,תמלל,תמליל,מה אמר,מה אמרה,מה הקליט,מה הקליטה,תקשיב').split(',').map(s => s.trim().toLowerCase()).filter(Boolean); // מילות הקוד בתיוג (התאמה מדויקת, רק בתיוג על הקלטה)
+
 const ALLOWED = [
   '972547198498', // דני
   '972539598622', // רון
@@ -35,12 +49,26 @@ const namePrefs = new Map();
 
 const PREFS_FILE = path.join(DATA_DIR, 'prefs.json');
 
+// מנקה מפתח-זיכרון: מסיר מילות-פקודה שדולפות לשאילתה ("כאופציה"/"באופציה"/"כתוספת")
+// ומילות-ארוחה, כדי שאותו מזון יישמר תחת מפתח קבוע. בלי זה "פרכיות כאופציה" ≠ "פרכיות"
+// והבוט שואל שוב ושוב למרות שדני כבר בחר.
+function cleanPrefKey(q) {
+  // הערה: \b של JS מבוסס-ASCII ולא עובד אחרי אות עברית — משתמשים ב-(?![א-ת]).
+  return (q || '').toLowerCase()
+    .replace(/\s*[כב]?אופצי(?:יה|ה|ות|יות)(?![א-ת])/g, '')
+    .replace(/\s*כתוספת(?![א-ת])/g, '')
+    .replace(/\s*ב?(?:ארוח(?:ת|ות)\s+)?(?:בוקר|צהריי?ם|ערב|ביניים|לילה)(?![א-ת])/g, '')
+    .replace(/\s*[במל]?ארוח(?:ת|ות)(?![א-ת])/g, '')  // "בארוחות"/"ארוחת" שנשארו לבד
+    .replace(/\s+/g, ' ').trim();
+}
+
 function loadPrefs() {
   try {
     const raw = fs.readFileSync(PREFS_FILE, 'utf8');
     const data = JSON.parse(raw);
-    (data.food || []).forEach(([k, v]) => foodPrefs.set(k, v));
-    (data.hint || []).forEach(([k, v]) => hintPrefs.set(k, v));
+    // מיגרציה: מפתחות ישנים "מלוכלכים" (פרכיות כאופציה) → נקיים (פרכיות)
+    (data.food || []).forEach(([k, v]) => foodPrefs.set(cleanPrefKey(k), v));
+    (data.hint || []).forEach(([k, v]) => hintPrefs.set(cleanPrefKey(k), v));
     (data.name || []).forEach(([k, v]) => namePrefs.set(k, v));
     console.log(`[prefs loaded] food=${foodPrefs.size} hint=${hintPrefs.size} name=${namePrefs.size}`);
   } catch (e) {
@@ -176,7 +204,7 @@ function runAutofit(phone, text, opts = {}) {
       const [header, ...rest] = raw.split('\n');
       const headerBody = header.slice('HINT_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
-      const hintQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const hintQuery = cleanPrefKey(sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '');
       const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const userMsg = rest.join('\n');
 
@@ -221,7 +249,7 @@ function runAutofit(phone, text, opts = {}) {
       const [header, ...rest] = raw.split('\n');
       const headerBody = header.slice('FOOD_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
-      const foodQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const foodQuery = cleanPrefKey(sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '');
       const rawAltsReg = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const alts = rawAltsReg.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? a.slice(0, ci) : a; });
       const userMsg = rest.join('\n');
@@ -277,6 +305,21 @@ function runMenu(phone, name, meal = '') {
     if (timedOut) return;
     await sendMessage(phone, output.trim() || '❌ לא נמצא תפריט');
   });
+}
+
+// ─── זיהוי פקודת "תפריט" (משותף לפרטי ולקבוצה) ─────────────────
+// "דני תפריט" / "תפריט דני" / "מה יש לדני בבוקר?" / "תראי לי את התפריט של דני"
+const _MENU_MEAL_KW  = '(?:בוקר|צהריים|צהרים|ערב|לילה|ביניים)';
+const _MENU_HEB_NAME = `[א-׺][א-׺\\s'״׳]{1,30}`;
+function parseMenuCommand(text) {
+  const t = (text || '').trim();
+  const m =
+    new RegExp(`^(${_MENU_HEB_NAME})\\s+תפריט(?:\\s+(${_MENU_MEAL_KW}))?$`).exec(t) ||
+    new RegExp(`^תפריט\\s+(${_MENU_HEB_NAME})(?:\\s+(${_MENU_MEAL_KW}))?$`).exec(t) ||
+    new RegExp(`^מה\\s+(?:יש|אוכל)\\s+ל(${_MENU_HEB_NAME})(?:\\s+ב(${_MENU_MEAL_KW}))?\\??$`).exec(t) ||
+    new RegExp(`^(?:תראי?|הראי?)\\s+(?:לי\\s+)?(?:את\\s+)?(?:ה)?תפריט\\s+(?:של\\s+)?(${_MENU_HEB_NAME})(?:\\s+(${_MENU_MEAL_KW}))?$`).exec(t);
+  if (!m) return null;
+  return { name: m[1].trim(), meal: (m[2] || '').trim() };
 }
 
 // ─── "לכולם" — הרצת פקודה על כל הלקוחות ────────────────────────────────────
@@ -372,6 +415,10 @@ app.post('/webhook', async (req, res) => {
   if (body.typeWebhook !== 'incomingMessageReceived') return;
 
   const msg = body.messageData;
+
+  // תמונות מקבוצת ההמלצות → Drive (תופס לפני סינון הטקסט שמשליך מדיה)
+  if (tryHandleRecsImage(body)) return;
+
   if (!msg || !QUOTED_TYPES.includes(msg.typeMessage)) return;
 
   // התעלם מ-webhooks ישנים (מעל 3 דקות לפני start) — retries קצרים אחרי restart עוברים
@@ -420,21 +467,10 @@ app.post('/webhook', async (req, res) => {
   }
 
   // ─── תפריט ─────────────────────────────────────────────────────
-  // "דני תפריט" / "תפריט דני" / "מה יש לדני בבוקר?" / "תראי לי את התפריט של דני"
-  const _MEAL_KW = '(?:בוקר|צהריים|צהרים|ערב|לילה|ביניים)';
-  const _HEB_NAME = `[א-׺][א-׺\\s'״׳]{1,30}`;
-  const menuM =
-    new RegExp(`^(${_HEB_NAME})\\s+תפריט(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim()) ||
-    new RegExp(`^תפריט\\s+(${_HEB_NAME})(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim()) ||
-    // "מה יש לדני?" / "מה יש לדני בבוקר?"
-    new RegExp(`^מה\\s+(?:יש|אוכל)\\s+ל(${_HEB_NAME})(?:\\s+ב(${_MEAL_KW}))?\\??$`).exec(text.trim()) ||
-    // "תראי לי את התפריט של דני" / "תראי לי את התפריט של דני בערב"
-    new RegExp(`^(?:תראי?|הראי?)\\s+(?:לי\\s+)?(?:את\\s+)?(?:ה)?תפריט\\s+(?:של\\s+)?(${_HEB_NAME})(?:\\s+(${_MEAL_KW}))?$`).exec(text.trim());
-  if (menuM) {
-    const menuName = menuM[1].trim();
-    const menuMeal = (menuM[2] || '').trim();
-    console.log(`📋 תפריט עבור: "${menuName}"${menuMeal ? ` (${menuMeal})` : ''}`);
-    runMenu(sender, menuName, menuMeal);
+  const menuCmd = parseMenuCommand(text);
+  if (menuCmd) {
+    console.log(`📋 תפריט עבור: "${menuCmd.name}"${menuCmd.meal ? ` (${menuCmd.meal})` : ''}`);
+    runMenu(sender, menuCmd.name, menuCmd.meal);
     return;
   }
 
@@ -715,19 +751,271 @@ const BIZ_TOKEN = process.env.GREEN_API_TOKEN_BIZ;
 const BIZ_BASE  = BIZ_ID ? `https://api.green-api.com/waInstance${BIZ_ID}` : null;
 const BIZ_GROUP = process.env.NOTIFY_GROUP_CHAT_ID; // chatId של קבוצת הצוות
 
+// ─── ניטור סנכרון הקו העסקי ───────────────────────────────────────────────
+// הקו העסקי (הטלפון של דני) מסתנכרן ל-GreenAPI רק כשהטלפון מחובר לרשת והוואטסאפ פעיל.
+// כשהוא מתנתק — הודעות (נכנסות מלקוחות + יוצאות של דני) נערמות בטלפון ומגיעות באצווה אחת
+// כשהחיבור חוזר, מה שגורם לעיכוב של עד שעות (כמו שקרה לליאת: שליחה 16:25, עיבוד 17:41).
+// כאן עוקבים אחרי זמן הודעת-התוכן האמיתית האחרונה בשני הכיוונים. שקט דו-כיווני ממושך
+// בשעות פעילות = חשד חזק לניתוק → התראה לקבוצת הצוות. ההתראה נשלחת מ-instance ה-REG
+// (sendMessage → BASE), שהוא טלפון נפרד מהקו העסקי, ולכן מגיעה גם כשהקו העסקי מנותק.
+const SYNC_GAPS_FILE   = path.join(DATA_DIR, 'biz_sync_gaps.json');
+const SYNC_ALERT_MIN   = Number(process.env.SYNC_ALERT_MIN   || 20); // דקות שקט עד התראה
+const SYNC_GAP_LOG_MIN = Number(process.env.SYNC_GAP_LOG_MIN || 12); // דקות שקט שמתועדות כ-gap
+const SYNC_ACTIVE_FROM = Number(process.env.SYNC_ACTIVE_FROM || 8);  // שעת התחלה (שעון ישראל)
+const SYNC_ACTIVE_TO   = Number(process.env.SYNC_ACTIVE_TO   || 23); // שעת סיום
+let lastBizMsgAt = Date.now(); // זמן הודעת BIZ אמיתית אחרונה (נכנס/יוצא)
+let syncAlertSent = false;     // האם כבר נשלחה התראת ניתוק לאירוע הנוכחי
+let syncGaps = [];             // היסטוריית אירועי gap
+try { syncGaps = JSON.parse(fs.readFileSync(SYNC_GAPS_FILE, 'utf8')) || []; } catch (_) {}
+
+function israelHour() {
+  return Number(new Date().toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour: '2-digit', hour12: false }));
+}
+function israelStamp(d) {
+  return new Date(d).toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+// נקרא בכל הודעת תוכן אמיתית של הקו העסקי (דני יוצא / לקוח נכנס)
+function markBizActivity() {
+  const now = Date.now();
+  const silentMin = (now - lastBizMsgAt) / 60000;
+  // חזרה לפעילות אחרי שקט ארוך = היה gap → תעד אותו
+  if (silentMin >= SYNC_GAP_LOG_MIN) {
+    const gap = { from: lastBizMsgAt, to: now, minutes: Math.round(silentMin) };
+    syncGaps.push(gap);
+    if (syncGaps.length > 200) syncGaps = syncGaps.slice(-200);
+    try { fs.writeFileSync(SYNC_GAPS_FILE, JSON.stringify(syncGaps)); } catch (_) {}
+    console.log(`[sync] ⚠️ זוהה gap של ${gap.minutes} דק' (${israelStamp(gap.from)} → ${israelStamp(gap.to)})`);
+    if (syncAlertSent && BIZ_GROUP) {
+      sendMessage(BIZ_GROUP, `✅ הקו העסקי חזר להסתנכרן (היה שקט ${gap.minutes} דק'). ההודעות שהצטברו עובדו.`);
+    }
+  }
+  syncAlertSent = false;
+  lastBizMsgAt = now;
+}
+
+// לולאת ניטור — בודקת כל 2 דק' שקט דו-כיווני בשעות פעילות
+async function bizSyncMonitorLoop() {
+  console.log(`[sync] ✅ ניטור סנכרון קו עסקי פעיל (סף ${SYNC_ALERT_MIN} דק', חלון ${SYNC_ACTIVE_FROM}-${SYNC_ACTIVE_TO} שעון ישראל)`);
+  while (true) {
+    await new Promise(r => setTimeout(r, 120000));
+    try {
+      const h = israelHour();
+      if (h < SYNC_ACTIVE_FROM || h >= SYNC_ACTIVE_TO) continue; // מחוץ לשעות פעילות — שקט תקין
+      const silentMin = (Date.now() - lastBizMsgAt) / 60000;
+      if (silentMin >= SYNC_ALERT_MIN && !syncAlertSent && BIZ_GROUP) {
+        // שקט לבד אינו ניתוק — לרוב פשוט אין תעבורה. מאמתים מול GreenAPI לפני התראה:
+        // שולחים רק אם ה-state באמת אינו 'authorized'. authorized או כשל-בדיקה → אין התראה.
+        let state = null;
+        try {
+          const BIZ_HOST = `https://7107.api.green-api.com`;
+          const resp = await fetch(`${BIZ_HOST}/waInstance${BIZ_ID}/getStateInstance/${BIZ_TOKEN}`);
+          if (resp.ok) state = (await resp.json())?.stateInstance;
+        } catch (e) { console.error('[sync] state check failed:', e.message); }
+
+        if (state && state !== 'authorized') {
+          syncAlertSent = true;
+          await sendMessage(BIZ_GROUP,
+            `⚠️ *הקו העסקי כנראה מנותק*\nאין שום הודעה (נכנסת או יוצאת) כבר ${Math.round(silentMin)} דק' והחיבור במצב "${state}".\nבדוק שהטלפון מחובר לאינטרנט ושהוואטסאפ פתוח — הודעות שתשלח עכשיו עלולות להגיע ללקוחות באיחור.`);
+          console.log(`[sync] 🚨 התראת ניתוק נשלחה (שקט ${Math.round(silentMin)} דק', state=${state})`);
+        } else {
+          console.log(`[sync] שקט ${Math.round(silentMin)} דק' אך state=${state || 'לא-נבדק'} — אין ניתוק אמיתי, מדלג על התראה`);
+        }
+      }
+    } catch (e) { console.error('[sync] monitor error:', e.message); }
+  }
+}
+
+// keepalive — שולח ping ל-GreenAPI כל 40 דקות כדי למנוע ניתוק session
+async function bizKeepaliveLoop() {
+  const BIZ_HOST = `https://7107.api.green-api.com`;
+  while (true) {
+    await new Promise(r => setTimeout(r, 40 * 60 * 1000));
+    try {
+      const resp = await fetch(`${BIZ_HOST}/waInstance${BIZ_ID}/getStateInstance/${BIZ_TOKEN}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        const state = data?.stateInstance;
+        console.log(`[keepalive] BIZ state: ${state}`);
+        if (state && state !== 'authorized') {
+          console.log(`[keepalive] ⚠️ לא מחובר (${state}) — מריץ reboot`);
+          await fetch(`${BIZ_HOST}/waInstance${BIZ_ID}/reboot/${BIZ_TOKEN}`);
+        }
+      } else {
+        console.log(`[keepalive] ⚠️ HTTP ${resp.status}`);
+      }
+    } catch (e) {
+      console.error('[keepalive] error:', e.message);
+    }
+  }
+}
+
+// ─── תמונות מקבוצת "המלצות וואטסאפ" → העלאה אוטומטית ל-Google Drive ──────────
+// כל תמונה שנשלחת בקבוצה נשמרת אוטומטית בתיקיית דרייב. זיהוי הקבוצה: לפי chatId
+// מדויק (RECS_GROUP_CHAT_ID) אם הוגדר, אחרת לפי שם הקבוצה (RECS_GROUP_NAME).
+// Auth: OAuth refresh token (scope drive.file) — יציב ל-24/7 בלי פקיעה תקופתית.
+const RECS_GROUP_CHAT_ID = process.env.RECS_GROUP_CHAT_ID || '';        // לדוגמה: 1203630...@g.us
+const RECS_GROUP_NAME    = process.env.RECS_GROUP_NAME    || 'המלצות'; // התאמה חלקית בשם הקבוצה
+const RECS_FOLDER_NAME   = process.env.RECS_FOLDER_NAME   || 'המלצות וואטסאפ';
+const DRIVE_FOLDER_ID    = process.env.DRIVE_FOLDER_ID    || '';        // נסה תיקייה קיימת; ריק → הבוט יוצר/מוצא
+const G_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     || '';
+const G_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const G_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || '';
+const DRIVE_READY = !!(G_CLIENT_ID && G_CLIENT_SECRET && G_REFRESH_TOKEN);
+const recsLog = []; // יומן אחרון לדיבוג (/debug-recs)
+function recsNote(o) { recsLog.push({ ts: Date.now(), ...o }); if (recsLog.length > 30) recsLog.shift(); }
+
+// access token מ-refresh token, עם cache (תקף ~שעה — לא מבקשים חדש לכל תמונה)
+let _accTok = { value: '', exp: 0 };
+async function getDriveAccessToken() {
+  if (_accTok.value && Date.now() < _accTok.exp) return _accTok.value;
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: G_CLIENT_ID, client_secret: G_CLIENT_SECRET,
+      refresh_token: G_REFRESH_TOKEN, grant_type: 'refresh_token',
+    }),
+  });
+  if (!res.ok) throw new Error(`token ${res.status}: ${(await res.text()).slice(0, 140)}`);
+  const j = await res.json();
+  _accTok = { value: j.access_token, exp: Date.now() + (j.expires_in - 120) * 1000 };
+  return _accTok.value;
+}
+
+// תיקיית היעד: DRIVE_FOLDER_ID אם נגיש, אחרת מוצא/יוצר תיקייה בשם RECS_FOLDER_NAME.
+// נשמר ב-/data כדי לא לחפש/ליצור שוב אחרי restart.
+const FOLDER_CACHE_FILE = path.join(DATA_DIR, 'recs_folder.json');
+let _recsFolderId = '';
+try { _recsFolderId = JSON.parse(fs.readFileSync(FOLDER_CACHE_FILE, 'utf8')).id || ''; } catch (_) {}
+function saveRecsFolder(id) { _recsFolderId = id; try { fs.writeFileSync(FOLDER_CACHE_FILE, JSON.stringify({ id })); } catch (_) {} }
+
+async function getRecsFolderId(token) {
+  // תיקייה מפורשת (DRIVE_FOLDER_ID) גוברת תמיד — עם scope drive מלא היא נגישה לכתיבה
+  if (DRIVE_FOLDER_ID) {
+    if (_recsFolderId !== DRIVE_FOLDER_ID) saveRecsFolder(DRIVE_FOLDER_ID);
+    return DRIVE_FOLDER_ID;
+  }
+  if (_recsFolderId) return _recsFolderId;
+  // 2. תיקייה שה-app כבר יצר בעבר (scope drive.file)
+  const q = encodeURIComponent(`name='${RECS_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+  const sr = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)&spaces=drive`,
+    { headers: { Authorization: `Bearer ${token}` } });
+  if (sr.ok) { const sj = await sr.json(); if (sj.files?.length) { saveRecsFolder(sj.files[0].id); return _recsFolderId; } }
+  // 3. צור חדשה
+  const cr = await fetch('https://www.googleapis.com/drive/v3/files', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: RECS_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' }),
+  });
+  if (!cr.ok) throw new Error(`folder create ${cr.status}: ${(await cr.text()).slice(0, 120)}`);
+  const cj = await cr.json();
+  saveRecsFolder(cj.id);
+  console.log(`[recs] 📁 נוצרה תיקיית יעד "${RECS_FOLDER_NAME}": https://drive.google.com/drive/folders/${cj.id}`);
+  return _recsFolderId;
+}
+
+// העלאת buffer לדרייב (multipart: metadata + media בבקשה אחת)
+async function uploadBufferToDrive(buffer, fileName, mimeType, token, folderId) {
+  const boundary = '----recs' + Date.now();
+  const meta = JSON.stringify({ name: fileName, parents: [folderId] });
+  const head = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`;
+  const tail = `\r\n--${boundary}--`;
+  const body = Buffer.concat([Buffer.from(head, 'utf8'), buffer, Buffer.from(tail, 'utf8')]);
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+    body,
+  });
+  if (!res.ok) throw new Error(`upload ${res.status}: ${(await res.text()).slice(0, 150)}`);
+  return await res.json();
+}
+
+// בודק אם ה-webhook הוא תמונה מקבוצת ההמלצות, ואם כן מתחיל העלאה לדרייב.
+// מחזיר true אם טופל (אין להמשיך לעיבוד הרגיל). משותף ל-/webhook ול-/webhook-biz.
+function tryHandleRecsImage(body) {
+  const msg = body && body.messageData;
+  if (!msg || msg.typeMessage !== 'imageMessage') return false;
+  const cid = body.senderData?.chatId || '';
+  const cname = body.senderData?.chatName || '';
+  if (!cid.includes('@g.us')) return false;
+  const isRecs = RECS_GROUP_CHAT_ID
+    ? cid === RECS_GROUP_CHAT_ID
+    : (!!RECS_GROUP_NAME && cname.includes(RECS_GROUP_NAME));
+  console.log(`[recs] 🖼️ תמונה מקבוצה chatId=${cid} name="${cname}" match=${isRecs}`);
+  if (!isRecs) { recsNote({ chatId: cid, chatName: cname, status: 'skip-other-group' }); return true; }
+  // דלג על webhooks ישנים (תור/retry אחרי restart) — מונע כפילויות בדרייב
+  if (body.timestamp && body.timestamp < SERVER_START - 180) { recsNote({ chatId: cid, status: 'skip-old' }); return true; }
+  const rid = body.idMessage;
+  if (rid && processedIds.has(rid)) return true;
+  if (rid) processedIds.add(rid);
+  if (!DRIVE_READY) { console.warn('[recs] ⚠️ תמונה התקבלה אך Drive לא מוגדר (חסר GOOGLE_* env)'); recsNote({ chatId: cid, status: 'no-drive-creds' }); return true; }
+  handleRecsImage(msg, body).catch(e => { console.error('[recs] ❌ כשל:', e.message); recsNote({ chatId: cid, status: 'error: ' + e.message.slice(0, 90) }); });
+  return true;
+}
+
+// מטפל בתמונה נכנסת מקבוצת ההמלצות: מוריד מ-WhatsApp ומעלה ל-Drive
+async function handleRecsImage(msg, body) {
+  const chatId = body.senderData?.chatId || '';
+  const chatName = body.senderData?.chatName || '';
+  const fd = msg.fileMessageData || {};
+  const sender = (body.senderData?.sender || '').replace('@c.us', '');
+
+  // שם קובץ: חותמת זמן + שולח + caption/שם מקורי + סיומת
+  const ext = (fd.fileName && path.extname(fd.fileName)) || (fd.mimeType === 'image/png' ? '.png' : '.jpg');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const caption = (fd.caption || '').replace(/[\/\\:*?"<>|\n\r]/g, ' ').trim().slice(0, 50);
+  const fileName = `${stamp}_${sender}${caption ? '_' + caption : ''}${ext}`.replace(/\s+/g, '_');
+
+  // 1. downloadUrl — מה-webhook אם קיים, אחרת downloadFile של Green API.
+  //    הקבוצה יכולה להיות על הקו הראשי או העסקי — מנסים את שניהם.
+  let downloadUrl = fd.downloadUrl;
+  if (!downloadUrl) {
+    const insts = [];
+    if (BIZ_BASE && BIZ_TOKEN) insts.push([BIZ_BASE, BIZ_TOKEN]);
+    insts.push([BASE, TOKEN]);
+    for (const [base, tok] of insts) {
+      const r = await fetch(`${base}/downloadFile/${tok}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId, idMessage: body.idMessage }),
+      });
+      if (r.ok) { downloadUrl = (await r.json()).downloadUrl; if (downloadUrl) break; }
+    }
+  }
+  if (!downloadUrl) throw new Error('אין downloadUrl לתמונה');
+
+  // 2. הורד את התמונה
+  const imgRes = await fetch(downloadUrl);
+  if (!imgRes.ok) throw new Error(`download ${imgRes.status}`);
+  const buffer = Buffer.from(await imgRes.arrayBuffer());
+
+  // 3. העלה ל-Drive
+  const token = await getDriveAccessToken();
+  const folderId = await getRecsFolderId(token);
+  const up = await uploadBufferToDrive(buffer, fileName, fd.mimeType || 'image/jpeg', token, folderId);
+  console.log(`[recs] ✅ הועלה לדרייב: ${fileName} (${up.id})`);
+  recsNote({ chatId, chatName, file: fileName, status: 'ok' });
+}
+
 // מילות מפתח שמפעילות את הבוט
+// ⚠️ דני כותב פקודות אך ורק עם "לך" — *לעולם לא "לו"*. שמות-פועל סתמיים
+// ('להוסיף'/'להוריד'/'להחליף') וגם וריאציות "לו" אסורים כאן — הם מופיעים בשיחה רגילה
+// ("מה אתה רוצה להוסיף?", "אני מוסיף לו עוד שבוע") וגרמו לבוט לתפוס הודעות-שיחה כפקודות.
+// פקודה אמיתית תמיד = פועל + "לך".
+// הווה ("מוסיף לך") = פקודה תמיד. עבר ("הורדתי לך 30 גרם") = פקודה *רק כשיש מספר אחריו*
+// (ראה PAST_CMD למטה) — דני מדווח מה שינה: "ליה הורדתי לך 30 גרם אורז". בלי מספר זה שיחה
+// ("אם הוספתי לך זה איכותי") ולא נתפס.
 const TRIGGER_WORDS = [
-  'מוסיף לך', 'מוסיף לו', 'תוסיף לך', 'תוסיף לו', 'להוסיף',
-  'אוסיף לך', 'אוסיף לו', 'נוסיף לך', 'נוסיף לו',
-  'שמתי לך', 'שמתי לו', 'שם לך', 'שם לו',
-  'מעלה לך', 'מעלה לו', 'תעלה לך', 'תעלה לו', 'להעלות',
-  'מוריד לך', 'מוריד לו', 'תוריד לך', 'תוריד לו', 'הוריד לו', 'מפחית',
-  'הורדתי לך', 'הורדתי לו', 'להוריד', 'להפחית',
-  'מחליף לך', 'מחליף לו', 'תחליף לך', 'תחליף לו', 'להחליף',
-  'החלפתי לך', 'החלפתי לו',
-  'משנה לך', 'משנה לו', 'שמתי לך', 'שמתי לו', 'הוספתי לך', 'הוספתי לו', 'הורדתי לך', 'הורדתי לו',
-  'מכניס לך', 'מכניס לו', 'תכניס לך', 'תכניס לו', 'הכנסתי לך', 'הכנסתי לו',
+  'מוסיף לך', 'תוסיף לך', 'אוסיף לך', 'נוסיף לך',
+  'שם לך',
+  'מעלה לך', 'תעלה לך',
+  'מוריד לך', 'תוריד לך', 'מפחית לך',
+  'מחליף לך', 'תחליף לך',
+  'משנה לך',
+  'מכניס לך', 'תכניס לך',
 ];
+// פקודת-עבר: פועל-עבר + (לך/לה/גם/את) + מספר. "הורדתי לך 30 גרם", "הורדתי 5 גרם", "הורדתי גם 30".
+// המספר הוא מה שמפריד פקודה אמיתית משיחה — "אם הוספתי לך זה איכותי" (בלי מספר) לא ייתפס.
+const PAST_CMD = /(?:הורדתי|הוספתי|העליתי|הפחתתי|החלפתי|שיניתי|הכנסתי|הורדת|הוספת)(?:\s+(?:ל[ךה]|גם|את|לך\s+גם)){0,2}\s+\d/;
 
 // WhatsApp / תיקון-שגיאות מכניס לעיתים מקף או רווח כפול בין מילים:
 // "מוסיף-לך" / "מוסיף  לך" → "מוסיף לך". מנרמל כדי שזיהוי הטריגר לא יתפספס.
@@ -755,8 +1043,20 @@ function extractMsgText(msg) {
   return { text: '', quotedId: null };
 }
 
+// גבול-מילה לפני הטריגר: "רשם לך" לא יתפוס את "שם לך". (\b של JS לא עובד בעברית.)
+// חריג: ו' החיבור ("ומעלה לך 5 גרם...") = פקודה תקינה — אסור לחסום אותה.
+function _triggerBoundaryOK(text, idx) {
+  return idx === 0 || !/[א-ת]/.test(text[idx - 1]) || text[idx - 1] === 'ו';
+}
 function hasTriggerWord(text) {
-  return TRIGGER_WORDS.some(w => text.includes(w));
+  if (PAST_CMD.test(text)) return true;  // "הורדתי לך 30 גרם" וכו'
+  return TRIGGER_WORDS.some(w => {
+    let idx = -1;
+    while ((idx = text.indexOf(w, idx + 1)) !== -1) {
+      if (_triggerBoundaryOK(text, idx)) return true;
+    }
+    return false;
+  });
 }
 
 // הקשר תרגיל: "אימון" וגם "תוכנית" (בקשת דני) — באימון/לאימון/תוכנית/בתוכנית/התוכנית/לתוכנית
@@ -769,6 +1069,33 @@ function hasExerciseTrigger(text) {
 // פקודת סט: טריגר + המילה "סט"/"סטים" כמילה עצמאית (לא "סטייק"/"סטטוס")
 function hasSetCommand(text) {
   return hasTriggerWord(text) && /(?:^|\s)סט(?:ים)?(?=$|\s)/.test(text);
+}
+
+// ─── עיגון הפקודה למילת-הטריגר ─────────────────────────────────
+// דני כותב ללקוח משפט שלם ("אני יכול לשים אופציה\nאני מוסיף לך תמרים").
+// הפרסר התבלבל מהפתיח ותפס "יכול ל" כמזון. כאן חותכים כל מה שלפני מילת
+// הפקודה הראשונה ("מוסיף לך" וכו'), אבל שומרים מילת-ארוחה אם הופיעה בפתיח.
+function anchorToCommand(text) {
+  const t = (text || '').trim();
+  let best = -1;
+  for (const w of TRIGGER_WORDS) {
+    let idx = -1;
+    while ((idx = t.indexOf(w, idx + 1)) !== -1) {
+      if (_triggerBoundaryOK(t, idx)) {
+        if (best === -1 || idx < best) best = idx;
+        break;
+      }
+    }
+  }
+  const pm = t.match(PAST_CMD);
+  if (pm && pm.index !== undefined && (best === -1 || pm.index < best)) best = pm.index;
+  if (best <= 0) return t.replace(/^אני\s+/, '');  // אין פתיח לחתוך — התנהגות קיימת
+  const preamble = t.slice(0, best);
+  let anchored = t.slice(best).trim();
+  // שמירת מילת-ארוחה מהפתיח שנחתך (שלא נאבד "בבוקר"/"בערב")
+  const mealM = preamble.match(/(?:^|\s)ב?(בוקר|צהריים|צהרים|ערב|לילה|ביניים)(?=$|\s)/);
+  if (mealM && !new RegExp(mealM[1]).test(anchored)) anchored = 'ב' + mealM[1] + ' ' + anchored;
+  return anchored;
 }
 
 function parseExerciseSwap(text) {
@@ -807,10 +1134,12 @@ function runExerciseSetBiz(contactName, clientPhone, commandText, opts = {}) {
     const raw = output.trim() || (code === 0 ? '✅ בוצע' : '❌ שגיאה');
     console.log(`[ex-set→] ${raw.slice(0,100).replace(/\n/g,' | ')}`);
     if (raw.startsWith('NAME_NOT_FOUND:')) {
-      if (opts.nameOverride === clientPhone) {
-        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}* (${clientPhone.replace(/^972/,'0')})`);
+      const _cn = (contactName || '').trim();
+      if (!opts.triedChatName && _cn && _cn !== clientPhone && !/^\+?[\d\s()-]+$/.test(_cn)) {
+        // טלפון לא נמצא ב-auto-fit (לקוח חו"ל עם מספר זר) → נסה לפי שם הצ'אט
+        runExerciseSetBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: _cn, triedChatName: true });
       } else {
-        runExerciseSetBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}* (${clientPhone.replace(/^972/,'0')})`);
       }
       return;
     }
@@ -869,10 +1198,12 @@ function runExerciseSwapBiz(contactName, clientPhone, commandText, opts = {}) {
     console.log(`[ex-swap→] ${raw.slice(0,100).replace(/\n/g,' | ')}`);
 
     if (raw.startsWith('NAME_NOT_FOUND:')) {
-      if (opts.nameOverride === clientPhone) {
-        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}* (${clientPhone.replace(/^972/,'0')})`);
+      const _cn = (contactName || '').trim();
+      if (!opts.triedChatName && _cn && _cn !== clientPhone && !/^\+?[\d\s()-]+$/.test(_cn)) {
+        // טלפון לא נמצא ב-auto-fit (לקוח חו"ל עם מספר זר) → נסה לפי שם הצ'אט
+        runExerciseSwapBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: _cn, triedChatName: true });
       } else {
-        runExerciseSwapBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}* (${clientPhone.replace(/^972/,'0')})`);
       }
       return;
     }
@@ -989,6 +1320,33 @@ function runExerciseSwapBiz(contactName, clientPhone, commandText, opts = {}) {
 const bizProcessedIds = new Set();
 // IDs שהבוט עצמו שלח (כדי לא להגיב להם)
 const bizBotSentIds = new Set();
+// הגנה מכפילות לפקודת "תפריט" בקבוצה (אותה הודעה עלולה להגיע משני instances)
+let lastGroupMenu = { key: '', ts: 0 };
+// cache הקלטות קוליות נכנסות: idMessage → { downloadUrl, mimeType, chatId, name, ts }
+// נתפס ברגע שההקלטה מגיעה (downloadUrl טרי מ-Green API), משמש כשדני מתייג "שומע"
+const voiceCache = new Map();
+
+// מתאמני רון: טלפונים (ללא @c.us) שהתמלול שלהם הולך לרון. ברירת מחדל = דני.
+const ronClients = new Set();
+// לקוחות שכבר נשאלו בקבוצה "של רון?" (כדי לא לשאול שוב על אותו לקוח).
+const askedClients = new Set();
+// שאלות ממתינות: questionMsgId (הודעת הבוט בקבוצה) → { phone, name }
+const pendingRonQ = new Map();
+const RON_CLIENTS_FILE   = path.join(DATA_DIR, 'ron_clients.json');
+const ASKED_CLIENTS_FILE = path.join(DATA_DIR, 'asked_clients.json');
+(process.env.RON_CLIENTS || '').split(',').map(s => s.trim()).filter(Boolean).forEach(p => ronClients.add(p));
+function loadRonClients() {
+  try { JSON.parse(fs.readFileSync(RON_CLIENTS_FILE, 'utf8')).forEach(p => ronClients.add(p)); } catch (e) { if (e.code !== 'ENOENT') console.warn('[ron load]', e.message); }
+  try { JSON.parse(fs.readFileSync(ASKED_CLIENTS_FILE, 'utf8')).forEach(p => askedClients.add(p)); } catch (e) { if (e.code !== 'ENOENT') console.warn('[asked load]', e.message); }
+  console.log(`[ron] נטענו ${ronClients.size} מתאמני רון, ${askedClients.size} נשאלו`);
+}
+function saveRonClients() {
+  try { fs.writeFileSync(RON_CLIENTS_FILE, JSON.stringify([...ronClients]), 'utf8'); } catch (e) { console.warn('[ron save]', e.message); }
+}
+function saveAskedClients() {
+  try { fs.writeFileSync(ASKED_CLIENTS_FILE, JSON.stringify([...askedClients]), 'utf8'); } catch (e) { console.warn('[asked save]', e.message); }
+}
+loadRonClients();
 
 // namePrefs v3: שם WhatsApp (lowercase) → auto-fit user_id (אחרי אישור דני)
 const bizNamePrefs = new Map();
@@ -1049,6 +1407,233 @@ async function getContactName(chatId) {
   }
 }
 
+// שם הלקוח המלא ששמור אצל דני (getContactInfo → contactName), לתצוגה בתמלול
+async function getClientFullName(chatId) {
+  if (!BIZ_BASE || !BIZ_TOKEN) return chatId.replace('@c.us', '').replace(/^972/, '0');
+  try {
+    const res = await fetch(`${BIZ_BASE}/getContactInfo/${BIZ_TOKEN}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatId }),
+    });
+    if (res.ok) {
+      const d = await res.json();
+      const name = (d.contactName || d.name || '').trim();
+      if (name) return name;
+    }
+  } catch (e) { /* נופל למספר */ }
+  return chatId.replace('@c.us', '').replace(/^972/, '0');
+}
+
+// ─── תמלול הקלטות קוליות ──────────────────────────────────────
+// זיהוי מילת הקוד בתיוג. רק "שומע" לבד (טבעי) — לא "שומע אותך אחי".
+// הניתוב רון/דני נקבע אוטומטית לפי רשימת ronClients (תחליף לתגית "מתאמנים רון").
+function parseTranscribeCommand(text) {
+  const t = (text || '').trim().toLowerCase();
+  return TRANSCRIBE_TRIGGERS.includes(t) ? 'auto' : null;
+}
+
+// הורדת קובץ האודיו ושליחתו ל-Groq Whisper (עברית). מחזיר { text } או { error }
+async function transcribeAudio(downloadUrl, mimeType = 'audio/ogg') {
+  if (!GROQ_API_KEY) {
+    console.error('[transcribe] GROQ_API_KEY חסר — לא ניתן לתמלל');
+    return { error: 'no_key' };
+  }
+  try {
+    const audioRes = await fetch(downloadUrl);
+    if (!audioRes.ok) {
+      console.error(`[transcribe] הורדת אודיו נכשלה: ${audioRes.status}`);
+      return { error: 'download' };
+    }
+    const audioBuf = Buffer.from(await audioRes.arrayBuffer());
+    const ext = /mpeg|mpga|mp3/.test(mimeType) ? 'mp3'
+              : /mp4|m4a/.test(mimeType)        ? 'm4a'
+              : /wav/.test(mimeType)            ? 'wav'
+              : /webm/.test(mimeType)           ? 'webm' : 'ogg';
+    const form = new FormData();
+    form.append('file', new Blob([audioBuf], { type: mimeType || 'audio/ogg' }), `voice.${ext}`);
+    form.append('model', 'whisper-large-v3');
+    form.append('language', 'he');
+    form.append('response_format', 'json');
+    const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
+      body: form,
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.error(`[transcribe] Groq נכשל ${res.status}: ${errBody.slice(0, 200)}`);
+      return { error: 'groq' };
+    }
+    const j = await res.json();
+    const text = (j.text || '').trim();
+    console.log(`[transcribe] ✅ תומלל (${text.length} תווים)`);
+    return { text };
+  } catch (e) {
+    console.error('[transcribe] EXCEPTION:', e.message);
+    return { error: 'exception' };
+  }
+}
+
+// תפיסה מיידית: קוראים downloadFile ברגע שההקלטה הנכנסת מגיעה (כשהמדיה עוד טרייה ב-WhatsApp),
+// ושומרים את ה-downloadUrl ל-cache. הוא תקף לשעות — כך התיוג "שומע" מאוחר יותר תמיד מצליח.
+// משיכת downloadUrl מ-Green API עם retry עמיד לתקלת "Internal error" (500) שמופיעה
+// *לסירוגין* בשירות downloadFile שלהם — אותה הקלטה יכולה להחזיר 500 כמה פעמים ואז 200.
+// מנסה לאורך זמן (ברירת מחדל ~10 דק') עד שנתפס חלון עובד. עוצר מיד על שגיאה שאינה 500
+// (למשל 4xx — הקלטה יוצאת שאין לה קובץ), כדי לא לנסות לשווא. מחזיר downloadUrl או null.
+async function downloadFileRetry(chatId, idMessage, { tries = 40, delayMs = 15000, label = '' } = {}) {
+  if (!BIZ_BASE || !BIZ_TOKEN) return null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(`${BIZ_BASE}/downloadFile/${BIZ_TOKEN}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId, idMessage }),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (d.downloadUrl) {
+          if (i > 0) console.log(`[transcribe] ✅ downloadFile הצליח אחרי ${i + 1} ניסיונות ${label}`);
+          return d.downloadUrl;
+        }
+        return null; // 200 ללא URL — אין קובץ
+      }
+      if (res.status !== 500) {
+        console.error(`[transcribe] downloadFile ${res.status} (לא 500, עוצר) ${label}: ${idMessage}`);
+        return null;
+      }
+      // 500 = תקלה זמנית בצד Green API → נסה שוב
+    } catch (e) {
+      console.error(`[transcribe] downloadFileRetry EXCEPTION ${label}: ${e.message}`);
+    }
+    if (i < tries - 1) await new Promise(r => setTimeout(r, delayMs));
+  }
+  console.error(`[transcribe] downloadFile נכשל אחרי ${tries} ניסיונות ${label}: ${idMessage}`);
+  return null;
+}
+
+async function cacheVoiceNow(chatId, idMessage, name) {
+  // retry ממושך: גם אם Green API בתקלה זמנית כשההקלטה נכנסת, נמשיך לנסות ברקע עד
+  // שנתפוס — כך שכשדני יתייג מאוחר יותר, ה-downloadUrl כבר יהיה ב-cache והתמלול מיידי.
+  const url = await downloadFileRetry(chatId, idMessage, { label: '(נכנס)' });
+  if (!url) return;
+  voiceCache.set(idMessage, { downloadUrl: url, mimeType: 'audio/ogg', chatId, name, ts: Date.now() });
+  console.log(`[transcribe] 🎙️ downloadUrl נתפס ל-cache: ${idMessage}`);
+  const cutoff = Date.now() - 6 * 3600 * 1000; // נקה רשומות מעל 6 שעות
+  for (const [k, v] of voiceCache) if (v.ts < cutoff) voiceCache.delete(k);
+}
+
+// גיבוי לתיוג שנכשל: כשבזמן התיוג ההקלטה לא ב-cache ו-downloadFile מחזיר 500 (תקלת
+// Green API לסירוגין), ממשיכים לנסות ברקע לאורך דקות. ברגע שהשירות מתאושש — מתמללים
+// ושולחים אוטומטית, כך שדני לא צריך לתייג שוב.
+async function backgroundTranscribe(chatId, quotedMsgId, target, isRon, phone) {
+  const url = await downloadFileRetry(chatId, quotedMsgId, { label: '(תיוג-רקע)' });
+  if (!url) {
+    await sendMessage(target, '🤔 לא הצלחתי למשוך את ההקלטה גם אחרי ניסיונות חוזרים.\n\n_אם זו הקלטה ש*אתה* שלחת — אי אפשר לתמלל (וואטסאפ לא שומר אותה). אם קיבלת אותה — ייתכן תקלה מתמשכת ב-Green API; נסה לתייג שוב מאוחר יותר._');
+    return;
+  }
+  const clientName = await getClientFullName(chatId);
+  const { text, error } = await transcribeAudio(url, 'audio/ogg');
+  if (error === 'no_key') { await sendMessage(target, '❌ תמלול לא מוגדר (חסר GROQ_API_KEY).'); return; }
+  if (error || !text)     { await sendMessage(target, '❌ ההקלטה נמשכה אך התמלול נכשל. נסה לתייג שוב.'); return; }
+  const phoneDisp = phone.replace(/^972/, '0');
+  await sendMessage(target, `🎙️ *תמלול* — ${clientName} (${phoneDisp})\n\n${text}`);
+  console.log(`[transcribe] ✅ נשלח (רקע) ל-${isRon ? 'רון' : 'דני'} | ${clientName}`);
+}
+
+// טיפול בפקודת תמלול: דני תייג הקלטה + כתב מילת קוד.
+// משתמש ב-downloadUrl מה-cache (נתפס בזמן אמת), fallback ל-downloadFile, מתמלל ושולח לדני/רון לפרטי.
+// owner: 'auto' (לפי רשימת רון) | 'ron' (לרון + סמן את הלקוח) | 'dani' (לדני + בטל סימון).
+async function handleTranscribeCommand(chatId, quotedMsgId, owner = 'auto') {
+  const dani = ALLOWED[0], ron = ALLOWED[1];
+  const phone = chatId.replace('@c.us', '');
+  // קבע למי נשלח התמלול: רון אם הלקוח שלו, אחרת דני. "שומע רון"/"שומע דני" מעדכנים את הרשימה.
+  let isRon;
+  if (owner === 'ron')       { isRon = true;  if (!ronClients.has(phone)) { ronClients.add(phone); saveRonClients(); console.log(`[ron] נוסף מתאמן: ${phone}`); } }
+  else if (owner === 'dani') { isRon = false; if (ronClients.delete(phone)) { saveRonClients(); console.log(`[ron] הוסר מתאמן: ${phone}`); } }
+  else                       { isRon = ronClients.has(phone); }
+  const target = isRon ? ron : dani;
+  let downloadUrl, mimeType, clientName;
+
+  // 1. נסה cache (אם downloadUrl נתפס בזמן אמת מה-webhook הנכנס)
+  const cached = voiceCache.get(quotedMsgId);
+  if (cached?.downloadUrl) {
+    downloadUrl = cached.downloadUrl;
+    mimeType    = cached.mimeType;
+    clientName  = cached.name;
+    console.log(`[transcribe] נמצא ב-cache: ${quotedMsgId}`);
+  }
+
+  // 2. מקור ראשי — downloadFile: מוריד את הקובץ on-demand לפי id.
+  //    עובד גם כשה-downloadUrl ב-webhook/journal מגיע ריק (מאומת חי על הקלטה נכנסת).
+  if (!downloadUrl && BIZ_BASE && BIZ_TOKEN) {
+    try {
+      const res = await fetch(`${BIZ_BASE}/downloadFile/${BIZ_TOKEN}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId, idMessage: quotedMsgId }),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (d.downloadUrl) {
+          downloadUrl = d.downloadUrl;
+          mimeType    = 'audio/ogg';
+          console.log(`[transcribe] downloadFile הצליח: ${quotedMsgId}`);
+        }
+      } else {
+        console.error(`[transcribe] downloadFile נכשל ${res.status} (id=${quotedMsgId})`);
+      }
+    } catch (e) {
+      console.error('[transcribe] downloadFile EXCEPTION:', e.message);
+    }
+  }
+
+  // 3. fallback אחרון — ההקלטה האחרונה שנתפסה מאותו צ'אט (דני כמעט תמיד מתייג את האחרונה).
+  //    מבטיח עבודה גם אם מזהה התיוג (stanzaId) לא תואם בדיוק למזהה הנכנס שנשמר ב-cache.
+  if (!downloadUrl) {
+    let latest = null;
+    for (const [, v] of voiceCache) {
+      if (v.chatId === chatId && (!latest || v.ts > latest.ts)) latest = v;
+    }
+    if (latest?.downloadUrl) {
+      downloadUrl = latest.downloadUrl;
+      mimeType    = latest.mimeType;
+      clientName  = latest.name;
+      console.log(`[transcribe] fallback להקלטה האחרונה מהצ'אט ${chatId}`);
+    }
+  }
+
+  if (!downloadUrl) {
+    // לא ב-cache ולא נמשך מיד — ככל הנראה תקלת 500 זמנית של Green API. אל תוותר:
+    // מנסים ברקע לאורך דקות, והתמלול יישלח אוטומטית ברגע שהשירות מתאושש (בלי תיוג חוזר).
+    await sendMessage(target, '⏳ Green API מתקשה למשוך את ההקלטה כרגע (תקלה זמנית אצלם). ממשיך לנסות ברקע — התמלול יישלח אוטומטית ברגע שאצליח, אין צורך לתייג שוב.');
+    backgroundTranscribe(chatId, quotedMsgId, target, isRon, phone)
+      .catch(e => console.error('[transcribe] backgroundTranscribe error:', e.message));
+    return;
+  }
+  // 3. תמלל — תמיד השם המלא ששמור אצל דני (לא ה-pushName/מספר מה-cache)
+  clientName = await getClientFullName(chatId);
+  const { text, error } = await transcribeAudio(downloadUrl, mimeType);
+  if (error === 'no_key') { await sendMessage(dani, '❌ תמלול לא מוגדר (חסר GROQ_API_KEY).'); return; }
+  if (error || !text)     { await sendMessage(target, '❌ התמלול נכשל. נסה שוב.'); return; }
+  // 4. שלח למי שאחראי על הלקוח (דני / רון) לפרטי
+  const phoneDisp = phone.replace(/^972/, '0');
+  await sendMessage(target, `🎙️ *תמלול* — ${clientName} (${phoneDisp})\n\n${text}`);
+  console.log(`[transcribe] ✅ נשלח ל-${isRon ? 'רון' : 'דני'} | ${clientName}`);
+
+  // ── לקוח חדש שלא מסומן ולא נשאל: שאל בקבוצת הצוות "של רון?" (פעם אחת) ──
+  if (!isRon && !askedClients.has(phone) && BIZ_GROUP) {
+    askedClients.add(phone); saveAskedClients();
+    const qMsgId = await sendBizMessage(BIZ_GROUP,
+      `❓ *${clientName}* (${phoneDisp}) — לקוח חדש, התמלול נשלח לדני.\n` +
+      `אם זה מתאמן של *רון* — השב על הודעה זו במילה *רון*, ומעכשיו ההקלטות שלו ילכו אליו.`);
+    if (typeof qMsgId === 'string') {
+      pendingRonQ.set(qMsgId, { phone, name: clientName });
+      if (pendingRonQ.size > 100) { const k = pendingRonQ.keys().next().value; pendingRonQ.delete(k); }
+    }
+  }
+}
+
 // ─── פורמט קבלה לקבוצה ───────────────────────────────────────
 function formatBizReceipt(clientName, autofitResult, phoneDisplay) {
   const time = new Date().toLocaleTimeString('he-IL', {
@@ -1075,8 +1660,10 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
   if (opts.foodOverride) { args.push('--food'); args.push(opts.foodOverride); }
   if (opts.hintOverride) { args.push('--hint'); args.push(opts.hintOverride); }
   if (opts.mealOverride) { args.push('--meal'); args.push(opts.mealOverride); }
-  // הודעות V3 מתחילות ב-"אני" — מסיר כדי שלא יבלבל את הפרסר
-  args.push(commandText.replace(/^אני\s+/, ''));
+  if (opts.allowFuzzy)   { args.push('--allow-fuzzy'); }
+  // עיגון למילת-הפקודה: חותך פטפוט מקדים ("אני יכול לשים אופציה...") שבלבל
+  // את הפרסר, ומתחיל מ-"מוסיף לך"/"מוריד לך" וכו'. שומר מילת-ארוחה מהפתיח.
+  args.push(anchorToCommand(commandText));
 
   const proc = spawn('python3', [script, ...args]);
   let output = '';
@@ -1124,13 +1711,14 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
 
     // ── שם לא נמצא: נסה לפי מספר טלפון, אחר כך alert ────────────────
     if (raw.startsWith('NAME_NOT_FOUND:')) {
-      if (opts.nameOverride === clientPhone) {
-        // כבר ניסינו טלפון — שלח alert
-        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}*\n(טלפון: ${clientPhone.replace(/^972/, '0')})`);
+      const _cn = (contactName || '').trim();
+      if (!opts.triedChatName && _cn && _cn !== clientPhone && !/^\+?[\d\s()-]+$/.test(_cn)) {
+        // טלפון לא נמצא ב-auto-fit (לקוח חו"ל עם מספר זר) → נסה לפי שם הצ'אט
+        console.log(`[biz] טלפון לא נמצא (${clientPhone}), מנסה לפי שם הצ'אט: "${_cn}"`);
+        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: _cn, triedChatName: true });
       } else {
-        const badName = raw.slice('NAME_NOT_FOUND:'.length).trim();
-        console.log(`[biz] שם לא נמצא: "${badName}", מנסה לפי טלפון: ${clientPhone}`);
-        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, nameOverride: clientPhone });
+        // כבר ניסינו טלפון+שם — שלח alert
+        await sendBizMessage(BIZ_GROUP, `❌ לא מצאתי לקוח: *${contactName}*\n(טלפון: ${clientPhone.replace(/^972/, '0')})`);
       }
       return;
     }
@@ -1160,7 +1748,7 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       const [header, ...rest] = raw.split('\n');
       const headerBody = header.slice('FOOD_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
-      const foodQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const foodQuery = cleanPrefKey(sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '');
       const rawAlts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const altObjs = rawAlts.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? { name: a.slice(0, ci), cal: parseInt(a.slice(ci+1)) || 0 } : { name: a, cal: 0 }; });
       const altNames = altObjs.map(o => o.name);
@@ -1187,7 +1775,7 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       const [header, ...rest] = raw.split('\n');
       const headerBody = header.slice('HINT_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
-      const hintQuery = sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '';
+      const hintQuery = cleanPrefKey(sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '');
       const rawAlts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const altObjs = rawAlts.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? { name: a.slice(0, ci), cal: parseInt(a.slice(ci+1)) || 0 } : { name: a, cal: 0 }; });
       const altNames = altObjs.map(o => o.name);
@@ -1239,9 +1827,61 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
 
 // ─── טיפול בתגובת דני בקבוצה ("כן" / "בחר N") ─────────────────
 async function handleBizGroupResponse(text, quotedId = null) {
-  if (!bizPending) return;
-  if (Date.now() - bizPending.timestamp > BIZ_PENDING_TTL) {
-    bizPending = null;
+  // ── תפריט מתוך הקבוצה: "דני תפריט" → התפריט נשלח לקבוצה עצמה ──
+  // נבדק לפני לוגיקת ה-pending כדי שלא ייבלע בענף ה"אין שאלה פתוחה".
+  const _groupMenu = parseMenuCommand(text);
+  if (_groupMenu) {
+    // הגנה מכפילות: אותה הודעת קבוצה עלולה להגיע משני ה-instances (webhook ראשי + biz)
+    const _menuKey = `${_groupMenu.name}|${_groupMenu.meal}`;
+    if (lastGroupMenu.key === _menuKey && Date.now() - lastGroupMenu.ts < 8000) {
+      console.log(`📋 [group] תפריט כפול נבלע (${_menuKey})`);
+      return;
+    }
+    lastGroupMenu = { key: _menuKey, ts: Date.now() };
+    console.log(`📋 [group] תפריט עבור: "${_groupMenu.name}"${_groupMenu.meal ? ` (${_groupMenu.meal})` : ''}`);
+    if (BIZ_GROUP) runMenu(BIZ_GROUP, _groupMenu.name, _groupMenu.meal);
+    return;
+  }
+
+  // ── תשובת "רון" על שאלת לקוח-חדש מהתמלול (reply לשאלת הבוט) ──
+  if (quotedId && pendingRonQ.has(quotedId)) {
+    const t0 = text.trim().toLowerCase();
+    const { phone, name } = pendingRonQ.get(quotedId);
+    if (t0 === 'רון') {
+      pendingRonQ.delete(quotedId);
+      ronClients.add(phone); saveRonClients();
+      await sendBizMessage(BIZ_GROUP, `✅ *${name}* סומן כמתאמן של רון — מעכשיו ההקלטות שלו אליו.`);
+    }
+    return; // תשובה לשאלת התמלול — לא ממשיכים ללוגיקת auto-fit
+  }
+
+  // ── פקודת תזונה ישירות מהקבוצה: "שם מתאמן: פקודה" (פורמט קשיח) ──────────
+  // מאפשר לדני להוסיף/לשנות מהקבוצה בלי לפתוח צ'אט פרטי. דורש נקודתיים +
+  // פועל-תזונה כדי שלא ייתפס שיח רגיל. השם מחולץ במלואו (כל מה שלפני ה-:),
+  // ומועבר עם allowFuzzy (אין טלפון-גיבוי בקבוצה, וההתאמה הקרובה מכוונת).
+  {
+    const _gm = text.match(/^\s*([א-ת][א-ת'׳"\s]{1,28}?)\s*:\s*(\S[\s\S]+)/);
+    if (_gm && /(?:תוסיפ|הוסיף|הוסף|מוסיף|תחליפ|תחליף|החליף|החלף|תוריד|הורד|תפחית|הפחת|תעל|העל|עדכן|כאופצי|כתחליף|במקום)/.test(_gm[2])) {
+      const _gName = _gm[1].trim();
+      const _gCmd  = _gm[2].trim();
+      console.log(`[group-cmd] פקודה מהקבוצה: "${_gName}" | "${_gCmd.slice(0, 40)}"`);
+      runAutofitBiz(_gName, '', _gCmd, { nameOverride: _gName, allowFuzzy: true });
+      return;
+    }
+  }
+
+  // 🔴 חוק ברזל: לעולם לא לבלוע תגובת-בחירה בשקט. אם דני שולח "1"/"בחר N"/"הכל"/"עוד"
+  // ואין שאלה פתוחה (פג תוקף 10 דק׳ / הבוט אותחל / כבר ענה) — להגיד לו, לא להתעלם.
+  const _isChoiceSignal = /^(?:בחר\s+)?\d+$/.test(text.trim()) ||
+    ['הכל','הכול','כולן','כולם','שניהם','שתיהן','עוד','הצג עוד'].includes(text.trim());
+  const _pendingStale = bizPending && (Date.now() - bizPending.timestamp > BIZ_PENDING_TTL);
+  if (!bizPending || _pendingStale) {
+    if (bizPending) bizPending = null;
+    if (_isChoiceSignal) {
+      await sendBizMessage(BIZ_GROUP,
+        '❓ אין לי שאלה פתוחה כרגע (אולי עברו 10 דק׳ מאז השאלה, או שהבוט אותחל). ' +
+        'שלח שוב את הפקודה המקורית ואטפל בה.');
+    }
     return;
   }
   // תגובה בתיוג (reply): ה-stanzaId מצביע על ההודעה שצוטטה. אם היא מתייגת *שאלה אחרת*
@@ -1470,17 +2110,35 @@ async function processBizBody(body) {
   }
 
   const msg = body.messageData;
+
+  // ── תפיסת הקלטה קולית נכנסת מלקוח ──
+  // וואטסאפ שומר את המדיה רק דקות ספורות. downloadFile עובד רק כשהמדיה טרייה → קוראים אותו
+  // *מיד* כשההקלטה מגיעה (ה-downloadUrl שנוצר תקף לשעות) ושומרים ל-cache לתמלול מאוחר בתיוג "שומע".
+  // חייב לרוץ לפני סינון QUOTED_TYPES (audioMessage לא ביניהם). שאר הודעות הלקוח ממשיכות ליפול בהמשך.
+  if (body.typeWebhook === 'incomingMessageReceived' && msg?.typeMessage === 'audioMessage') {
+    markBizActivity(); // הקלטה נכנסת מלקוח = הקו מסתנכרן
+    if (msgId && BIZ_BASE && BIZ_TOKEN) {
+      const vChatId = body.senderData?.chatId || '';
+      const vName = body.senderData?.chatName || (body.senderData?.sender || '').replace('@c.us', '');
+      cacheVoiceNow(vChatId, msgId, vName);  // async — לא חוסם את ה-webhook
+    }
+    return;
+  }
+
   if (!msg || !QUOTED_TYPES.includes(msg.typeMessage)) return;
   const { text: _bizRaw, quotedId: _bizQuoted } = extractMsgText(msg);
   const text = normalizeBizText(_bizRaw);
   if (!text) return;
+  markBizActivity(); // הודעת תוכן אמיתית (דני יוצא / לקוח נכנס) = הקו מסתנכרן
 
   const chatId = body.senderData?.chatId || '';
   console.log(`[biz] type=${body.typeWebhook} chatId=${chatId}${_bizQuoted ? ' ↩תיוג' : ''} text="${text.slice(0,40)}"`);
 
-  // תגובות דני בקבוצה
+  // תגובות דני בקבוצה — דני עונה לפעמים מהמספר העסקי (outgoing) ולפעמים מהאישי
+  // (incoming, כי הוא משתתף אחר בקבוצה). חייבים לטפל בשניהם, אחרת "1" מהאישי נבלע
+  // והבוט לא מבצע את הבחירה. הודעות הבוט עצמו כבר סוננו ע"י bizBotSentIds בראש הפונקציה.
   if (chatId === BIZ_GROUP || chatId.replace('@g.us','') === (BIZ_GROUP || '').replace('@g.us','')) {
-    if (body.typeWebhook === 'outgoingMessageReceived') {
+    if (body.typeWebhook === 'outgoingMessageReceived' || body.typeWebhook === 'incomingMessageReceived') {
       await handleBizGroupResponse(text, _bizQuoted);
     }
     return;
@@ -1489,6 +2147,15 @@ async function processBizBody(body) {
   // שיחות 1-on-1 — רק הודעות יוצאות
   if (body.typeWebhook !== 'outgoingMessageReceived') return;
   if (chatId.includes('@g.us')) return;
+
+  // ── תמלול הקלטה: דני/רון עשו "השב" על הקלטה של לקוח + כתבו מילת קוד ──
+  // רק תיוג+מילת קוד מפעיל. "שומע" סתם בשיחה (בלי תיוג) ממשיך כרגיל ולא מפריע.
+  const _owner = parseTranscribeCommand(text);
+  if (_owner && _bizQuoted) {
+    console.log(`[biz] תמלול (${_owner}): chatId=${chatId} quoted=${_bizQuoted}`);
+    await handleTranscribeCommand(chatId, _bizQuoted, _owner);
+    return;
+  }
 
   const BIZ_TEST_PHONE = process.env.BIZ_TEST_PHONE;
   if (BIZ_TEST_PHONE) {
@@ -1517,15 +2184,24 @@ async function processBizBody(body) {
 
 // ─── BIZ Polling loop — lastOutgoingMessages ──────────────────
 const BIZ_WATERMARK_FILE = require('path').join(DATA_DIR, 'biz_watermark.json');
+// חלון לאחור (שניות): GreenAPI מחזיר לפעמים הודעות באיחור/לא-לפי-סדר (במיוחד תיוגים
+// וברסטים שנשלחו באותה דקה). watermark נוקשה לפי זמן חתך אותן בשקט (לפני כל לוג).
+// לכן בודקים גם הודעות עד GRACE שניות *לפני* ה-watermark, והדה-דופ האמיתי הוא לפי idMessage.
+const BIZ_POLL_GRACE = 300;
 async function bizPollLoop() {
   const nowTs = Math.floor(Date.now() / 1000);
   let lastTs = nowTs;
-  // שחזר watermark מקובץ — שלא לאבד הודעות שנשלחו בזמן restart (עד 10 דק אחורה)
+  // seenIds: idMessage → timestamp. דה-דופ אמיתי (לא לפי זמן) — שורד מחזורים ו-restart דרך הקובץ.
+  const seenIds = new Map();
+  // שחזר watermark + ids מקובץ — שלא לאבד הודעות שנשלחו בזמן restart, וגם שלא לכפול אותן (עד 10 דק אחורה)
   try {
     const saved = JSON.parse(require('fs').readFileSync(BIZ_WATERMARK_FILE, 'utf8'));
     if (saved && saved.ts && (nowTs - saved.ts) < 600) {
       lastTs = saved.ts;
-      console.log('[biz-poll] ✅ watermark שוחזר מקובץ (' + (nowTs - saved.ts) + 's אחורה — לא מאבד הודעות restart)');
+      if (saved.ids && typeof saved.ids === 'object') {
+        for (const [id, ts] of Object.entries(saved.ids)) seenIds.set(id, ts);
+      }
+      console.log('[biz-poll] ✅ watermark שוחזר מקובץ (' + (nowTs - saved.ts) + 's אחורה, ' + seenIds.size + ' ids ידועים — לא מאבד ולא מכפיל הודעות restart)');
     }
   } catch (e) { /* אין קובץ — התחלה רגילה */ }
   console.log('[biz-poll] starting, watermark=', new Date(lastTs * 1000).toISOString());
@@ -1536,11 +2212,18 @@ async function bizPollLoop() {
       if (!resp.ok) continue;
       const msgs = await resp.json();
       if (!Array.isArray(msgs)) continue;
+      const cycleNow = Math.floor(Date.now() / 1000);
+      const cutoff = lastTs - BIZ_POLL_GRACE;  // חלון: עד GRACE שניות לפני ה-watermark
       let maxTs = lastTs;
-      for (const msg of msgs) {
-        if (!msg.timestamp || msg.timestamp <= lastTs) continue;
+      // עבד בסדר זמן עולה — פקודות/בחירות (1/2/...) חייבות לרוץ כרונולוגית
+      const ordered = msgs.filter(m => m.timestamp).sort((a, b) => a.timestamp - b.timestamp);
+      for (const msg of ordered) {
+        if (msg.timestamp <= cutoff) continue;                       // ישן מהחלון
+        if (msg.idMessage && seenIds.has(msg.idMessage)) continue;   // כבר עובד (דה-דופ לפי id, לא לפי זמן)
         maxTs = Math.max(maxTs, msg.timestamp);
         const text = msg.textMessage || msg.extendedTextMessage?.text || '';
+        // סמן כנראה עוד לפני העיבוד — גם הודעה ריקה/לא-פקודה לא תיסרק שוב בכל מחזור
+        if (msg.idMessage) seenIds.set(msg.idMessage, msg.timestamp);
         if (!text) continue;
         bizDebugLog.push({ ts: Date.now(), body: msg });
         if (bizDebugLog.length > 30) bizDebugLog.shift();
@@ -1552,7 +2235,10 @@ async function bizPollLoop() {
         });
       }
       lastTs = maxTs;
-      try { require('fs').writeFileSync(BIZ_WATERMARK_FILE, JSON.stringify({ ts: lastTs })); } catch (e) {}
+      // גזום ids ישנים מחוץ לחלון השחזור (10 דק) — שהמפה לא תגדל בלי גבול
+      const pruneBefore = cycleNow - 600;
+      for (const [id, ts] of seenIds) { if (ts < pruneBefore) seenIds.delete(id); }
+      try { require('fs').writeFileSync(BIZ_WATERMARK_FILE, JSON.stringify({ ts: lastTs, ids: Object.fromEntries(seenIds) })); } catch (e) {}
     } catch (e) {
       console.error('[biz-poll error]', e.message);
     }
@@ -1567,6 +2253,8 @@ app.post('/webhook-biz', async (req, res) => {
   res.sendStatus(200);
   const body = req.body;
   if (!body || !body.typeWebhook) return;
+  // תמונות מקבוצת ההמלצות (הקו העסקי חבר בקבוצה) → Drive
+  if (tryHandleRecsImage(body)) return;
   // עבד רק הודעות *יוצאות* (דני מקליד בטלפון). incoming מהלקוח / state / status —
   // מועברים עם הסוג המקורי כדי ש-processBizBody יסנן אותם (הגנה מעיבוד הודעת לקוח כפקודה)
   const tw = body.typeWebhook;
@@ -1584,6 +2272,17 @@ app.get('/debug-v3', (_, res) => {
   res.json({ count: v3Log.length, log: v3Log.slice(-20).reverse() });
 });
 
+// ─── Debug prefs (לאבחון זיכרון בחירות — פרכיות וכו') ───────────
+app.get('/debug-prefs', (_, res) => {
+  res.json({
+    prefs_file: PREFS_FILE,
+    data_dir_is_volume: PREFS_FILE.startsWith('/data'),
+    food: [...foodPrefs.entries()],
+    hint: [...hintPrefs.entries()],
+    name_count: namePrefs.size,
+  });
+});
+
 // ─── Debug env ────────────────────────────────────────────────
 app.get('/debug-env', (_, res) => {
   res.json({
@@ -1591,6 +2290,8 @@ app.get('/debug-env', (_, res) => {
     BIZ_TEST_PHONE: process.env.BIZ_TEST_PHONE || 'NOT SET',
     BIZ_ID: process.env.GREEN_API_ID_BIZ || 'NOT SET',
     REG_ID: process.env.GREEN_API_ID || 'SET',
+    TRANSCRIBE_TRIGGERS: TRANSCRIBE_TRIGGERS.join(', '),  // מילות הקוד הפעילות
+    GROQ: GROQ_API_KEY ? 'SET' : 'NOT SET',   // האם מפתח התמלול מחובר
   });
 });
 
@@ -1605,9 +2306,172 @@ app.get('/debug-biz', (_, res) => {
   res.json({ count: bizDebugLog.length, last10: entries });
 });
 
+// ─── Debug ניטור סנכרון — אירועי gap היסטוריים ─────────────────
+app.get('/debug-gaps', (_, res) => {
+  const silentMin = Math.round((Date.now() - lastBizMsgAt) / 60000);
+  res.json({
+    last_activity: israelStamp(lastBizMsgAt),
+    silent_now_min: silentMin,
+    alert_sent: syncAlertSent,
+    alert_threshold_min: SYNC_ALERT_MIN,
+    active_hours: `${SYNC_ACTIVE_FROM}-${SYNC_ACTIVE_TO}`,
+    gaps_count: syncGaps.length,
+    gaps: syncGaps.slice(-30).reverse().map(g => ({
+      from: israelStamp(g.from), to: israelStamp(g.to), minutes: g.minutes
+    })),
+  });
+});
+
+// ─── Debug תמונות → Drive ──────────────────────────────────────
+app.get('/debug-recs', (_, res) => {
+  res.json({
+    drive_ready: DRIVE_READY,
+    target_folder_id: _recsFolderId || DRIVE_FOLDER_ID || '(ייקבע בתמונה הראשונה)',
+    target_folder_url: _recsFolderId ? `https://drive.google.com/drive/folders/${_recsFolderId}` : null,
+    group_chat_id: RECS_GROUP_CHAT_ID || `(לא הוגדר — זיהוי לפי שם מכיל "${RECS_GROUP_NAME}")`,
+    folder_name_if_created: RECS_FOLDER_NAME,
+    recent: recsLog.slice(-15).reverse().map(e => ({ ago: Math.round((Date.now() - e.ts) / 1000) + 's', ...e })),
+  });
+});
+
 // ─── Health check ─────────────────────────────────────────────
 app.get('/', (_, res) => res.send('✅ v2 autofit bot running'));
 app.get('/test', (req, res) => { const {spawn}=require('child_process'); const p=spawn('python3',[require('path').join(__dirname,'autofit_api.py'),'שם: רון וליצקו\nארוחה: ערב\nהוספה: טונה ל חזה עוף מבושל']); let o=''; p.stdout.on('data',d=>{o+=d}); p.on('close',()=>res.send(o)); });
+
+// ─── ניטור שינויים בחשבון מודעות פייסבוק ───────────────────────
+// לולאה עצמאית: קוראת את יומן הפעילות של החשבון כל 3 דק', ושולחת לדני
+// התראת וואטסאפ על כל שינוי קונפיגורציה (מכל גורם), חוץ מרעש מערכת.
+// מותנה ב-FB_ADS_TOKEN — בלי טוקן לא רצה כלל (אפס השפעה על שאר הבוט).
+const FB_WM_FILE = path.join(DATA_DIR, 'fb_ads_watermark.json');
+function fbFmtChange(extra) {
+  try {
+    const d = typeof extra === 'string' ? JSON.parse(extra || '{}') : (extra || {});
+    const has = k => Object.prototype.hasOwnProperty.call(d, k);
+    const f = v => (v == null || v === '') ? '∅' : ('' + v).slice(0, 45);
+    if (has('old_value') && has('new_value')) return `מ־${f(d.old_value)} ל־${f(d.new_value)}`;
+    if (has('new_value')) return f(d.new_value);
+    return '';
+  } catch (e) { return ''; }
+}
+// תווית ברורה בעברית של *מה* שונה (אתר/תקציב/מודעה/פילוח/סטטוס...)
+function fbChangeLabel(e) {
+  const et = (e.event_type || '');
+  const ex = (e.extra_data || '') + '';
+  if (/creative/.test(et)) {
+    const urls = ex.match(/https?:\/\/[^"\\ ]+/g) || [];
+    const ext = urls.find(u => !/fbcdn|scontent|facebook\.com|fb\.me/.test(u));
+    if (ext) return 'אתר/קישור 🔗';
+    return 'מודעה (קריאייטיב) 🖼️';
+  }
+  if (/budget/.test(et)) return 'תקציב 💰';
+  if (/run_status/.test(et)) {
+    if (/פעיל|ACTIVE/i.test(ex) && !/לא פעיל/.test(ex)) return 'סטטוס → הופעל ▶️';
+    if (/הושה|PAUSED|לא פעיל|מושה/i.test(ex)) return 'סטטוס → הושהה ⏸️';
+    return 'סטטוס (הפעלה/השהיה)';
+  }
+  if (/target/.test(et)) return 'פילוח/קהל 🎯';
+  if (/optimization_goal/.test(et)) return 'יעד מיטוב';
+  if (/bid_strategy/.test(et)) return 'אסטרטגיית הצעת מחיר';
+  if (/_name/.test(et)) return 'שם ✏️';
+  if (/^create_campaign/.test(et)) return 'קמפיין חדש ➕';
+  if (/^create_ad_set/.test(et)) return 'סדרת מודעות חדשה ➕';
+  if (/^create_ad/.test(et)) return 'מודעה חדשה ➕';
+  if (/^create_audience/.test(et)) return 'קהל חדש ➕';
+  if (/^delete/.test(et)) return 'נמחק 🗑️';
+  if (/audience/.test(et)) return 'קהל';
+  return e.translated_event_type || et; // ברירת מחדל — תרגום פייסבוק
+}
+async function fbAdsActivityPoll() {
+  if (!FB_ADS_TOKEN) { console.log('[fb-ads] FB_ADS_TOKEN לא מוגדר — ניטור שינויים כבוי'); return; }
+  let since;
+  try { since = JSON.parse(fs.readFileSync(FB_WM_FILE, 'utf8')).since; }
+  catch (e) { since = Math.floor(Date.now() / 1000); try { fs.writeFileSync(FB_WM_FILE, JSON.stringify({ since })); } catch (_) {} }
+  console.log('[fb-ads] ✅ ניטור שינויים פעיל, מ-', new Date(since * 1000).toISOString());
+  while (true) {
+    await new Promise(r => setTimeout(r, 180000)); // כל 3 דקות
+    try {
+      const url = `https://graph.facebook.com/v19.0/act_${FB_AD_ACCOUNT}/activities?fields=event_time,event_type,translated_event_type,actor_name,object_name,extra_data&since=${since}&limit=100&access_token=${FB_ADS_TOKEN}`;
+      const res = await fetch(url);
+      const j = await res.json();
+      if (j.error) {
+        console.error('[fb-ads] שגיאת API:', j.error.message);
+        if (j.error.code === 190) console.error('[fb-ads] ⚠️ הטוקן פג/לא תקף — צריך לחדש את FB_ADS_TOKEN');
+        continue;
+      }
+      const evs = (j.data || [])
+        .filter(e => !FB_NOISE_EVENTS.has(e.event_type))
+        .sort((a, b) => new Date(a.event_time) - new Date(b.event_time));
+      let maxTs = since;
+      for (const e of evs) {
+        const ts = Math.floor(new Date(e.event_time).getTime() / 1000);
+        if (ts <= since) continue;
+        maxTs = Math.max(maxTs, ts);
+        const t = new Date(e.event_time).toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+        const change = fbFmtChange(e.extra_data);
+        const label = fbChangeLabel(e);
+        let msg = `🔔 *שינוי בקמפיינים*\n👤 ${e.actor_name || '?'} | ${t}\n📌 שונה: ${label}${e.object_name ? ' — ' + e.object_name : ''}`;
+        if (change) msg += `\n📝 ${change}`;
+        await sendMessage(FB_ALERT_PHONE, msg);
+        await new Promise(r => setTimeout(r, 500)); // throttle שליחה
+      }
+      since = maxTs;
+      try { fs.writeFileSync(FB_WM_FILE, JSON.stringify({ since })); } catch (_) {}
+    } catch (e) { console.error('[fb-ads] EXCEPTION:', e.message); }
+  }
+}
+
+// ─── ניטור לידים חדשים מטפסי פייסבוק → התראת וואטסאפ לדני ───────
+// כל 2 דק' שולף לידים חדשים מכל הטפסים של העמוד ושולח שם+טלפון+קמפיין.
+// מותנה ב-FB_ADS_TOKEN (שצריך גם הרשאת leads_retrieval).
+const FB_LEADS_WM_FILE = path.join(DATA_DIR, 'fb_leads_watermark.json');
+function fbLeadField(fd, keys) {
+  for (const f of (fd || [])) {
+    const n = (f.name || '').toLowerCase();
+    if (keys.some(k => n.includes(k))) return (f.values && f.values[0]) || '';
+  }
+  return '';
+}
+async function fbLeadsPoll() {
+  if (!FB_LEADS_TOKEN) { console.log('[fb-leads] FB_LEADS_TOKEN לא מוגדר — ניטור לידים כבוי (צריך leads_retrieval+טוקן עמוד)'); return; }
+  let since;
+  try { since = JSON.parse(fs.readFileSync(FB_LEADS_WM_FILE, 'utf8')).since; }
+  catch (e) { since = Math.floor(Date.now() / 1000); try { fs.writeFileSync(FB_LEADS_WM_FILE, JSON.stringify({ since })); } catch (_) {} }
+  let forms = [], formsAt = 0;
+  console.log('[fb-leads] ✅ ניטור לידים פעיל, מ-', new Date(since * 1000).toISOString());
+  while (true) {
+    await new Promise(r => setTimeout(r, 120000)); // כל 2 דקות
+    try {
+      if (Date.now() - formsAt > 3600000) { // רענון רשימת הטפסים כל שעה
+        const fr = await fetch(`https://graph.facebook.com/v19.0/${FB_PAGE_ID}/leadgen_forms?fields=id,name&limit=200&access_token=${FB_LEADS_TOKEN}`);
+        const fj = await fr.json();
+        if (fj.error) { console.error('[fb-leads] טפסים:', fj.error.message); }
+        else { forms = (fj.data || []).map(f => ({ id: f.id, name: f.name })); formsAt = Date.now(); console.log(`[fb-leads] ${forms.length} טפסים`); }
+      }
+      let maxTs = since;
+      for (const form of forms) {
+        const lu = `https://graph.facebook.com/v19.0/${form.id}/leads?fields=created_time,field_data,campaign_name,ad_name&filtering=[{"field":"time_created","operator":"GREATER_THAN","value":${since}}]&limit=50&access_token=${FB_LEADS_TOKEN}`;
+        const lr = await fetch(lu);
+        const lj = await lr.json();
+        if (lj.error) continue;
+        const leads = (lj.data || []).sort((a, b) => new Date(a.created_time) - new Date(b.created_time));
+        for (const ld of leads) {
+          const ts = Math.floor(new Date(ld.created_time).getTime() / 1000);
+          if (ts <= since) continue;
+          maxTs = Math.max(maxTs, ts);
+          const name = fbLeadField(ld.field_data, ['full_name', 'name', 'שם']) || '—';
+          const phone = fbLeadField(ld.field_data, ['phone', 'טלפון', 'מספר']) || '—';
+          const t = new Date(ld.created_time).toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+          let msg = `🟢 *ליד חדש!*\n👤 ${name}\n📞 ${phone}\n🕐 ${t}`;
+          if (ld.campaign_name) msg += `\n📣 ${ld.campaign_name}`;
+          await sendMessage(FB_ALERT_PHONE, msg);
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+      since = maxTs;
+      try { fs.writeFileSync(FB_LEADS_WM_FILE, JSON.stringify({ since })); } catch (_) {}
+    } catch (e) { console.error('[fb-leads] EXCEPTION:', e.message); }
+  }
+}
 
 // ─── הפעל שרת + הגדר webhook ──────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -1653,7 +2517,7 @@ app.listen(PORT, async () => {
             webhookUrlToken: '',
             outgoingMessageWebhook: 'yes',   // דני מקליד בטלפון → מגיע מיד
             outgoingAPIMessageWebhook: 'no',
-            incomingWebhook: 'no',           // לא לעבד הודעות לקוח כפקודה
+            incomingWebhook: 'yes',          // הקלטות נכנסות מלקוחות → תפיסת downloadUrl לתמלול. שאר הודעות הלקוח נזרקות ב-processBizBody
             stateWebhook: 'no',
             pollMessageWebhook: 'no',
           }),
@@ -1671,5 +2535,11 @@ app.listen(PORT, async () => {
   if (BIZ_BASE && BIZ_TOKEN) {
     console.log('✅ BIZ polling started (instance', BIZ_ID, ')');
     bizPollLoop(); // לולאה אסינכרונית — לא חוסמת
+    bizSyncMonitorLoop(); // ניטור סנכרון — מתריע אם הקו העסקי מנותק
+    bizKeepaliveLoop(); // keepalive — מונע ניתוק session כל 40 דקות
   }
+
+  // ── ניטור שינויים בחשבון מודעות פייסבוק (מותנה ב-FB_ADS_TOKEN) ──
+  fbAdsActivityPoll(); // לולאה עצמאית — try/catch פנימי, לא משפיעה על שאר הבוט
+  fbLeadsPoll();       // ניטור לידים חדשים → התראת וואטסאפ
 });
