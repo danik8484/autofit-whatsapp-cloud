@@ -94,7 +94,10 @@ loadPrefs();
 // ─── שליחת הודעה (עם retry — שלא לאבד קבלות בגלל rate-limit/5xx) ──
 async function sendMessage(phone, text) {
   const chatId = phone.includes('@') ? phone : `${phone}@c.us`;
-  const body = JSON.stringify({ chatId, message: text });
+  // 🤖 07-05 (ביקורת TheDani): תו-זיהוי בלתי-נראה (U+2060) בתחילת כל הודעת-אוטופיט —
+  // שני הבוטים על אותו קו, ו-TheDani מוחק כרטיסים כשהוא רואה "דני ענה"; התו מסמן לו
+  // שההודעה היוצאת היא של אוטופיט ולא של דני. ללקוח התו בלתי-נראה לחלוטין.
+  const body = JSON.stringify({ chatId, message: '⁠' + text });
   // עד 4 ניסיונות: כשל זמני (429 rate-limit / 5xx / רשת) → המתן ונסה שוב
   const delays = [800, 2000, 4000];
   for (let attempt = 0; attempt <= delays.length; attempt++) {
@@ -407,7 +410,17 @@ app.post('/webhook', async (req, res) => {
     } else if (hasExerciseTrigger(outText)) {
       runExerciseSwapBiz(outName, outPhone, outText, { nameOverride: outPhone });
     } else {
-      runAutofitBiz(outName, outPhone, outText, { nameOverride: outPhone });
+      // הודעה עם כמה הוספות (כל אחת בשורה) → הרץ כל אחת בנפרד עם ה-timeout שלה,
+      // במרווח של 4 שניות, כדי לא לחנוק את כולן ביחד ולא להעמיס על ה-API.
+      const bizCmds = splitBizCommands(outText);
+      if (bizCmds.length > 1) {
+        console.log(`[v3] פוצל ל-${bizCmds.length} פקודות נפרדות`);
+        bizCmds.forEach((cmd, i) => {
+          setTimeout(() => runAutofitBiz(outName, outPhone, cmd, { nameOverride: outPhone }), i * 4000);
+        });
+      } else {
+        runAutofitBiz(outName, outPhone, outText, { nameOverride: outPhone });
+      }
     }
     return;
   }
@@ -1096,6 +1109,28 @@ function anchorToCommand(text) {
   const mealM = preamble.match(/(?:^|\s)ב?(בוקר|צהריים|צהרים|ערב|לילה|ביניים)(?=$|\s)/);
   if (mealM && !new RegExp(mealM[1]).test(anchored)) anchored = 'ב' + mealM[1] + ' ' + anchored;
   return anchored;
+}
+
+// ─── פיצול הודעה מרובת-הוספות לפקודות נפרדות ─────────────────────
+// דני שולח לעיתים כמה הוראות בהודעה אחת, כל אחת בשורה:
+//   "אני מוסיף לך אבקת חלבון...\nאני מוסיף לך פקאנים...\n..."
+// עד כה כל ההודעה רצה כתהליך אחד ונחנקה ב-timeout של 30 שניות.
+// כאן מפצלים לפי שורות: כל שורה שמתחילה במילת-טריגר = פקודה נפרדת;
+// שורה בלי טריגר בתחילתה = המשך של הפקודה הקודמת (לא חותכים באמצע משפט).
+// פועל-פתיחה בתחילת שורה גם כשחסר "לך" ("אני מוסיף מעדן..." — דני משמיט לעיתים).
+const _CMD_VERB_START = /^(?:מוסיף|תוסיף|אוסיף|נוסיף|מעלה|תעלה|מוריד|תוריד|מפחית|מחליף|תחליף|משנה|מכניס|תכניס)(?=\s|$)/;
+function splitBizCommands(text) {
+  const lines = String(text || '').split('\n');
+  const cmds = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    const body = t.replace(/^אני\s+/, '');
+    const startsTrigger = TRIGGER_WORDS.some(w => body.startsWith(w)) || _CMD_VERB_START.test(body) || PAST_CMD.test(body);
+    if (startsTrigger || cmds.length === 0) cmds.push(t);
+    else cmds[cmds.length - 1] += ' ' + t;  // צירוף שורת-המשך לפקודה הקודמת
+  }
+  return cmds.length ? cmds : [text];
 }
 
 function parseExerciseSwap(text) {
