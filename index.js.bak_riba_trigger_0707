@@ -1066,19 +1066,12 @@ function extractMsgText(msg) {
 function _triggerBoundaryOK(text, idx) {
   return idx === 0 || !/[א-ת]/.test(text[idx - 1]) || text[idx - 1] === 'ו';
 }
-// עתיד ("אוסיף לך"/"נוסיף לך" = "אני אתן לך בעתיד") = פקודה *רק כשיש מספר אחריו* — כמו עבר.
-// בלי מספר זו שיחה רגילה ("ברגע שתסיים תגיד לי ואני אוסיף לך אירובי סיום") ואסור לתפוס אותה כפקודה.
-// נשאר ב-TRIGGER_WORDS כדי שפקודת-עתיד אמיתית עם מספר ("אוסיף לך 50 גרם ריבה") עדיין תיעגן ותפוצל.
-const _FUTURE_TRIGGERS = new Set(['אוסיף לך', 'נוסיף לך']);
 function hasTriggerWord(text) {
   if (PAST_CMD.test(text)) return true;  // "הורדתי לך 30 גרם" וכו'
   return TRIGGER_WORDS.some(w => {
     let idx = -1;
     while ((idx = text.indexOf(w, idx + 1)) !== -1) {
-      if (!_triggerBoundaryOK(text, idx)) continue;
-      // עתיד בלי מספר בהמשך = שיחה, לא פקודה
-      if (_FUTURE_TRIGGERS.has(w) && !/\d/.test(text.slice(idx + w.length, idx + w.length + 40))) continue;
-      return true;
+      if (_triggerBoundaryOK(text, idx)) return true;
     }
     return false;
   });

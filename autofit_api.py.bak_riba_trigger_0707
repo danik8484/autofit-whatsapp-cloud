@@ -787,19 +787,6 @@ def find_best_food(query: str, coach_id: str = "", _depth: int = 0):
         best_a, alts_a = find_best_food(alias, coach_id, _depth + 1)
         if best_a:
             return best_a, alts_a
-    # "ריבה" + תיאור שאינו וריאציה אמיתית במאגר ("ריבה טבעית"/"ריבה ביתית") → ברירת המחדל
-    # של דני ("ריבה" → מעדן ארבעה פירות סאנט דלפור). הווריאציות האמיתיות ("ריבה דלה",
-    # "ריבה פירות יער לייט") מזוהות בחיפוש רגיל ונשמרות; רק צירוף בלי התאמה נופל לברירת המחדל.
-    # בודקים מול הטקסט המדויק שדני כתב (לא אחרי נרמול — הנרמול חותך "לייט"→"ייט" ושובר שכן).
-    _rq = query.strip()
-    _rw = _rq.split()
-    if len(_rw) > 1 and _rw[0] == "ריבה":
-        _rc = _canon_cook(_rq.lower())
-        _rfoods = search_food(_rq, coach_id)
-        if not any(_canon_cook(f.get("food_name", "").lower()).startswith(_rc) for f in _rfoods):
-            _rb, _ra = find_best_food("ריבה", coach_id, _depth + 1)
-            if _rb:
-                return _rb, _ra
     norm_query = normalize_food_query(query)
     foods = search_food(norm_query, coach_id)
     if not foods and norm_query != query:

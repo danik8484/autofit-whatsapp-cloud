@@ -1066,19 +1066,12 @@ function extractMsgText(msg) {
 function _triggerBoundaryOK(text, idx) {
   return idx === 0 || !/[א-ת]/.test(text[idx - 1]) || text[idx - 1] === 'ו';
 }
-// עתיד ("אוסיף לך"/"נוסיף לך" = "אני אתן לך בעתיד") = פקודה *רק כשיש מספר אחריו* — כמו עבר.
-// בלי מספר זו שיחה רגילה ("ברגע שתסיים תגיד לי ואני אוסיף לך אירובי סיום") ואסור לתפוס אותה כפקודה.
-// נשאר ב-TRIGGER_WORDS כדי שפקודת-עתיד אמיתית עם מספר ("אוסיף לך 50 גרם ריבה") עדיין תיעגן ותפוצל.
-const _FUTURE_TRIGGERS = new Set(['אוסיף לך', 'נוסיף לך']);
 function hasTriggerWord(text) {
   if (PAST_CMD.test(text)) return true;  // "הורדתי לך 30 גרם" וכו'
   return TRIGGER_WORDS.some(w => {
     let idx = -1;
     while ((idx = text.indexOf(w, idx + 1)) !== -1) {
-      if (!_triggerBoundaryOK(text, idx)) continue;
-      // עתיד בלי מספר בהמשך = שיחה, לא פקודה
-      if (_FUTURE_TRIGGERS.has(w) && !/\d/.test(text.slice(idx + w.length, idx + w.length + 40))) continue;
-      return true;
+      if (_triggerBoundaryOK(text, idx)) return true;
     }
     return false;
   });
@@ -1559,11 +1552,10 @@ async function downloadFileRetry(chatId, idMessage, { tries = 40, delayMs = 1500
   return null;
 }
 
-async function cacheVoiceNow(chatId, idMessage, name, directUrl) {
+async function cacheVoiceNow(chatId, idMessage, name) {
   // retry ממושך: גם אם Green API בתקלה זמנית כשההקלטה נכנסת, נמשיך לנסות ברקע עד
   // שנתפוס — כך שכשדני יתייג מאוחר יותר, ה-downloadUrl כבר יהיה ב-cache והתמלול מיידי.
-  // 🌉 גשר-Baileys: ה-downloadUrl כבר מגיע ברשומה (directUrl) — משתמשים בו ישירות (אין downloadFile בגשר).
-  const url = directUrl || await downloadFileRetry(chatId, idMessage, { label: '(נכנס)' });
+  const url = await downloadFileRetry(chatId, idMessage, { label: '(נכנס)' });
   if (!url) return;
   voiceCache.set(idMessage, { downloadUrl: url, mimeType: 'audio/ogg', chatId, name, ts: Date.now() });
   console.log(`[transcribe] 🎙️ downloadUrl נתפס ל-cache: ${idMessage}`);
@@ -2168,7 +2160,7 @@ async function processBizBody(body) {
     if (msgId && BIZ_BASE && BIZ_TOKEN) {
       const vChatId = body.senderData?.chatId || '';
       const vName = body.senderData?.chatName || (body.senderData?.sender || '').replace('@c.us', '');
-      cacheVoiceNow(vChatId, msgId, vName, body.downloadUrl);  // downloadUrl מהגשר (אם קיים) → תמלול בלי downloadFile
+      cacheVoiceNow(vChatId, msgId, vName);  // async — לא חוסם את ה-webhook
     }
     return;
   }
@@ -2289,69 +2281,6 @@ async function bizPollLoop() {
       try { require('fs').writeFileSync(BIZ_WATERMARK_FILE, JSON.stringify({ ts: lastTs, ids: Object.fromEntries(seenIds) })); } catch (e) {}
     } catch (e) {
       console.error('[biz-poll error]', e.message);
-    }
-  }
-}
-
-// ─── BIZ Incoming Polling loop — lastIncomingMessages (הקלטות + תמונות-קבוצה מלקוחות) ──
-// 🌉 07-07: נפרד לגמרי מ-bizPollLoop (הפקודות) — כשל כאן לא נוגע בקליטת הפקודות.
-//   מחזיר לזרם את ההודעות-הנכנסות שהגיעו דרך /webhook-biz לפני המעבר לגשר:
-//   audioMessage → תמלול (cacheVoiceNow), imageMessage בקבוצת-המלצות → Drive (tryHandleRecsImage).
-//   רץ רק כשהקו העסקי על הגשר (WA_HOST) — בגרין-אפי incoming הגיע ב-webhook.
-const BIZ_IN_WATERMARK_FILE = require('path').join(DATA_DIR, 'biz_in_watermark.json');
-async function bizIncomingPollLoop() {
-  if (!WA_HOST || !BIZ_BASE || !BIZ_TOKEN) return;
-  const nowTs = Math.floor(Date.now() / 1000);
-  let lastTs = nowTs;
-  const seenIds = new Map();
-  try {
-    const saved = JSON.parse(require('fs').readFileSync(BIZ_IN_WATERMARK_FILE, 'utf8'));
-    if (saved && saved.ts && (nowTs - saved.ts) < 600) {
-      lastTs = saved.ts;
-      if (saved.ids && typeof saved.ids === 'object') for (const [id, ts] of Object.entries(saved.ids)) seenIds.set(id, ts);
-    }
-  } catch (e) { /* אין קובץ — התחלה רגילה */ }
-  console.log('[biz-in-poll] starting, watermark=', new Date(lastTs * 1000).toISOString());
-  while (true) {
-    await new Promise(r => setTimeout(r, 10000)); // כל 10 שניות
-    try {
-      const resp = await fetch(`${BIZ_BASE}/lastIncomingMessages/${BIZ_TOKEN}`);
-      if (!resp.ok) continue;
-      const msgs = await resp.json();
-      if (!Array.isArray(msgs)) continue;
-      const cycleNow = Math.floor(Date.now() / 1000);
-      const cutoff = lastTs - BIZ_POLL_GRACE;
-      let maxTs = lastTs;
-      const ordered = msgs.filter(m => m.timestamp).sort((a, b) => a.timestamp - b.timestamp);
-      for (const msg of ordered) {
-        if (msg.timestamp <= cutoff) continue;
-        if (msg.idMessage && seenIds.has(msg.idMessage)) continue;
-        maxTs = Math.max(maxTs, msg.timestamp);
-        if (msg.idMessage) seenIds.set(msg.idMessage, msg.timestamp);
-        const tm = msg.typeMessage || '';
-        // רק סוגים שאוטופיט מטפל בהם נכנסים — הקלטה (תמלול) / תמונה (קבוצת-המלצות). השאר מיותר.
-        if (tm !== 'audioMessage' && tm !== 'imageMessage') continue;
-        // קבוצה: _rjid שומר את ה-@g.us המקורי (הגשר ממיר chatId ל-@c.us). tryHandleRecsImage דורש @g.us.
-        const rjid = msg._rjid || '';
-        const chatId = rjid.endsWith('@g.us') ? rjid : (msg.chatId || '');
-        const messageData = (tm === 'imageMessage')
-          ? { typeMessage: 'imageMessage', fileMessageData: { downloadUrl: msg.downloadUrl || '', caption: msg.textMessage || '' } }
-          : { typeMessage: 'audioMessage' };
-        await processBizBody({
-          typeWebhook: 'incomingMessageReceived',
-          idMessage: msg.idMessage,
-          senderData: { chatId, chatName: '', sender: msg.chatId || '' },
-          messageData,
-          timestamp: msg.timestamp,
-          downloadUrl: msg.downloadUrl || '',
-        });
-      }
-      lastTs = maxTs;
-      const pruneBefore = cycleNow - 600;
-      for (const [id, ts] of seenIds) { if (ts < pruneBefore) seenIds.delete(id); }
-      try { require('fs').writeFileSync(BIZ_IN_WATERMARK_FILE, JSON.stringify({ ts: lastTs, ids: Object.fromEntries(seenIds) })); } catch (e) {}
-    } catch (e) {
-      console.error('[biz-in-poll error]', e.message);
     }
   }
 }
@@ -2646,7 +2575,6 @@ app.listen(PORT, async () => {
   if (BIZ_BASE && BIZ_TOKEN) {
     console.log('✅ BIZ polling started (instance', BIZ_ID, ')');
     bizPollLoop(); // לולאה אסינכרונית — לא חוסמת
-    bizIncomingPollLoop(); // 🌉 קליטת הקלטות/תמונות-נכנסות מהגשר (נפרד מהפקודות)
     bizSyncMonitorLoop(); // ניטור סנכרון — מתריע אם הקו העסקי מנותק
     bizKeepaliveLoop(); // keepalive — מונע ניתוק session כל 40 דקות
   }
