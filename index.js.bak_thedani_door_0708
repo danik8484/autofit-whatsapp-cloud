@@ -2584,37 +2584,6 @@ async function fbLeadsPoll() {
   }
 }
 
-// ─── 🍽️🤝 07-08 (הכרעת-דני): הדלת של TheDani ─────────────────────────────────
-// TheDani בודק תפריט-מתאמן ומוסיף מאכל — רק אחרי שדני אישר את הכרטיס בפאנל שלו.
-// אבטחה: טוקן ייעודי (THEDANI_TOKEN); בלי טוקן מוגדר הדלת סגורה. כתיבה: רק "תוסיף ל...".
-app.post('/api/thedani', (req, res) => {
-  const expected = process.env.THEDANI_TOKEN || '';
-  const got = req.headers['x-thedani-token'] || (req.body && req.body.token) || '';
-  if (!expected || got !== expected) return res.status(403).json({ ok: false, error: 'forbidden' });
-  const b = req.body || {};
-  let args = null;
-  if (b.meals) {
-    args = ['--meals-json', String(b.meals).slice(0, 60)];
-  } else if (b.request) {
-    const r = String(b.request).slice(0, 200);
-    if (!/^תוסיף ל/.test(r)) return res.status(400).json({ ok: false, error: 'only-add-allowed' });
-    args = [r];
-  } else {
-    return res.status(400).json({ ok: false, error: 'meals-or-request-required' });
-  }
-  const script = path.join(__dirname, 'autofit_api.py');
-  const proc = spawn('python3', [script, ...args]);
-  let out = '', err = '';
-  proc.stdout.on('data', d => out += d);
-  proc.stderr.on('data', d => err += d);
-  const killer = setTimeout(() => { try { proc.kill(); } catch (_) {} }, 75000);
-  proc.on('close', (code) => {
-    clearTimeout(killer);
-    console.log(`[thedani-door] ${args[0] === '--meals-json' ? 'תפריט' : 'הוספה'}: ${args.join(' ').slice(0, 80)} → code=${code}`);
-    res.json({ ok: code === 0, output: out.trim().slice(0, 4000), error: err.trim().slice(0, 300) });
-  });
-});
-
 // ─── הפעל שרת + הגדר webhook ──────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {

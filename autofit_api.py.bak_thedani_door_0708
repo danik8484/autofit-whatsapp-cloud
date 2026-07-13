@@ -3943,7 +3943,6 @@ if __name__ == "__main__":
     list_users       = "--list-users" in args
     args = [a for a in args if a != "--list-users"]
     find_user_query  = _pop_arg("--find-user")
-    meals_json_query = _pop_arg("--meals-json")   # 🍽️🤝 07-08: תפריט-מתאמן כ-JSON (הדלת של TheDani)
     swap_exercise       = "--swap-exercise" in args
     args = [a for a in args if a != "--swap-exercise"]
     old_exercise        = _pop_arg("--old-exercise")
@@ -3984,27 +3983,6 @@ if __name__ == "__main__":
                 fn = u.get("name") or u.get("full_name") or ""
                 if fn:
                     print(fn)
-        sys.exit(0)
-
-    # 🍽️🤝 07-08 (הדלת של TheDani): תפריט המתאמן כ-JSON — status: ok / no_data / no_conn.
-    #    קריאה בלבד; שום שינוי. TheDani משתמש בזה ל"בדקתי, X לא בתפריט שלך".
-    if meals_json_query:
-        try:
-            uid_mj, full_name_mj, _ = find_user(meals_json_query)
-            if not uid_mj or uid_mj == "MULTIPLE":
-                print(json.dumps({"status": "no_data",
-                                  "why": "multiple" if uid_mj == "MULTIPLE" else "user-not-found"},
-                                 ensure_ascii=False))
-                sys.exit(0)
-            _meals_mj = []
-            for _m_mj in (get_user_meals(uid_mj) or []):
-                _foods_mj = [{"food_name": (f.get("food_name") or "").strip(), "quantity": f.get("quantity")}
-                             for f in (_m_mj.get("mealFoods") or _m_mj.get("new_meal_food") or [])
-                             if (f.get("food_name") or "").strip()]
-                _meals_mj.append({"meal_name": _m_mj.get("meal_name") or "", "foods": _foods_mj})
-            print(json.dumps({"status": "ok", "name": full_name_mj, "meals": _meals_mj}, ensure_ascii=False))
-        except Exception as _e_mj:
-            print(json.dumps({"status": "no_conn", "why": str(_e_mj)[:120]}, ensure_ascii=False))
         sys.exit(0)
 
     if menu_name:
