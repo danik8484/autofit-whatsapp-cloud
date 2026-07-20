@@ -530,6 +530,96 @@ finally:
     (_afc.find_user, _afc.get_user_meals, _afc.load_coach_id,
      _afc.find_best_food, _afc.search_food, _afc.add_food_to_meal) = _orig
 
+# ── 19. באגי 18.7 (ליטל קין / נתיב אדרי) ─────────────────────
+print("\n── 19. באגי 18.7: אחוזים במילים / ארוחה נכונה / 'X ולחם' ──")
+
+# (א) "5 אחוז" → "5%" — דני כותב במילים, המאגר בסימן.
+#     בלי זה הבוט לא מצא "קוטג 5 אחוז" ונחת על "פשטידת קוטג ותרד".
+check("אחוזים: 'קוטג 5 אחוז' → 'קוטג 5%'",
+      _afc.normalize_food_query("קוטג 5 אחוז"), "קוטג 5%")
+check("אחוזים: גרש + אחוז", _afc.normalize_food_query("קוטג' 5 אחוז"), "קוטג 5%")
+check("אחוזים: שבר עשרוני", _afc.normalize_food_query("יוגורט 1.5 אחוז"), "יוגורט 1.5%")
+check("אחוזים: רבים ('אחוזים')", _afc.normalize_food_query("חלב 3 אחוזים"), "חלב 3%")
+check("אחוזים: '%' קיים לא נשבר", _afc.normalize_food_query("קוטג 5%"), "קוטג 5%")
+check("אחוזים: 'אחוז' בלי מספר לא נוגעים", _afc.normalize_food_query("אחוז"), "אחוז")
+check("אחוזים: 'אחוזי שומן' לא משאיר זנב", _afc.normalize_food_query("גבינה 5 אחוזי שומן"), "גבינה 5% שומן")
+check("אחוזים: פסיק עשרוני → נקודה", _afc.normalize_food_query("יוגורט 1,5 אחוז"), "יוגורט 1.5%")
+check("אחוזים: 'אחוזון' לא נפגע", _afc.normalize_food_query("אחוזון 5"), "אחוזון 5")
+
+# (ב) ארוחה: שם קצר הוא תת-מחרוזת של ארוך. "ארוחת" חייבת להגיע ל"ארוחת",
+#     לא ל"ארוחת ערב" שמופיעה ראשונה ברשימה (כתיבה לארוחה הלא-נכונה בשקט).
+_MEALS_SUBSTR = [{"id": 1, "meal_name": "ארוחת ערב", "mealFoods": [{"id": 11, "food_name": "אורז"}]},
+                 {"id": 2, "meal_name": "ארוחת",     "mealFoods": [{"id": 22, "food_name": "אורז"}]}]
+check("ארוחה: 'ארוחת' → הארוחה בשם הזה (לא 'ארוחת ערב')",
+      _afc.find_meal_and_food(_MEALS_SUBSTR, "ארוחת", "אורז")[0], 2)
+check("ארוחה: 'ארוחת ערב' → ערב",
+      _afc.find_meal_and_food(_MEALS_SUBSTR, "ארוחת ערב", "אורז")[0], 1)
+_MEALS_ORDER = [{"id": 7, "meal_name": "ארוחת ביניים 2", "mealFoods": [{"id": 71, "food_name": "אורז"}]},
+                {"id": 8, "meal_name": "ארוחת ביניים",   "mealFoods": [{"id": 81, "food_name": "אורז"}]}]
+check("ארוחה: התאמה מדויקת מנצחת גם כשהיא שנייה ברשימה",
+      _afc.find_meal_and_food(_MEALS_ORDER, "ארוחת ביניים", "אורז")[0], 8)
+# ה' הידיעה: "ארוחת הערב" חייבת לנצח את "ארוחת ערב" כשהיא קיימת ככתבה (קודקס 19.7)
+_MEALS_HEY = [{"id": 3, "meal_name": "ארוחת ערב",   "mealFoods": [{"id": 31, "food_name": "אורז"}]},
+              {"id": 4, "meal_name": "ארוחת הערב", "mealFoods": [{"id": 41, "food_name": "אורז"}]}]
+check("ארוחה: 'ארוחת הערב' → השם המדויק, לא 'ארוחת ערב'",
+      _afc.find_meal_and_food(_MEALS_HEY, "ארוחת הערב", "אורז")[0], 4)
+check("ארוחה: 'ארוחת ערב' → השם המדויק גם כשהוא ראשון",
+      _afc.find_meal_and_food(_MEALS_HEY, "ארוחת ערב", "אורז")[0], 3)
+
+# (ג) "פסטה ולחם" — 'לחם' אינו שם מדויק במאגר (רק סוגי לחם), ולכן הפיצול ויתר
+#     והבוט חיפש מזון יחיד בשם "פסטה ולחם".
+#     ⚠️ המאגר-המדומה כאן חייב להיות נאמן למציאות (ביקורת-קודקס 19.7: mocks
+#     שטוחים הסתירו את מסלול-הכשל האמיתי). לכן: קטגוריה = הרבה שמות שמתחילים בה
+#     ('לחם' → 93 במאגר החי), מילה-בתוך-שם = כמעט אפס ('גרעינים'/'תרד' → 1).
+_orig2 = (_afc.search_food, _afc._is_exact_food)
+try:
+    _EXACT = {"פסטה", "בננה", "תפוח", "אורז", "בטטה", "ריבה",
+              "לחם מחמצת", "פשטידת קוטג ותרד", "יוגורט וניל", "קוטג 5%"}
+    # מילה → כמה שמות במאגר *מתחילים* בה (מדגם נאמן למאגר החי)
+    _HEADS = {"לחם": 9, "פסטה": 9, "אורז": 9, "בטטה": 6,
+              "גרעינים": 1, "תרד": 1, "ניל": 0, "וניל": 0, "מלאה": 0}
+    def _mock_search(q, cid=""):
+        q = (q or "").strip()
+        if not q:
+            return []
+        n = _HEADS.get(q)
+        if n is not None:
+            return [{"food_name": f"{q} {i}"} for i in range(n)] or [{"food_name": q}]
+        return [{"food_name": q}] if q in _EXACT else [{"food_name": f"מוצר {q} כלשהו"}]
+    _afc.search_food = _mock_search
+    _afc._is_exact_food = lambda t, cid="": _afc.normalize_food_query(t.strip()) in {
+        _afc.normalize_food_query(x) for x in _EXACT}
+    _afc._headword_cache.clear()
+    check("פיצול: 'פסטה ולחם' → שני מזונות",
+          _afc._split_multi_new_food("פסטה ולחם"), ["פסטה", "לחם"])
+    check("פיצול: 'פסטה ו לחם' (ו' מנותקת) → שני מזונות",
+          _afc._split_multi_new_food("פסטה ו לחם"), ["פסטה", "לחם"])
+    check("פיצול: 'ריבה ולחם' → הלחם לא נעלם",
+          _afc._split_multi_new_food("ריבה ולחם"), ["ריבה", "לחם"])
+    check("פיצול: 'פשטידת קוטג ותרד ולחם' — המוצר לא נחתך באמצע",
+          _afc._split_multi_new_food("פשטידת קוטג ותרד ולחם"), ["פשטידת קוטג ותרד", "לחם"])
+    check("פיצול: 'לחם מחמצת וגרעינים' נשאר שלם",
+          _afc._split_multi_new_food("לחם מחמצת וגרעינים"), ["לחם מחמצת וגרעינים"])
+    check("פיצול: 'פשטידת קוטג ותרד' נשאר שלם",
+          _afc._split_multi_new_food("פשטידת קוטג ותרד"), ["פשטידת קוטג ותרד"])
+    check("פיצול: 'יוגורט וניל' נשאר שלם",
+          _afc._split_multi_new_food("יוגורט וניל"), ["יוגורט וניל"])
+    check("פיצול: 'בננה ותפוח' (שניהם מדויקים) → שניים",
+          _afc._split_multi_new_food("בננה ותפוח"), ["בננה", "תפוח"])
+    check("פיצול: 'קוטג 5 אחוז ולחם' (אחוז במילים) → שניים",
+          _afc._split_multi_new_food("קוטג 5 אחוז ולחם"), ["קוטג 5 אחוז", "לחם"])
+    check("פיצול: '1,5 אחוז' לא נחתך בפסיק",
+          _afc._split_multi_new_food("יוגורט 1,5 אחוז"), ["יוגורט 1.5%"])
+    check("פיצול: כמות בגרמים → לא נוגעים",
+          _afc._split_multi_new_food("50 גרם אורז"), ["50 גרם אורז"])
+    _afc.search_food = lambda q, cid="": []      # שום חלק לא נמצא במאגר
+    _afc._headword_cache.clear()
+    check("פיצול: חלק שאינו מזון כלל → לא מפצל",
+          _afc._split_multi_new_food("משהו ובלבל"), ["משהו ובלבל"])
+finally:
+    (_afc.search_food, _afc._is_exact_food) = _orig2
+    _afc._headword_cache.clear()
+
 # ══════════════════════════════════════════════════════════════════
 print(f"\n{'═'*50}")
 print(f"תוצאה: {PASS} עברו, {FAIL} נכשלו")

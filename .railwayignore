@@ -4,3 +4,8 @@ __pycache__/
 .env
 baileys_session/
 test_*.py
+
+# רתמת-בדיקה מקומית — לא נחוצה בשרת
+fixtures/
+e2e_harness.py
+e2e_cases.py

@@ -6,8 +6,16 @@ const fs = require('fs');
 const DATA_DIR = fs.existsSync('/data') ? '/data' : __dirname;
 
 const ID    = process.env.GREEN_API_ID    || '7107642551';
-const TOKEN = process.env.GREEN_API_TOKEN || '5b7315dfa1cd46beaed1f82da183a246471219b64d674e029d';
-const BASE  = `https://api.green-api.com/waInstance${ID}`;
+// 16.7 (בקשת דני): הקו-הראשי עבר מ-GreenAPI (פג-תוקף) לגשר-Baileys שני — בדיוק
+// כמו מעבר הקו-העסקי ב-07-07. MAIN_WA_HOST מוגדר → כל השליחות/קריאות של הקו
+// הראשי הולכות לגשר; לא מוגדר → GreenAPI כרגיל (נפילה-לאחור אם דני יחדש).
+const MAIN_WA_HOST = process.env.MAIN_WA_HOST || '';
+const TOKEN = MAIN_WA_HOST
+  ? (process.env.MAIN_BRIDGE_TOKEN || '')
+  : (process.env.GREEN_API_TOKEN || '5b7315dfa1cd46beaed1f82da183a246471219b64d674e029d');
+const BASE  = MAIN_WA_HOST
+  ? `${MAIN_WA_HOST}/waInstance${ID}`
+  : `https://api.green-api.com/waInstance${ID}`;
 
 // ── תמלול הקלטות קוליות דרך Groq Whisper ──
 const GROQ_API_KEY       = process.env.GROQ_API_KEY || '';
@@ -137,9 +145,13 @@ function runAutofit(phone, text, opts = {}) {
   if (opts.force)          args.push('--force');
   if (opts.nameOverride)   { args.push('--name'); args.push(opts.nameOverride); }
   if (opts.mealOverride)   { args.push('--meal'); args.push(opts.mealOverride); }
+  if (opts.mealIdOverride) { args.push('--meal-id'); args.push(String(opts.mealIdOverride)); }
   if (opts.foodOverride)   { args.push('--food'); args.push(opts.foodOverride); }
   if (opts.hintOverride)   { args.push('--hint'); args.push(opts.hintOverride); }
   if (opts.userIdOverride) { args.push('--user-id'); args.push(opts.userIdOverride); }
+  if (Number.isInteger(opts.resumeOpIndex)) {
+    args.push('--resume-op-index'); args.push(String(opts.resumeOpIndex));
+  }
   args.push(text);
 
   const proc = spawn('python3', [script, ...args]);
@@ -195,33 +207,50 @@ function runAutofit(phone, text, opts = {}) {
     // MEAL_OPTIONS — ארוחה לא נמצאה, רשימה ממוספרת
     if (raw.startsWith('MEAL_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
-      const alts = header.slice('MEAL_OPTIONS:'.length).split('|').slice(1);
-      const userMsg = rest.join('\n');
-      pendingCorrections.set(phone, { type: 'meal', originalText: text, alternatives: alts, nameOverride: opts.nameOverride || '', timestamp: Date.now() });
+      const alts = header.slice('MEAL_OPTIONS:'.length).split('|').slice(1).map(parseMealOptionToken);
+      const meta = extractResumeOpMetadata(rest);
+      const userMsg = meta.lines.join('\n');
+      const retryOpts = { ...opts };
+      if (Number.isInteger(meta.resumeOpIndex)) retryOpts.resumeOpIndex = meta.resumeOpIndex;
+      pendingCorrections.set(phone, { type: 'meal', originalText: text, alternatives: alts, opts: retryOpts, timestamp: Date.now() });
       await sendMessage(phone, userMsg);
+      return;
+    }
+
+    if (raw.startsWith('MULTIMEAL:')) {
+      const [header, ...rest] = raw.split('\n');
+      const alts = header.slice('MULTIMEAL:'.length).split('|').filter(Boolean).map(parseMealOptionToken);
+      const meta = extractResumeOpMetadata(rest);
+      const retryOpts = { ...opts };
+      if (Number.isInteger(meta.resumeOpIndex)) retryOpts.resumeOpIndex = meta.resumeOpIndex;
+      pendingCorrections.set(phone, { type: 'multimeal', originalText: text, alternatives: alts, opts: retryOpts, timestamp: Date.now() });
+      await sendMessage(phone, meta.lines.join('\n'));
       return;
     }
 
     // HINT_OPTIONS — מזון להחלפה לא נמצא, רשימה ממוספרת
     if (raw.startsWith('HINT_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
+      const meta = extractResumeOpMetadata(rest);
       const headerBody = header.slice('HINT_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
       const hintQuery = cleanPrefKey(sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '');
       const alts = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
-      const userMsg = rest.join('\n');
+      const userMsg = meta.lines.join('\n');
+      const retryOpts = { ...opts };
+      if (Number.isInteger(meta.resumeOpIndex)) retryOpts.resumeOpIndex = meta.resumeOpIndex;
 
       // יש העדפה שמורה? בחר אוטומטית (אלא אם המשתמש ביקש "אפשרות אחרת")
       const pref = hintQuery && !opts.skipFoodPref && hintPrefs.get(hintQuery.toLowerCase());
       if (pref && alts.includes(pref)) {
         console.log(`[hint-pref] ${hintQuery} → ${pref} (auto)`);
         await sendMessage(phone, '⏳ מבצע...');
-        runAutofit(phone, text, { force: true, hintOverride: pref, nameOverride: opts.nameOverride || '', foodOverride: opts.foodOverride || '' });
+        runAutofit(phone, text, { ...retryOpts, force: true, hintOverride: pref });
         return;
       }
 
       // שמור גם foodOverride שכבר נבחר — כדי לא לשכוח אותו
-      pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, hintQuery, nameOverride: opts.nameOverride || '', foodOverride: opts.foodOverride || '', timestamp: Date.now() });
+      pendingCorrections.set(phone, { type: 'hint', originalText: text, alternatives: alts, hintQuery, opts: retryOpts, timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -250,25 +279,28 @@ function runAutofit(phone, text, opts = {}) {
     // FOOD_OPTIONS — מזון חדש עמום, רשימה ממוספרת
     if (raw.startsWith('FOOD_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
+      const meta = extractResumeOpMetadata(rest);
+      const retryOpts = { ...opts };
+      if (Number.isInteger(meta.resumeOpIndex)) retryOpts.resumeOpIndex = meta.resumeOpIndex;
       const headerBody = header.slice('FOOD_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
       const foodQuery = cleanPrefKey(sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '');
       const rawAltsReg = (sepIdx >= 0 ? headerBody.slice(sepIdx + 2) : headerBody).split('|');
       const alts = rawAltsReg.map(a => { const ci = a.lastIndexOf(':'); return ci > 0 ? a.slice(0, ci) : a; });
-      const userMsg = rest.join('\n');
+      const userMsg = meta.lines.join('\n');
 
       // יש העדפה שמורה? בחר אוטומטית (אלא אם המשתמש ביקש "אפשרות אחרת")
       const pref = foodQuery && !opts.skipFoodPref && foodPrefs.get(foodQuery.toLowerCase());
       if (pref && alts.includes(pref)) {
         console.log(`[pref] ${foodQuery} → ${pref} (auto)`);
         await sendMessage(phone, '⏳ מבצע...');
-        runAutofit(phone, text, { force: true, foodOverride: pref, nameOverride: opts.nameOverride || '', hintOverride: opts.hintOverride || '' });
+        runAutofit(phone, text, { ...retryOpts, force: true, foodOverride: pref });
         return;
       }
 
       // שמור גם hintOverride שכבר נבחר — כדי לא לשכוח אותו
       // שמור כל האלטרנטיבות לpagination (pageOffset=0 = עמוד ראשון)
-      pendingCorrections.set(phone, { type: 'food', originalText: text, allAlternatives: alts, alternatives: alts.slice(0, 10), pageOffset: 0, foodQuery, nameOverride: opts.nameOverride || '', hintOverride: opts.hintOverride || '', timestamp: Date.now() });
+      pendingCorrections.set(phone, { type: 'food', originalText: text, allAlternatives: alts, alternatives: alts.slice(0, 10), pageOffset: 0, foodQuery, opts: retryOpts, timestamp: Date.now() });
       await sendMessage(phone, userMsg);
       return;
     }
@@ -370,8 +402,12 @@ async function runForAllClients(phone, baseText) {
 // ─── Webhook מ-Green API ──────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
+  await processMainBody(req.body);
+});
 
-  const body = req.body;
+// ─── עיבוד הודעות הקו-הראשי — משותף ל-webhook (GreenAPI, אם יחודש) ולפול
+// מגשר-Baileys הראשי (16.7, בקשת דני — מעבר מ-GreenAPI שפג-תוקף) ──────────
+async function processMainBody(body) {
 
   // ── V3: הודעות יוצאות מדני ללקוחות ────────────────────────────────────
   if (body.typeWebhook === 'outgoingMessageReceived') {
@@ -405,23 +441,7 @@ app.post('/webhook', async (req, res) => {
     const outName = body.senderData?.chatName || outPhone;
     console.log(`[v3] פקודה יוצאת: "${outName}" (${outPhone}) | "${outText.slice(0,60)}"`);
     v3Log.push({ ts: Date.now(), step: 'trigger', name: outName, phone: outPhone, text: outText.slice(0,40) });
-    if (hasSetCommand(outText)) {
-      runExerciseSetBiz(outName, outPhone, outText, { nameOverride: outPhone });
-    } else if (hasExerciseTrigger(outText)) {
-      runExerciseSwapBiz(outName, outPhone, outText, { nameOverride: outPhone });
-    } else {
-      // הודעה עם כמה הוספות (כל אחת בשורה) → הרץ כל אחת בנפרד עם ה-timeout שלה,
-      // במרווח של 4 שניות, כדי לא לחנוק את כולן ביחד ולא להעמיס על ה-API.
-      const bizCmds = splitBizCommands(outText);
-      if (bizCmds.length > 1) {
-        console.log(`[v3] פוצל ל-${bizCmds.length} פקודות נפרדות`);
-        bizCmds.forEach((cmd, i) => {
-          setTimeout(() => runAutofitBiz(outName, outPhone, cmd, { nameOverride: outPhone }), i * 4000);
-        });
-      } else {
-        runAutofitBiz(outName, outPhone, outText, { nameOverride: outPhone });
-      }
-    }
+    dispatchBizCommands(outName, outPhone, outText, '[v3]');
     return;
   }
 
@@ -493,10 +513,39 @@ app.post('/webhook', async (req, res) => {
     if (Date.now() - corr.timestamp > 5 * 60 * 1000) {
       pendingCorrections.delete(sender);
       // פג תוקף — אל תעבד את ההודעה כבחירה ישנה, המשך לעיבוד רגיל
-    } else if (corr.type === 'meal') {
+    } else if (corr.type === 'meal' || corr.type === 'multimeal') {
+      const answer = text.replace(/[*]/g, '').trim();
+      if (corr.type === 'multimeal' && ['הכל','הכול','כולן','כולם','all'].includes(answer)) {
+        pendingCorrections.delete(sender);
+        await sendMessage(sender, '⏳ מבצע...');
+        corr.alternatives.forEach((meal, i) => {
+          setTimeout(() => runAutofit(sender, corr.originalText, {
+            ...(corr.opts || {}), force: true, mealOverride: meal.name,
+            mealIdOverride: meal.id,
+          }), i * 3500);
+        });
+        return;
+      }
+      const numMatch = answer.match(/^(?:בחר\s+)?(\d+)$/);
+      let chosen = null;
+      if (numMatch) {
+        const idx = parseInt(numMatch[1]) - 1;
+        if (idx >= 0 && idx < corr.alternatives.length) chosen = corr.alternatives[idx];
+      } else {
+        const matches = corr.alternatives.filter(m => m.name === answer);
+        if (matches.length > 1) {
+          await sendMessage(sender, 'יש כמה ארוחות בשם הזה — שלח את מספר האפשרות.');
+          return;
+        }
+        chosen = matches[0] || { id: '', name: answer };
+      }
+      if (!chosen || !chosen.name) return;
       pendingCorrections.delete(sender);
       await sendMessage(sender, '⏳ מבצע...');
-      runAutofit(sender, corr.originalText, { force: true, mealOverride: text.trim(), nameOverride: corr.nameOverride || '' });
+      runAutofit(sender, corr.originalText, {
+        ...(corr.opts || {}), force: true, mealOverride: chosen.name,
+        mealIdOverride: chosen.id,
+      });
       return;
     } else if (corr.type === 'name') {
       if (text.trim().length >= 2) {
@@ -570,8 +619,9 @@ app.post('/webhook', async (req, res) => {
               console.log(`[hint-pref saved] "${corr.hintQuery}" → "${chosen}"`);
               savePrefs();
             }
-            // זכור גם foodOverride שנבחר קודם
-            runAutofit(sender, corr.originalText, { force: true, hintOverride: chosen, nameOverride: corr.nameOverride || '', foodOverride: corr.foodOverride || '' });
+            runAutofit(sender, corr.originalText, {
+              ...(corr.opts || {}), force: true, hintOverride: chosen,
+            });
           } else {
             // שמור העדפה לפעם הבאה
             if (corr.foodQuery) {
@@ -579,8 +629,9 @@ app.post('/webhook', async (req, res) => {
               console.log(`[pref saved] "${corr.foodQuery}" → "${chosen}"`);
               savePrefs();
             }
-            // זכור גם hintOverride שנבחר קודם
-            runAutofit(sender, corr.originalText, { force: true, foodOverride: chosen, nameOverride: corr.nameOverride || '', hintOverride: corr.hintOverride || '' });
+            runAutofit(sender, corr.originalText, {
+              ...(corr.opts || {}), force: true, foodOverride: chosen,
+            });
           }
           return;
         }
@@ -718,7 +769,63 @@ app.post('/webhook', async (req, res) => {
   }
 
   runAutofit(sender, text, _skipPref ? { skipFoodPref: true } : {});
-});
+}
+
+// ─── פול-קליטה מהגשר-הראשי (16.7) — מחליף את ה-webhook של GreenAPI ─────────
+// רק הודעות-טקסט 1-על-1 (דני/רון אל קו-הבוט: תפריטים, תיקונים, אישורים).
+// קבוצות מדולגות בכוונה — תשובות-הקבוצה ("בחר 1") כבר מטופלות דרך הקו-העסקי,
+// וטיפול כפול היה מריץ בחירה פעמיים. רץ רק כש-MAIN_WA_HOST מוגדר.
+const MAIN_IN_WATERMARK_FILE = require('path').join(DATA_DIR, 'main_in_watermark.json');
+async function mainIncomingPollLoop() {
+  if (!MAIN_WA_HOST || !TOKEN) return;
+  const nowTs = Math.floor(Date.now() / 1000);
+  let lastTs = nowTs;
+  const seenIds = new Map();
+  try {
+    const saved = JSON.parse(require('fs').readFileSync(MAIN_IN_WATERMARK_FILE, 'utf8'));
+    if (saved && saved.ts && (nowTs - saved.ts) < 600) {
+      lastTs = saved.ts;
+      if (saved.ids && typeof saved.ids === 'object') for (const [id, ts] of Object.entries(saved.ids)) seenIds.set(id, ts);
+    }
+  } catch (e) { /* אין קובץ — התחלה רגילה */ }
+  console.log('[main-in-poll] starting, watermark=', new Date(lastTs * 1000).toISOString());
+  while (true) {
+    await new Promise(r => setTimeout(r, 10000)); // כל 10 שניות
+    try {
+      const resp = await fetch(`${BASE}/lastIncomingMessages/${TOKEN}`);
+      if (!resp.ok) continue;
+      const msgs = await resp.json();
+      if (!Array.isArray(msgs)) continue;
+      const cycleNow = Math.floor(Date.now() / 1000);
+      const cutoff = lastTs - BIZ_POLL_GRACE;
+      let maxTs = lastTs;
+      const ordered = msgs.filter(m => m.timestamp).sort((a, b) => a.timestamp - b.timestamp);
+      for (const msg of ordered) {
+        if (msg.timestamp <= cutoff) continue;
+        if (msg.idMessage && seenIds.has(msg.idMessage)) continue;
+        maxTs = Math.max(maxTs, msg.timestamp);
+        if (msg.idMessage) seenIds.set(msg.idMessage, msg.timestamp);
+        const rjid = msg._rjid || '';
+        if (rjid.endsWith('@g.us')) continue;            // קבוצות — דרך הקו-העסקי בלבד
+        const text = msg.textMessage || '';
+        if (!text) continue;                              // מדיה בקו-הראשי — לא בשימוש
+        await processMainBody({
+          typeWebhook: 'incomingMessageReceived',
+          idMessage: msg.idMessage,
+          timestamp: msg.timestamp,
+          senderData: { chatId: msg.chatId || '', sender: msg.chatId || '', chatName: '' },
+          messageData: { typeMessage: 'textMessage', textMessageData: { textMessage: text } },
+        });
+      }
+      lastTs = maxTs;
+      const pruneBefore = cycleNow - 600;
+      for (const [id, ts] of seenIds) { if (ts < pruneBefore) seenIds.delete(id); }
+      try { require('fs').writeFileSync(MAIN_IN_WATERMARK_FILE, JSON.stringify({ ts: lastTs, ids: Object.fromEntries(seenIds) })); } catch (e) {}
+    } catch (e) {
+      console.error('[main-in-poll error]', e.message);
+    }
+  }
+}
 
 // חילוץ ריבוי שמות מ-"לרון ולדני" / "לרון, לדני" / "לרון ודני"
 function _extractMultiNames(text) {
@@ -1014,145 +1121,28 @@ async function handleRecsImage(msg, body) {
   recsNote({ chatId, chatName, file: fileName, status: 'ok' });
 }
 
-// מילות מפתח שמפעילות את הבוט
-// ⚠️ דני כותב פקודות אך ורק עם "לך" — *לעולם לא "לו"*. שמות-פועל סתמיים
-// ('להוסיף'/'להוריד'/'להחליף') וגם וריאציות "לו" אסורים כאן — הם מופיעים בשיחה רגילה
-// ("מה אתה רוצה להוסיף?", "אני מוסיף לו עוד שבוע") וגרמו לבוט לתפוס הודעות-שיחה כפקודות.
-// פקודה אמיתית תמיד = פועל + "לך".
-// הווה ("מוסיף לך") = פקודה תמיד. עבר ("הורדתי לך 30 גרם") = פקודה *רק כשיש מספר אחריו*
-// (ראה PAST_CMD למטה) — דני מדווח מה שינה: "ליה הורדתי לך 30 גרם אורז". בלי מספר זה שיחה
-// ("אם הוספתי לך זה איכותי") ולא נתפס.
-const TRIGGER_WORDS = [
-  'מוסיף לך', 'תוסיף לך', 'אוסיף לך', 'נוסיף לך',
-  'שם לך',
-  'מעלה לך', 'תעלה לך',
-  'מוריד לך', 'תוריד לך', 'מפחית לך',
-  'מחליף לך', 'תחליף לך',
-  'משנה לך',
-  'מכניס לך', 'תכניס לך',
-];
-// פקודת-עבר: פועל-עבר + (לך/לה/גם/את) + מספר. "הורדתי לך 30 גרם", "הורדתי 5 גרם", "הורדתי גם 30".
-// המספר הוא מה שמפריד פקודה אמיתית משיחה — "אם הוספתי לך זה איכותי" (בלי מספר) לא ייתפס.
-const PAST_CMD = /(?:הורדתי|הוספתי|העליתי|הפחתתי|החלפתי|שיניתי|הכנסתי|הורדת|הוספת)(?:\s+(?:ל[ךה]|גם|את|לך\s+גם)){0,2}\s+\d/;
+// זיהוי-טריגר, פיצול ומיון פקודות — הועבר ל-biz_routing.js (16.7) כדי שהבדיקות
+// ירוצו על הקוד האמיתי, וכדי שכל פקודה בהודעה מרובת-הוראות תמוין בנפרד.
+const {
+  TRIGGER_WORDS, QUOTED_TYPES,
+  normalizeBizText, extractMsgText, hasTriggerWord, hasExerciseTrigger,
+  hasSetCommand, anchorToCommand, splitBizCommands, splitAndClassify,
+  parseMealOptionToken, extractResumeOpMetadata,
+} = require('./biz_routing');
 
-// WhatsApp / תיקון-שגיאות מכניס לעיתים מקף או רווח כפול בין מילים:
-// "מוסיף-לך" / "מוסיף  לך" → "מוסיף לך". מנרמל כדי שזיהוי הטריגר לא יתפספס.
-function normalizeBizText(text) {
-  return text
-    .replace(/([א-ת])[־–—\-]([א-ת])/g, '$1 $2')  // מקף (כולל ־/–/—) בין אותיות עבריות → רווח
-    .replace(/[^\S\n]+/g, ' ');                    // רווחים/טאבים כפולים → רווח אחד (שומר שורות חדשות)
-}
-
-// מחלץ טקסט מהודעה — תומך בטקסט רגיל וגם בהודעה *מתויגת* (reply/quote).
-// בתיוג Green API שולח typeMessage=quotedMessage/extendedTextMessage, והטקסט נמצא
-// ב-extendedTextMessageData.text (לא ב-textMessageData) + stanzaId של ההודעה שצוטטה.
-const QUOTED_TYPES = ['textMessage', 'extendedTextMessage', 'quotedMessage'];
-function extractMsgText(msg) {
-  if (!msg) return { text: '', quotedId: null };
-  if (msg.typeMessage === 'textMessage') {
-    return { text: (msg.textMessageData?.textMessage || '').trim(), quotedId: null };
-  }
-  if (msg.typeMessage === 'extendedTextMessage' || msg.typeMessage === 'quotedMessage') {
-    return {
-      text: (msg.extendedTextMessageData?.text || '').trim(),
-      quotedId: msg.extendedTextMessageData?.stanzaId || null,
-    };
-  }
-  return { text: '', quotedId: null };
-}
-
-// גבול-מילה לפני הטריגר: "רשם לך" לא יתפוס את "שם לך". (\b של JS לא עובד בעברית.)
-// חריג: ו' החיבור ("ומעלה לך 5 גרם...") = פקודה תקינה — אסור לחסום אותה.
-function _triggerBoundaryOK(text, idx) {
-  return idx === 0 || !/[א-ת]/.test(text[idx - 1]) || text[idx - 1] === 'ו';
-}
-// עתיד ("אוסיף לך"/"נוסיף לך" = "אני אתן לך בעתיד") = פקודה *רק כשיש מספר אחריו* — כמו עבר.
-// בלי מספר זו שיחה רגילה ("ברגע שתסיים תגיד לי ואני אוסיף לך אירובי סיום") ואסור לתפוס אותה כפקודה.
-// נשאר ב-TRIGGER_WORDS כדי שפקודת-עתיד אמיתית עם מספר ("אוסיף לך 50 גרם ריבה") עדיין תיעגן ותפוצל.
-const _FUTURE_TRIGGERS = new Set(['אוסיף לך', 'נוסיף לך']);
-function hasTriggerWord(text) {
-  if (PAST_CMD.test(text)) return true;  // "הורדתי לך 30 גרם" וכו'
-  return TRIGGER_WORDS.some(w => {
-    let idx = -1;
-    while ((idx = text.indexOf(w, idx + 1)) !== -1) {
-      if (!_triggerBoundaryOK(text, idx)) continue;
-      // עתיד בלי מספר בהמשך = שיחה, לא פקודה
-      if (_FUTURE_TRIGGERS.has(w) && !/\d/.test(text.slice(idx + w.length, idx + w.length + 40))) continue;
-      return true;
-    }
-    return false;
+// ─── ניתוב פר-פקודה (תיקון 16.7 — אור איבגי) ─────────────────────
+// מפצל הודעה מרובת-הוראות וממיין כל הוראה לבד: סט / תרגיל / תזונה.
+// עד כה ההחלטה נלקחה על ההודעה כולה — "תוכנית" בשורת-פתיח שלחה גם את
+// פקודות האוכל למסלול התרגילים והן נזרקו. מרווח 4 שניות בין פקודות —
+// לא לחנוק את כולן ביחד ולא להעמיס על ה-API (כמו הפיצול הישן במסלול הראשי).
+function dispatchBizCommands(contactName, clientPhone, text, logPrefix) {
+  const routed = splitAndClassify(text);
+  if (routed.length > 1) console.log(`${logPrefix} פוצל ל-${routed.length} פקודות (מיון נפרד לכל אחת)`);
+  routed.forEach(({ cmd, kind }, i) => {
+    const run = kind === 'set' ? runExerciseSetBiz : kind === 'swap' ? runExerciseSwapBiz : runAutofitBiz;
+    if (i === 0) run(contactName, clientPhone, cmd, { nameOverride: clientPhone });
+    else setTimeout(() => run(contactName, clientPhone, cmd, { nameOverride: clientPhone }), i * 4000);
   });
-}
-
-// הקשר תרגיל: "אימון" וגם "תוכנית" (בקשת דני) — באימון/לאימון/תוכנית/בתוכנית/התוכנית/לתוכנית
-const EX_CONTEXT = /באימון|לאימון|[בלה]?ת[ו]?כנית/;
-
-function hasExerciseTrigger(text) {
-  return hasTriggerWord(text) && EX_CONTEXT.test(text);
-}
-
-// פקודת סט: טריגר + המילה "סט"/"סטים" כמילה עצמאית (לא "סטייק"/"סטטוס")
-function hasSetCommand(text) {
-  return hasTriggerWord(text) && /(?:^|\s)סט(?:ים)?(?=$|\s)/.test(text);
-}
-
-// ─── עיגון הפקודה למילת-הטריגר ─────────────────────────────────
-// דני כותב ללקוח משפט שלם ("אני יכול לשים אופציה\nאני מוסיף לך תמרים").
-// הפרסר התבלבל מהפתיח ותפס "יכול ל" כמזון. כאן חותכים כל מה שלפני מילת
-// הפקודה הראשונה ("מוסיף לך" וכו'), אבל שומרים מילת-ארוחה אם הופיעה בפתיח.
-function anchorToCommand(text) {
-  const t = (text || '').trim();
-  let best = -1;
-  for (const w of TRIGGER_WORDS) {
-    let idx = -1;
-    while ((idx = t.indexOf(w, idx + 1)) !== -1) {
-      if (_triggerBoundaryOK(t, idx)) {
-        if (best === -1 || idx < best) best = idx;
-        break;
-      }
-    }
-  }
-  const pm = t.match(PAST_CMD);
-  if (pm && pm.index !== undefined && (best === -1 || pm.index < best)) best = pm.index;
-  if (best <= 0) return t.replace(/^אני\s+/, '');  // אין פתיח לחתוך — התנהגות קיימת
-  const preamble = t.slice(0, best);
-  let anchored = t.slice(best).trim();
-  // שמירת מילת-ארוחה מהפתיח שנחתך (שלא נאבד "בבוקר"/"בערב")
-  const mealM = preamble.match(/(?:^|\s)ב?(בוקר|צהריים|צהרים|ערב|לילה|ביניים)(?=$|\s)/);
-  if (mealM && !new RegExp(mealM[1]).test(anchored)) anchored = 'ב' + mealM[1] + ' ' + anchored;
-  return anchored;
-}
-
-// ─── פיצול הודעה מרובת-הוספות לפקודות נפרדות ─────────────────────
-// דני שולח לעיתים כמה הוראות בהודעה אחת, כל אחת בשורה:
-//   "אני מוסיף לך אבקת חלבון...\nאני מוסיף לך פקאנים...\n..."
-// עד כה כל ההודעה רצה כתהליך אחד ונחנקה ב-timeout של 30 שניות.
-// כאן מפצלים לפי שורות: כל שורה שמתחילה במילת-טריגר = פקודה נפרדת;
-// שורה בלי טריגר בתחילתה = המשך של הפקודה הקודמת (לא חותכים באמצע משפט).
-// פועל-פתיחה בתחילת שורה גם כשחסר "לך" ("אני מוסיף מעדן..." — דני משמיט לעיתים).
-const _CMD_VERB_START = /^(?:מוסיף|תוסיף|אוסיף|נוסיף|מעלה|תעלה|מוריד|תוריד|מפחית|מחליף|תחליף|משנה|מכניס|תכניס)(?=\s|$)/;
-function splitBizCommands(text) {
-  const lines = String(text || '').split('\n');
-  const cmds = [];
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t) continue;
-    const body = t.replace(/^אני\s+/, '');
-    const startsTrigger = TRIGGER_WORDS.some(w => body.startsWith(w)) || _CMD_VERB_START.test(body) || PAST_CMD.test(body);
-    if (startsTrigger || cmds.length === 0) cmds.push(t);
-    else cmds[cmds.length - 1] += ' ' + t;  // צירוף שורת-המשך לפקודה הקודמת
-  }
-  return cmds.length ? cmds : [text];
-}
-
-function parseExerciseSwap(text) {
-  // "מחליף לך בתוכנית את לחיצת חזה ב-לחיצת ספסל"
-  const mFull = text.match(/(?:באימון|לאימון|[בלה]?ת[ו]?כנית)\s+(?:את\s+)?(.+?)\s+ב-?(.+)$/);
-  if (mFull) return { oldExercise: mFull[1].trim(), newExercise: mFull[2].trim() };
-  // "מחליף לך בתוכנית את לחיצת חזה" (בלי תרגיל חדש)
-  const mOld = text.match(/(?:באימון|לאימון|[בלה]?ת[ו]?כנית)\s+(?:את\s+)?(.+)$/);
-  if (mOld) return { oldExercise: mOld[1].trim(), newExercise: '' };
-  return null;
 }
 
 // הוספת/הורדת סט לתרגיל — "מוסיף לך עוד סט בלחיצת חזה" / "סט של 20 חזרות" / "מוריד לך סט"
@@ -1708,6 +1698,10 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
   if (opts.foodOverride) { args.push('--food'); args.push(opts.foodOverride); }
   if (opts.hintOverride) { args.push('--hint'); args.push(opts.hintOverride); }
   if (opts.mealOverride) { args.push('--meal'); args.push(opts.mealOverride); }
+  if (opts.mealIdOverride) { args.push('--meal-id'); args.push(String(opts.mealIdOverride)); }
+  if (Number.isInteger(opts.resumeOpIndex)) {
+    args.push('--resume-op-index'); args.push(String(opts.resumeOpIndex));
+  }
   if (opts.allowFuzzy)   { args.push('--allow-fuzzy'); }
   // עיגון למילת-הפקודה: חותך פטפוט מקדים ("אני יכול לשים אופציה...") שבלבל
   // את הפרסר, ומתחיל מ-"מוסיף לך"/"מוריד לך" וכו'. שומר מילת-ארוחה מהפתיח.
@@ -1794,6 +1788,9 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
     // ── אפשרויות מזון: שלח לקבוצה לבחירה ──────────────────────────
     if (raw.startsWith('FOOD_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
+      const meta = extractResumeOpMetadata(rest);
+      const retryOpts = { ...opts };
+      if (Number.isInteger(meta.resumeOpIndex)) retryOpts.resumeOpIndex = meta.resumeOpIndex;
       const headerBody = header.slice('FOOD_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
       const foodQuery = cleanPrefKey(sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '');
@@ -1804,13 +1801,13 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       const _fpref = foodQuery && !opts.skipFoodPref && !opts.foodOverride && foodPrefs.get(foodQuery.toLowerCase());
       if (_fpref && altNames.includes(_fpref)) {
         console.log(`[biz food-pref] "${foodQuery}" → "${_fpref}" (auto, זוכר בחירה)`);
-        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, foodOverride: _fpref });
+        runAutofitBiz(contactName, clientPhone, commandText, { ...retryOpts, foodOverride: _fpref });
         return;
       }
       const listMsg = altObjs.map((o, i) => `${i+1}. ${o.name}${o.cal > 0 ? ` — ${o.cal} קל` : ''}`).join('\n');
-      bizPending = { type: 'food_choice', contactName, clientPhone, commandText, alternatives: altNames, foodQuery, opts, timestamp: Date.now() };
+      bizPending = { type: 'food_choice', contactName, clientPhone, commandText, alternatives: altNames, foodQuery, opts: retryOpts, timestamp: Date.now() };
       // דיווח חלקי: ה-body מ-Python כולל קבלה (✅) של מה שכבר בוצע — שלח אותה קודם, ואז את החסר
-      const _fbody = rest.join('\n');
+      const _fbody = meta.lines.join('\n');
       const _qIdx = _fbody.indexOf('❓');
       const _receipt = _qIdx > 0 ? _fbody.slice(0, _qIdx).trim() : '';
       if (_receipt) await sendBizMessage(BIZ_GROUP, _receipt);
@@ -1821,6 +1818,9 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
     // ── אפשרויות hint (מזון להחלפה) ─────────────────────────────────
     if (raw.startsWith('HINT_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
+      const meta = extractResumeOpMetadata(rest);
+      const retryOpts = { ...opts };
+      if (Number.isInteger(meta.resumeOpIndex)) retryOpts.resumeOpIndex = meta.resumeOpIndex;
       const headerBody = header.slice('HINT_OPTIONS:'.length);
       const sepIdx = headerBody.indexOf('||');
       const hintQuery = cleanPrefKey(sepIdx >= 0 ? headerBody.slice(0, sepIdx) : '');
@@ -1831,11 +1831,11 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
       const _hpref = hintQuery && !opts.skipFoodPref && !opts.hintOverride && hintPrefs.get(hintQuery.toLowerCase());
       if (_hpref && altNames.includes(_hpref)) {
         console.log(`[biz hint-pref] "${hintQuery}" → "${_hpref}" (auto, זוכר בחירה)`);
-        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, hintOverride: _hpref });
+        runAutofitBiz(contactName, clientPhone, commandText, { ...retryOpts, hintOverride: _hpref });
         return;
       }
       const listMsg = altObjs.map((o, i) => `${i+1}. ${o.name}${o.cal > 0 ? ` — ${o.cal} קל` : ''}`).join('\n');
-      bizPending = { type: 'hint_choice', contactName, clientPhone, commandText, alternatives: altNames, hintQuery, opts, timestamp: Date.now() };
+      bizPending = { type: 'hint_choice', contactName, clientPhone, commandText, alternatives: altNames, hintQuery, opts: retryOpts, timestamp: Date.now() };
       await sendBizMessage(BIZ_GROUP, `❓ *${contactName}* — לא מצאתי *${hintQuery}*, מה שמצאתי:\n${listMsg}\n\n_השב_ *בחר N*, כתוב שם אחר, או *עוד*`);
       return;
     }
@@ -1843,9 +1843,12 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
     // ── המאכל-להחלפה בכמה ארוחות → שאל איזו / הכל ──────────────────
     if (raw.startsWith('MULTIMEAL:')) {
       const [header, ...rest] = raw.split('\n');
-      const meals = header.slice('MULTIMEAL:'.length).split('|').filter(Boolean);
-      const userMsg = rest.join('\n');
-      bizPending = { type: 'multimeal', contactName, clientPhone, commandText, alternatives: meals, opts, timestamp: Date.now() };
+      const meals = header.slice('MULTIMEAL:'.length).split('|').filter(Boolean).map(parseMealOptionToken);
+      const meta = extractResumeOpMetadata(rest);
+      const retryOpts = { ...opts };
+      if (Number.isInteger(meta.resumeOpIndex)) retryOpts.resumeOpIndex = meta.resumeOpIndex;
+      const userMsg = meta.lines.join('\n');
+      bizPending = { type: 'multimeal', contactName, clientPhone, commandText, alternatives: meals, opts: retryOpts, timestamp: Date.now() };
       await sendBizMessage(BIZ_GROUP, `*${contactName}*\n${userMsg}`);
       return;
     }
@@ -1853,9 +1856,12 @@ function runAutofitBiz(contactName, clientPhone, commandText, opts = {}) {
     // ── ארוחה לא ברורה ───────────────────────────────────────────────
     if (raw.startsWith('MEAL_OPTIONS:')) {
       const [header, ...rest] = raw.split('\n');
-      const alts = header.slice('MEAL_OPTIONS:'.length).split('|').slice(1);
-      const userMsg = rest.join('\n');
-      bizPending = { type: 'meal_choice', contactName, clientPhone, commandText, alternatives: alts, opts, timestamp: Date.now() };
+      const alts = header.slice('MEAL_OPTIONS:'.length).split('|').slice(1).map(parseMealOptionToken);
+      const meta = extractResumeOpMetadata(rest);
+      const retryOpts = { ...opts };
+      if (Number.isInteger(meta.resumeOpIndex)) retryOpts.resumeOpIndex = meta.resumeOpIndex;
+      const userMsg = meta.lines.join('\n');
+      bizPending = { type: 'meal_choice', contactName, clientPhone, commandText, alternatives: alts, opts: retryOpts, timestamp: Date.now() };
       await sendBizMessage(BIZ_GROUP, `⚠️ *${contactName}*\n${userMsg}\n\n_השב_ *בחר N*`);
       return;
     }
@@ -1960,7 +1966,9 @@ async function handleBizGroupResponse(text, quotedId = null) {
     const tl = t.replace(/[*]/g, '').trim();
     if (['הכל','הכול','כולן','כולם','שניהם','שתיהן','גם','גם וגם','all'].includes(tl)) {
       alternatives.forEach((meal, i) => {
-        setTimeout(() => runAutofitBiz(contactName, clientPhone, commandText, { ...opts, mealOverride: meal }), i * 3500);
+        setTimeout(() => runAutofitBiz(contactName, clientPhone, commandText, {
+          ...opts, mealOverride: meal.name, mealIdOverride: meal.id,
+        }), i * 3500);
       });
       return;
     }
@@ -1968,7 +1976,10 @@ async function handleBizGroupResponse(text, quotedId = null) {
     if (nm) {
       const idx = parseInt(nm[1]) - 1;
       if (idx >= 0 && idx < alternatives.length) {
-        runAutofitBiz(contactName, clientPhone, commandText, { ...opts, mealOverride: alternatives[idx] });
+        const meal = alternatives[idx];
+        runAutofitBiz(contactName, clientPhone, commandText, {
+          ...opts, mealOverride: meal.name, mealIdOverride: meal.id,
+        });
       }
     }
     return;
@@ -2120,7 +2131,7 @@ async function handleBizGroupResponse(text, quotedId = null) {
       if (idx >= 0 && idx < allAlts.length) chosen = allAlts[idx];
     } else if (t.length >= 2 && !t.includes('\n')) {
       // טקסט חופשי — אפשר גם לכתוב שם מזון
-      chosen = t;
+      chosen = type === 'meal_choice' ? { id: '', name: t } : t;
     }
 
     if (!chosen) return;
@@ -2134,7 +2145,17 @@ async function handleBizGroupResponse(text, quotedId = null) {
       if (hintQuery) { hintPrefs.set(hintQuery.toLowerCase(), chosen); savePrefs(); }
       runAutofitBiz(contactName, clientPhone, commandText, { ...opts, hintOverride: chosen });
     } else {
-      runAutofitBiz(contactName, clientPhone, commandText, { ...opts, mealOverride: chosen });
+      const meal = typeof chosen === 'string' ? { id: '', name: chosen } : chosen;
+      // שם כפול בטקסט חופשי אינו מזהה בחירה; דרוש מספר כדי לא לנחש ID.
+      const sameName = alternatives.filter(x => x.name === meal.name);
+      if (!meal.id && sameName.length > 1) {
+        bizPending = { type, contactName, clientPhone, commandText, alternatives, opts, timestamp: Date.now() };
+        await sendBizMessage(BIZ_GROUP, 'יש כמה ארוחות בשם הזה — השב *בחר N*.');
+        return;
+      }
+      runAutofitBiz(contactName, clientPhone, commandText, {
+        ...opts, mealOverride: meal.name, mealIdOverride: meal.id,
+      });
     }
   }
 }
@@ -2221,13 +2242,7 @@ async function processBizBody(body) {
   const contactName = body?.senderData?.chatName || clientPhone; // לתצוגה בקבלה בלבד
   console.log(`[biz] לקוח: "${contactName}" (${clientPhone})`);
   // חיפוש לפי טלפון תמיד — מהיר ואמין יותר
-  if (hasSetCommand(text)) {
-    runExerciseSetBiz(contactName, clientPhone, text, { nameOverride: clientPhone });
-  } else if (hasExerciseTrigger(text)) {
-    runExerciseSwapBiz(contactName, clientPhone, text, { nameOverride: clientPhone });
-  } else {
-    runAutofitBiz(contactName, clientPhone, text, { nameOverride: clientPhone });
-  }
+  dispatchBizCommands(contactName, clientPhone, text, '[biz]');
 }
 
 // ─── BIZ Polling loop — lastOutgoingMessages ──────────────────
@@ -2678,6 +2693,7 @@ app.listen(PORT, async () => {
     console.log('✅ BIZ polling started (instance', BIZ_ID, ')');
     bizPollLoop(); // לולאה אסינכרונית — לא חוסמת
     bizIncomingPollLoop(); // 🌉 קליטת הקלטות/תמונות-נכנסות מהגשר (נפרד מהפקודות)
+    mainIncomingPollLoop(); // 🌉 16.7: קליטת דני/רון מקו-הבוט דרך הגשר-הראשי (מחליף webhook)
     bizSyncMonitorLoop(); // ניטור סנכרון — מתריע אם הקו העסקי מנותק
     bizKeepaliveLoop(); // keepalive — מונע ניתוק session כל 40 דקות
   }

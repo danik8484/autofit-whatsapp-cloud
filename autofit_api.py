@@ -512,11 +512,23 @@ def find_meal_and_food(meals: list, meal_name: str, food_hint: str) -> tuple:
     # נרמל ה' הידיעה משם הארוחה לחיפוש ("ארוחת הערב" → "ארוחת ערב")
     _meal_search = re.sub(r'(?<=\s)ה(?=[א-ת])', '', meal_name).strip()
     target_meal = None
-    for m in meals:
-        db_name = m.get("meal_name", "")
-        if _meal_search in db_name or meal_name in db_name:
-            target_meal = m
-            break
+    # התאמה מדורגת — *לא* "הראשון שמכיל". שם-ארוחה קצר הוא תת-מחרוזת של ארוך
+    # ("ארוחת" בתוך "ארוחת ערב"), ולכן לולאת-הראשון כתבה לארוחה הלא-נכונה בשקט.
+    # הסדר קובע, ובשלושה מעברים נפרדים על *כל* הארוחות (לא break באמצע):
+    #   (1) שם זהה בדיוק כפי שנכתב  (2) שם זהה אחרי נרמול ה' הידיעה  (3) הכלה.
+    # בלי הפרדת (1) מ-(2), בקשה ל"ארוחת הערב" מול ["ארוחת ערב","ארוחת הערב"]
+    # נחטפה ע"י הראשונה (ביקורת-קודקס 19.7).
+    _norm_meal = lambda s: re.sub(r'(?<=\s)ה(?=[א-ת])', '', (s or '')).strip()
+    _named = [(m, (m.get("meal_name", "") or "").strip()) for m in meals]
+    target_meal = next((m for m, dn in _named if dn == meal_name.strip()), None)
+    if target_meal is None:
+        target_meal = next((m for m, dn in _named if _norm_meal(dn) == _meal_search), None)
+    if target_meal is None:
+        _cands = [(abs(len(dn) - len(_meal_search)), i, m)
+                  for i, (m, dn) in enumerate(_named)
+                  if _meal_search in dn or meal_name in dn]
+        if _cands:
+            target_meal = min(_cands, key=lambda c: (c[0], c[1]))[2]
     # נפילה רכה: שם הארוחה ב-DB מאוית לא נכון ("ארחת צהריים" במקום "ארוחת צהריים")
     # → התאמה fuzzy לפי דמיון מילים, כדי שטעות-כתיב בתפריט לא תחסום שינוי.
     if not target_meal and meals:
@@ -563,18 +575,32 @@ def find_meal_and_food(meals: list, meal_name: str, food_hint: str) -> tuple:
                     return False
             return True
 
-        # 1. חיפוש מדויק: כל מילות ה-hint מופיעות בשם המזון
-        match = next((f for f in foods if all(
-            w in _norm(f.get("food_name", ""))
-            for w in hint_words
-        )), None)
+        # 0. שם זהה לחלוטין — קודם כל השאר. בארוחה שיש בה גם "ביצה" וגם
+        #    "ביצה קשה בינונית", "מוריד לך 1 ביצה" הפחית את הארוכה רק כי היא
+        #    מופיעה ראשונה ברשימה (19.7). זהות מנצחת מיקום.
+        _hint_canon = _canon_cook(normalized_hint.lower())
+        match = next((f for f in foods
+                      if _canon_cook(_norm(f.get("food_name", "")).lower()) == _hint_canon), None)
 
-        # 2. חיפוש רחב — מילה ראשונה בלבד (substring)
+        # 1. חיפוש מדויק: כל מילות ה-hint מופיעות בשם המזון
         if not match:
+            match = next((f for f in foods if all(
+                w in _norm(f.get("food_name", ""))
+                for w in hint_words
+            )), None)
+
+        # 2. חיפוש רחב — מילה ראשונה בלבד (substring).
+        #    ⚠️ אותו שער כמו ב-fuzzy: אם דני נקב בשם מזון אמיתי ומלא ("לחם מחמצת")
+        #    ואין אותו בארוחה — אסור ליפול על "לחם מלא" רק כי המילה הראשונה זהה.
+        #    זו הפחתה ממזון שדני לא ביקש (ביקורת-קודקס 19.7).
+        if not match and not (len(hint_words) > 1 and _is_exact_food(normalized_hint)):
             match = next((f for f in foods if hint_words[0] in _norm(f.get("food_name", ""))), None)
 
-        # 3. fuzzy — סובלנות לטעויות כתיב (edit distance ≤ 1 לכל מילה)
-        if not match:
+        # 3. fuzzy — סובלנות לטעויות כתיב (edit distance ≤ 1 לכל מילה).
+        #    ⚠️ רק אם מה שדני כתב *אינו* מזון אמיתי בפני עצמו. "ביציה" זו טעות כתיב
+        #    ולכן מותר לתקן ל"ביצה"; "פיצה" הוא מזון אמיתי, ותיקונו ל"ביצה" הפחית
+        #    מזון שדני כלל לא ביקש (ביקורת-קודקס 19.7).
+        if not match and not _is_exact_food(normalized_hint):
             match = next((f for f in foods if _word_fuzzy(hint_words, f.get("food_name", ""))), None)
 
         # 4. רבים→יחיד: דני כותב "ביצים"/"עגבניות" אבל במאגר "ביצה קשה"/"עגבניה".
@@ -584,7 +610,9 @@ def find_meal_and_food(meals: list, meal_name: str, food_hint: str) -> tuple:
             for _sing in _singularize_query(normalized_hint):
                 _sw = _sing.split()
                 match = next((f for f in foods if all(w in _norm(f.get("food_name", "")) for w in _sw)), None)
-                if not match:
+                # אותו שער גם כאן: "פיצות" → יחיד "פיצה" → fuzzy → "ביצה". מסלול
+                # היחיד עקף את ההגנה והפחית מזון שדני לא ביקש (ביקורת-קודקס 19.7).
+                if not match and not _is_exact_food(_sing):
                     match = next((f for f in foods if _word_fuzzy(_sw, f.get("food_name", ""))), None)
                 if match:
                     break
@@ -653,6 +681,11 @@ def normalize_food_query(q: str) -> str:
     """מסיר ה' הידיעה, גרש, תווי תבנית (<>), ומנרמל ביטויי בישול נפוצים."""
     q = re.sub(r'[<>]', '', q)
     q = re.sub(r"['׳״]", '', q)  # גרש (' ׳ ״) — "קוטג'" → "קוטג"
+    # אחוזים במילים → סימן: המאמן כותב "קוטג 5 אחוז", המאגר כותב "גבינת קוטג' 5%".
+    # בלי ההמרה החיפוש נכשל, הבוט שואל לשווא ועלול לנחות על מזון אחר לגמרי.
+    # גבול-אות בסוף חובה: בלעדיו "5 אחוזי שומן" הפך ל-"5%י שומן" (הזנב נשאר).
+    q = re.sub(r'(\d+)[.,](\d+)\s*(?:%\s*)?אחוז(?:ים|י)?(?![א-ת])', r'\1.\2%', q)
+    q = re.sub(r'(\d+)\s*(?:%\s*)?אחוז(?:ים|י)?(?![א-ת])', r'\1%', q)
     # ביטויי בישול — תומך גם ב"הבישול" / "הבשול" (עם ה' הידיעה)
     q = re.sub(r'לפני\s+ה?(?:בישול|בשול)\b', 'לפני בישול', q)
     q = re.sub(r'(?:אחרי|לאחר)\s+ה?(?:בישול|בשול)\b', 'מבושל', q)
@@ -1014,26 +1047,45 @@ def add_food_to_meal(user_id: str, meal_id: int, food: dict, food_row: dict, gra
             "new_user_food_cup_value": str(food.get("cups") or food.get("cup_value") or "0.00"),
             "food_measure": "grams",
         }
+        # צילום מזהי-השורות *לפני* ההוספה — כדי לדעת בוודאות איזו שורה נולדה עכשיו.
+        _prev_ids = None
+        try:
+            for _mm in get_user_meals(str(user_id)):
+                if str(_mm.get("id")) == str(meal_id):
+                    _prev_ids = {str(f.get("id")) for f in (_mm.get("mealFoods") or [])}
+        except Exception:
+            _prev_ids = None            # לא הצלחנו לצלם → לא נוגעים אחרי ההוספה
         data = _post("/coach/v2-addUserMealFood", body)
         if data.get("status"):
-            # רשת ביטחון: ודא שהגרמים נכנסו בפועל — אם autofit שם measure="אחר"/יחידות
-            # והכמות ריקה, כפה אותה דרך update_food_quantity (שתמיד עובד).
+            # רשת ביטחון: autofit לפעמים שם measure="אחר" והכמות יוצאת ריקה — המזון
+            # נכנס לתפריט בכמות שגויה והבוט מדווח "✅ נוסף" (כשל שקט). הוחזרה אחרי
+            # שביקורת-פייבל 19.7 הצביעה שההגנה נמחקה לגמרי בתיקון ממצא 18.
+            # ⚠️ מתקנים *רק* שורה שלא הייתה קיימת לפני ההוספה. הגרסה הישנה חיפשה לפי
+            # food_id בלבד, וב-GET ישן היא "תיקנה" את השורה הוותיקה (ממצא 18).
             _target = str(grams_override or food.get("grams") or food.get("gram_value") or "100")
-            try:
-                _tg = float(_target)
-                _m2 = get_user_meals(str(user_id))
-                for _mm in _m2:
-                    if str(_mm.get("id")) == str(meal_id):
-                        _matches = [f for f in (_mm.get("mealFoods") or [])
-                                    if str(f.get("food_id")) == str(food.get("id"))]
-                        if _matches:
-                            _newest = max(_matches, key=lambda f: int(f.get("id", 0) or 0))
-                            _cq = _newest.get("quantity")
-                            _cqf = float(_cq) if _cq not in (None, "", "0", 0, "0.0") else 0.0
-                            if abs(_cqf - _tg) > 0.5:
-                                update_food_quantity(str(user_id), _newest["id"], _tg)
-            except Exception:
-                pass
+            if _prev_ids is not None:
+                try:
+                    _tg = float(_target)
+                    for _mm in get_user_meals(str(user_id)):
+                        if str(_mm.get("id")) != str(meal_id):
+                            continue
+                        _rows = _mm.get("mealFoods") or []
+                        # ה-GET חייב להראות *בדיוק* שורה אחת יותר מהצילום. "מזהה שלא היה
+                        # בצילום" לבדו אינו מוכיח שהשורה נוצרה מההוספה הזו — GET שמתקדם
+                        # חלקית עלול להראות שורה של פעולה אחרת (ביקורת-קודקס 19.7).
+                        if len(_rows) != len(_prev_ids) + 1:
+                            break
+                        _fresh = [f for f in _rows
+                                  if str(f.get("id")) not in _prev_ids
+                                  and str(f.get("food_id")) == str(food.get("id"))]
+                        if len(_fresh) != 1:
+                            break       # לא זוהתה שורה חדשה יחידה → לא נוגעים
+                        _row = _fresh[0]
+                        if abs(float(_row.get("quantity") or 0) - _tg) > 0.5:
+                            update_food_quantity(str(user_id), _row["id"], _tg)
+                        break
+                except Exception:
+                    pass
             return f"✅ נוסף: {food['food_name']}"
         return f"❌ שגיאת API: {data.get('message','')}"
 
@@ -1206,7 +1258,8 @@ def handle_calorie_offset(user_id: str, full_name: str, all_meals: list, coach_i
 
 
 def handle_calorie_adjust(user_id: str, full_name: str, all_meals: list,
-                          parsed: dict, meals_list: list, request_text: str) -> str:
+                          parsed: dict, meals_list: list, request_text: str,
+                          mutate_snapshot: bool = False) -> str:
     """מוסיף/מוריד N קלוריות ממזון *קיים* בארוחה ע\"י המרה לגרמים לפי היחס הקלורי
     של אותו המזון בתפריט (calories/quantity). דוגמה: 'מוריד לך 80 קלוריות מהפיתה בבוקר'."""
     reduce = bool(parsed.get("reduce"))
@@ -1306,6 +1359,16 @@ def handle_calorie_adjust(user_id: str, full_name: str, all_meals: list,
     if not upd.get("status"):
         return f"❌ שגיאת עדכון של {fname}: {upd.get('message','')}"
 
+    if mutate_snapshot:
+        # ממצא 22: בפיצולי אותה הודעה חייבים להמשיך מהכמות/קלוריות שנכתבו זה עתה.
+        # ברירת המחדל False שומרת על פונקציה טהורה לבדיקות ולקריאות מבודדות.
+        # ה-API מקבל int מעוגל; שמירת float תיאורטי כאן יצרה סטייה של גרם בפעולה הבאה.
+        _sent_q = int(round(new_q))
+        row["quantity"] = str(_sent_q)
+        if "quantity_to_calculate" in row:
+            row["quantity_to_calculate"] = str(_sent_q)
+        row["calories"] = (curr_cal * _sent_q / curr_q) if curr_q else 0
+
     msg = (f"✅ {verb}: *{fname}* ב{found_meal} של {full_name}\n"
            f"{sign}{int(round(cal_actual))} קל' → {_fq(curr_q)}{arrow}{_fq(new_q)} {_ulabel} "
            f"({int(round(curr_cal))}→{int(round(new_cal))} קל')")
@@ -1376,11 +1439,21 @@ def _extract_meal(text: str) -> str:
 
 _VERB_PAT = r"(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|מוסי(?:ף|פה|פים)|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להוסיף|להחליף|שימ[יי]?|תשימ[יי]?|הכנס[יי]?|הכניס|עדכן|עדכני|תשנ[יה])"
 
+# מילות-זמן של דני ("ערב השבוע" ← ראם 16.7 קיבל חיפוש "אורז שבוע") — מתארות מתי,
+# לא שם מזון. גבולות-אות שומרים על "תמרים"/"מחרוזת". "הערב"/"בערב" = ארוחה — בכוונה לא כאן.
+# ו' חיבור ("והשבוע") ותחילית "החל מ" ("החל ממחר") — ביקורת-קודקס 16.7.
+_TIME_WORDS_RE = re.compile(
+    r'(?<![א-ת])ו?(?:החל\s+מ?)?(?:השבוע(?:יים)?|החודש|היום|מ?מחר|בינתיים|זמנית|מ?עכשיו|מהיום|מעתה)(?![א-ת])'
+)
+
+def _strip_time_words(text: str) -> str:
+    return _TIME_WORDS_RE.sub(' ', text)
+
 def _extract_foods(text: str):
     """מחלץ (מזון_חדש, מזון_קיים) מטקסט. מחזיר (new_food, group_hint)."""
     # מילות-זמן ומילות-קישור של דני שאינן שם-מזון — להסיר שלא ידבקו לחיפוש.
     # ("שיבולת שועל אצלך כאופציה בתור לחם מעכשיו" → הבוט חיפש בטעות "עכשיו")
-    text = re.sub(r'(?<![א-ת])(?:מ?עכשיו|מהיום|מעתה|החל\s+מ?היום)(?![א-ת])', ' ', text)
+    text = _strip_time_words(text)
     text = re.sub(r'(?<![א-ת])אצל[ךוהםן](?![א-ת])', ' ', text)
     # "מוסיף לך/לו X" — כינוי-מושא בין הפועל למזון, לא חלק משם המזון
     text = re.sub(r'(?<![א-ת])ל[ךוה](?![א-ת])', ' ', text)
@@ -1571,8 +1644,11 @@ _MOD_UNITS = {'כפות':15,'כף':15,'כפיות':5,'כפית':5,'כוסות':2
 def _num_token(tok):
     return int(tok) if tok.isdigit() else _HEB_NUM.get(tok)
 
-def _normalize_units(text: str) -> str:
+def _normalize_units(text: str, preserve_egg_units: bool = False) -> str:
     """ממיר יחידות מידה לגרמים: עשרוני, קילו, ביצים, כפות/כפית/כוס/פרוסה."""
+    # 0) פסיק עשרוני → נקודה: דני כותב "12,5 גרם". בלי ההמרה הפסיק נראה כמפריד-רשימה,
+    #    ה-"12" נזרק ונוספו 5 גרם בלבד (ביקורת-קודקס 19.7). רק בין ספרה לספרה.
+    text = re.sub(r'(?<=\d),(?=\d)', '.', text)
     # 1) גרמים עשרוניים: "12.5 גרם" → "13 גרם" (autofit שולח שלם ממילא)
     text = re.sub(r'(\d+\.\d+)\s*גרם', lambda m: f"{int(round(float(m.group(1))))} גרם", text)
     # 2) קילו: חצי/רבע + "N קילו / ק\"ג"
@@ -1582,10 +1658,13 @@ def _normalize_units(text: str) -> str:
                   lambda m: f"{int(round(float(m.group(1))*1000))} גרם", text)
     text = re.sub(r'(?<![\d.\u05D0-\u05EA])קילו\b(?!\s*גרם)', '1000 גרם', text)  # "קילו" לבד
     _num_word = r'(?:\d+|' + '|'.join(_HEB_NUM) + r')'
-    # 3) ביצים: "N ביצים/ביצה" → "N*55 גרם ביצה" (היחידה היא המזון)
+    # 3) ביצים: בהוספה ממירים למשקל; בהפחתה משורה שמסומנת unit שומרים את
+    # מספר הביצים. המרה של "1 ביצה" ל-55 גרם גרמה לחישוב 3-55=0 יחידות.
     def _eggs(m):
         n = _num_token(m.group(1))
-        return f"{int(round(n*55))} גרם ביצה" if n else m.group(0)
+        if not n:
+            return m.group(0)
+        return f"{n} ביצה" if preserve_egg_units else f"{int(round(n*55))} גרם ביצה"
     text = re.sub(rf'\b({_num_word})\s+(?:ביצים|ביצה|ביצת)\b', _eggs, text)
     # 4) כף/כפית/כוס/פרוסה: "N <יחידה> [של] <מזון>" → "N*g גרם <מזון>" (lookahead שומר על המזון)
     _mod_pat = '|'.join(sorted(_MOD_UNITS, key=len, reverse=True))
@@ -1633,6 +1712,10 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
     """
     result = {}
     conf = 100
+    # חייבים ללכוד לפני ה-pre-processing: הוא מסיר את ההערה משם המזון.
+    # קודם הזיהוי נעשה רק אחר כך ולכן force_new תמיד היה False והמזון הקיים עודכן.
+    _force_new = bool(re.search(r'\bמ(?:זון|אכל|וצר)\s+חדש\b', text))
+    _force_new_marker = "__FORCE_NEW__"
 
     # ── pre-process: פקודות v3 ("מוסיף לך/לו") → פורמט שהפרסר מבין ───────────
     # ל[כךו]: לך (ך = כ סופית 0x5da) + לו — שתי הצורות
@@ -1645,18 +1728,45 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
     text = re.sub(r'^אני\s+', '', text)  # 'אני מוסיף לך' → 'מוסיף לך'
     # מילת-אישור בודדת בשורה ראשונה ("כן\nמוסיף לך...") = תשובה ללקוח → הסר
     text = re.sub(r'^\s*(?:כן|לא|אוקיי?|סבבה|בטח|יאללה|יאלה|מעולה|פגז|תודה|טוב|יופי|מצוין|סגור|בסדר|ברור|נכון)\s*\n', '', text)
-    # "מאכל/מזון/מוצר חדש" = הערה של דני, לא חלק משם המזון ("ריבה מאכל חדש" → "ריבה")
-    text = re.sub(r'\bמ(?:זון|אכל|וצר)\s+חדש\b', '', text)
+    # משאירים marker פנימי עד פענוח ה-op. כך "מזון חדש" בשורה אחת לא זולג
+    # לכל שאר הפעולות המובנות, אך עדיין מוסר משם המזון לפני החיפוש.
+    text = re.sub(r'\bמ(?:זון|אכל|וצר)\s+חדש\b', f' {_force_new_marker} ', text)
+    # מילות-זמן ("צהריים + ערב השבוע" ← ראם 16.7) — כאן, בשער הפענוח, שיחולו על כל
+    # סוגי הפקודות (הוספה/הפחתה/העלאה/החלפה), לא רק על חילוץ-מזון.
+    text = _strip_time_words(text)
     # שם-פנייה מוביל ("ליה הורדתי לך 30 גרם" / "אילן אני מוסיף לך") — ב-skip_name השם
     # מגיע מהטלפון, אז מילה מובילה לפני פועל-פקודה היא פנייה ללקוח, לא חלק מהמזון → הסר.
     if skip_name:
         _vcmd = (r'(?:מוסי[פף]|תוסי[פף]|אוסי[פף]|נוסי[פף]|מוריד|תוריד|הורד\w*|הוספ\w*'
                  r'|מעלה|תעלה|העל\w*|מחלי[פף]|תחלי[פף]|החלפ\w*|מפחי\w*|הפח\w*'
                  r'|מכניס|תכניס|הכנס\w*|משנה|שינ\w*)')
-        text = re.sub(rf'^\s*[\u05D0-\u05EA]{{2,12}}\s+(?=(?:אני\s+)?{_vcmd}(?![\u05D0-\u05EA]))',
+        # ⚠️ אל תמחק מילת-ארוחה מובילה. "בצהריים אני מוריד לך 50 גרם אורז" — ה"בצהריים"
+        # נמחק כאילו היה שם-לקוח, הארוחה נפלה לברירת-המחדל, והשינוי נכתב *לערב*
+        # במקום לצהריים (ביקורת-קודקס 19.7).
+        _meal_lead = r'[בלמ]?ה?(?:בוקר|צהריי?ם|ערב|ביניי?ם|לילה)'
+        text = re.sub(rf'^\s*(?!{_meal_lead}(?![\u05D0-\u05EA]))'
+                      rf'[\u05D0-\u05EA]{{2,12}}\s+(?=(?:אני\s+)?{_vcmd}(?![\u05D0-\u05EA]))',
                       '', text, count=1)
         text = re.sub(r'^אני\s+', '', text)
-    text = _normalize_units(text)  # יחידות → גרמים (ביצים/כפות/קילו/עשרוני)
+    _egg_reduce_re = re.compile(
+        r'(?<![א-ת])(?:מוריד|תוריד[יי]?|הוריד|הורדתי|הורד[יי]?|מפחית|תפחית[יי]?|הפחת[תיי]?)(?![א-ת])'
+    )
+    _egg_reduce = bool(_egg_reduce_re.search(text))
+    _egg_count_requested = bool(
+        _egg_reduce and re.search(
+            r'\b(?:\d+|' + '|'.join(_HEB_NUM) + r')\s+(?:ביצים|ביצה|ביצת)\b',
+            text,
+        )
+    )
+    if re.search(r'(?m)^\s*הוספה\s*:', text):
+        # ממצא 15: פועל הפחתה בשורה אחת לא קובע את יחידת הביצה בשורה אחרת.
+        # כל שורת פעולה מנורמלת לפי הפועל המקומי שלה בלבד.
+        text = '\n'.join(
+            _normalize_units(line, preserve_egg_units=bool(_egg_reduce_re.search(line)))
+            for line in text.split('\n')
+        )
+    else:
+        text = _normalize_units(text, preserve_egg_units=_egg_reduce)
     # ── קיזוז קלורי + אופציות מרובות — זהה וחתוך לפני נרמול V3 ─────────────
     # (חיוני: 'מוריד' שב-V3 הופך ל'הפחת' היה שובר את זיהוי הקיזוז)
     _off = _split_offset(text)
@@ -1777,7 +1887,24 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
             # תמיכה בריבוי ארוחות: "ערב + צהריים" → שמור רשימה
             # לא מפצלים על "ו" בתוך מילה (כמו "הבוקר") — רק "ו" עם רווחים משני צדדיו
             parts = re.split(r'[+,]|\s+[וV]\s*', val)
-            all_m = [m for p in parts for m in [_extract_meal(p.strip())] if m]
+            all_m = []
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                # שם מלא עשוי להכיל משמעות אחרי מילת הזמן
+                # ("צהריים אחרי בישול"); _extract_meal היה מכווץ אותו לצהריים.
+                # ממצא 7: גם בלי הקידומת "ארוחת" זהו שם מלא, לא תווית זמן פשוטה.
+                _simple_meal = re.fullmatch(
+                    r'[בלמ]?ה?(?:ארוחת\s+ה?)?(?:ערב|בוקר|צהריים|צהרים|ביניים|בינים|לילה)',
+                    p,
+                )
+                _extracted_meal = _extract_meal(p)
+                m = (p if (p.startswith("ארוחת") or
+                           (_extracted_meal and not _simple_meal))
+                     else _extracted_meal)
+                if m:
+                    all_m.append(m)
             meals = list(dict.fromkeys(all_m))  # dedup תוך שמירת סדר (לילה+ערב→ערב פעם אחת)
             if len(meals) > 1:
                 result["meals"] = meals  # ריבוי ארוחות
@@ -1790,6 +1917,8 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
             meal_key = _extract_meal(key)
             result.setdefault("meal", meal_key)  # so free-text _bare_meal_re fires
             v = val.strip()
+            _meal_op_force_new = _force_new_marker in v
+            v = v.replace(_force_new_marker, ' ').strip()
             v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
             # multi-food: "20 גרם X ו-15 גרם Y" → multiple ops
             _mf_s = _detect_multi_food(v)
@@ -1799,6 +1928,8 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
                     _mf_op_d = {"change": _mf_ch, "meal": meal_key}
                     if _mf_grams:
                         _mf_op_d["extra_grams"] = _mf_grams
+                    if _meal_op_force_new:
+                        _mf_op_d["force_new"] = True
                     if "ops" not in result:
                         result["ops"] = []
                     result["ops"].append(_mf_op_d)
@@ -1810,9 +1941,15 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
                     ml = re.search(r'^(.+?)\s+ל([\u05D0-\u05EA].+)$', v)
                     nf, ht = (ml.group(1), ml.group(2)) if ml else (v, "")
                 op = f"הוסף ({nf.strip()}) במקום ({ht.strip()})" if ht.strip() else f"הוסף ({nf.strip()})"
+                op_dict = {"meal": meal_key, "change": op}
+                if _meal_op_force_new:
+                    op_dict["force_new"] = True
                 if "extra_ops" not in result:
                     result["extra_ops"] = []
-                result["extra_ops"].append({"meal": meal_key, "change": op})
+                result["extra_ops"].append(op_dict)
+                # גם שורת-ארוחה היא פעולה מלאה. קודם היא נשמרה רק ב-extra_ops,
+                # אבל execute_request קרא את ops ולכן ביצע רק את השורה הראשונה.
+                result.setdefault("ops", []).append(op_dict)
         elif key in ("שנה", "change", "פעולה", "בקשה"):
             result["change"] = _wrap_change_foods(val)
         elif key in ("החלף", "הוסף", "תחליף"):
@@ -1836,9 +1973,16 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
             # גם: "X, Y" בשורה אחת = 2 פעולות, "בנוסף ל" = synonym ל-"ל"
             def _parse_one_op(raw):
                 v = raw.strip()
+                _op_force_new = _force_new_marker in v
+                v = v.replace(_force_new_marker, ' ').strip()
                 # strip outer parens: "(80 גרם אורז)" → "80 גרם אורז"
                 if v.startswith('(') and v.endswith(')'):
                     v = v[1:-1].strip()
+                # ממצא 21: יחידת קלוריות שייכת לפעולה הזו בלבד. המרה גלובלית
+                # גרמה לכל שורות ההוספה הבאות להיכנס למסלול הקלורי או להיעלם.
+                _op_cal_mode = bool(_CAL_UNIT_RE.search(v))
+                if _op_cal_mode:
+                    v = _CAL_UNIT_RE.sub(r'\1 גרם', v)
                 _op_reduce = bool(re.match(r'^(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|תפחית|תפחיתי|הורידי)\s+', v))
                 v = re.sub(r'^(?:הורד|הפחת|תוריד|תורידי|הפחיתי|הפחית|תפחית|תפחיתי|הורידי)\s+', '', v)
                 v = re.sub(r'^(?:הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|תחליפ[יי]?)\s+', '', v)
@@ -1868,6 +2012,15 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
                         if m_ge:
                             extra_grams = m_ge.group(2)
                             v = m_ge.group(1).strip()
+                # ממצא 15: בהפחתת "1 ביצה" המספר הוא מספר יחידות, לא גרמים.
+                # שומרים את סוג הכמות עד שנדע אם שורת התפריט נמדדת ביחידות או במשקל.
+                _egg_count_op = False
+                if _op_reduce and not extra_grams:
+                    _egg_m = re.match(r'^(\d+)\s+(ביצ(?:ה|ים|ת)\b.*)$', v)
+                    if _egg_m:
+                        extra_grams = _egg_m.group(1)
+                        v = _egg_m.group(2).strip()
+                        _egg_count_op = True
                 # זהה ארוחה ספציפית בתוך הפעולה ("בבוקר", "בצהריים")
                 op_meal = _extract_meal(v)
                 if op_meal:
@@ -1886,6 +2039,12 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
                 op_dict = {"change": change, "meal": op_meal, "extra_grams": extra_grams, "as_option": _is_option}
                 if _op_reduce:
                     op_dict["reduce"] = True
+                if _egg_count_op:
+                    op_dict["quantity_kind"] = "egg_count"
+                if _op_cal_mode:
+                    op_dict["_cal_mode"] = True
+                if _op_force_new:
+                    op_dict["force_new"] = True
                 return op_dict
 
             # פצל ב-comma לפעולות מרובות
@@ -1909,8 +2068,23 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
         result.setdefault("meal", first_op["meal"])
 
     if "name" in result and "change" in result:
+        # פורמטים כמו "הוסף:"/"שנה:" אינם עוברים דרך _parse_one_op; מנקים גם
+        # בהם את ה-marker לפני חיפוש המזון, בלי לאבד את force_new הגלובלי היחיד.
+        result["change"] = re.sub(
+            r'\s*' + re.escape(_force_new_marker) + r'\s*', ' ', result["change"]
+        ).strip()
+        for _structured_op in result.get("ops", []):
+            _structured_op["change"] = re.sub(
+                r'\s*' + re.escape(_force_new_marker) + r'\s*',
+                ' ',
+                _structured_op.get("change", ""),
+            ).strip()
         result.setdefault("meal", "ערב")
         result["confidence"] = 100
+        # כשיש op מסומן, force_new שייך רק לו. בפורמטים ישנים ללא ops נשמרת
+        # התאימות של דגל גלובלי לפקודה היחידה.
+        if _force_new and not any(op.get("force_new") for op in result.get("ops", [])):
+            result["force_new"] = True
         return result
 
     # הודעה מובנית (יש שם/ארוחה) אבל חסר הוספה — לא נפול לfree-text
@@ -1921,6 +2095,8 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
     if "name" in result and _has_structured_key:
         result.setdefault("meal", "ערב")
         result["confidence"] = 100
+        if _force_new:
+            result["force_new"] = True
         return result  # חסר change — execute_request יחזיר "חסר מה להוסיף"
 
     # ── שפה חופשית ───────────────────────────────────────────────────────────
@@ -1933,9 +2109,9 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
     full = re.sub(r'לפני\s+ה?שינה', 'לילה', full)
     full = re.sub(r'ארוחת\s+לילה', 'לילה', full)
     # "מזון חדש" = פקודה, לא שם/מזון — נסיר לפני חילוץ
-    _force_new = bool(re.search(r'\bמזון\s+חדש\b', full))
     if _force_new:
-        full = re.sub(r'\bמזון\s+חדש\b', '', full)
+        full = re.sub(r'\bמ(?:זון|אכל|וצר)\s+חדש\b', '', full)
+        full = full.replace(_force_new_marker, ' ')
         full = re.sub(r'\s+', ' ', full).strip()
 
     # "ב-X גרם" / "ב50 גרם" → "X גרם" (כמות יחסית)
@@ -2232,6 +2408,13 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
     if not result.get("ops") and not result.get("change"):
         # strip leading verb — may be present when name came from "לNAME" pattern
         _cf_for_multi = re.sub(r'^(?:' + _VERB_PAT + r')\s+', '', clean_full).strip()
+        # hint בסוף שייך לכל זוגות הכמות, לא רק לאחרון. קודם _detect_multi_food
+        # בלע אותו בתוך שם המזון השני, ולכן רק הפסטה נכתבה והבננה ביקשה בחירה.
+        _shared_multi_hint = ""
+        _shared_hint_m = re.search(r'\s+במקום\s+(.+)$', _cf_for_multi)
+        if _shared_hint_m:
+            _shared_multi_hint = _strip_definite_article(_shared_hint_m.group(1).strip())
+            _cf_for_multi = _cf_for_multi[:_shared_hint_m.start()].strip()
         _mf = _detect_multi_food(_cf_for_multi)
         if _mf and len(_mf) >= 2:
             _mf_meal = result.get("meal") or _extract_meal(full) or "ערב"
@@ -2241,7 +2424,14 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
             result["ops"] = []
             for _mfi, (_mf_food, _mf_grams) in enumerate(_mf):
                 _mf_food = _strip_definite_article(_mf_food.strip())
-                _mf_op: dict = {"change": f"הוסף ({_mf_food})", "meal": _mf_meal}
+                _mf_change = f"הוסף ({_mf_food})"
+                if _shared_multi_hint:
+                    _mf_change += f" במקום ({_shared_multi_hint})"
+                _mf_op: dict = {
+                    "change": _mf_change,
+                    "meal": _mf_meal,
+                    "as_option": bool(re.search(r'כאופצי(?:ה|ות)', text)),
+                }
                 _qty = _mf_grams or (_pre_grams if _mfi == 0 else None)
                 if _qty:
                     _mf_op["extra_grams"] = _qty
@@ -2348,6 +2538,8 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
         result["force_new"] = True
     if _reduce:
         result["reduce"] = True
+    if _reduce and _egg_count_requested:
+        result["quantity_kind"] = "egg_count"
     return result
 
 
@@ -2362,16 +2554,39 @@ _MULTI_VERBS = (r'(?:'
                 r'|שים|תשים|מכניס|תכניס|הכנס'                                # שימה/הכנסה
                 r')')
 
+# מילות-נימוס/פנייה שיכולות להקדים את השלילה ("בבקשה לא להוסיף", "אחי אל תוסיף").
+# בלעדיהן העוגן ^ פספס את השלילה — והבוט *ביצע* בדיוק את מה שדני ביקש לא לעשות (19.7).
 _NEGATION_PREFIX = re.compile(
-    r'^\s*(?:אל\s+ת'
+    r'^\s*(?:(?:בבקשה|אנא|תשמע|שמע|אחי|רגע|בינתיים|כרגע|אוקיי?|סבבה|אני|אנחנו)[\s,]+){0,3}'
+    r'(?:אל\s+ת'
     r'|לא\s+(?:ל(?:הוסיף|החליף|עדכן|שנות|הוריד|העלות|העלות|הפחית|הגדיל)'
-    r'|ת(?:וסיפ|חליפ|עלה|עלי|ורידי|וריד|גדיל|פחית)))',
+    r'|ת(?:וסיפ|חליפ|עלה|עלי|ורידי|וריד|גדיל|פחית)'
+    # הווה ועבר בשלילה: "אני לא מוריד לך 50 גרם" / "לא הורדתי 50 גרם, השארתי כרגיל".
+    # קודם נתפסו רק "לא להוריד"/"לא תוריד", והבוט *הוריד* בפועל (ביקורת-קודקס 19.7).
+    r'|(?:מוסיף|מוריד|מחליף|מעלה|מפחית|משנה|מכניס|שם)(?![א-ת])'
+    r'|(?:הוספתי|הורדתי|החלפתי|העליתי|הפחתתי|שיניתי|הכנסתי)(?![א-ת])))',
     re.UNICODE
 )
 
 _READ_QUERY_PAT = re.compile(
     r'(?:מה\s+(?:יש|אוכל|קיים|נמצא)|תראי?\s+מה\s+יש|תבדקי?\s+מה\s+יש'
     r'|כמה\s+(?:יש|גרם)|מה\s+(?:יש\s+)?ב(?:ארוחת?\s+)?(?:ערב|בוקר|צהריים))',
+    re.UNICODE
+)
+
+# פועל-קביעה: "עדכן ל-100 גרם" / "שנה ל-100" = הכמות החדשה היא 100, לא +100.
+# ("מוסיף"/"מעלה" נשארים חיבור.) בלי ההבחנה הזו "עדכן 100 גרם" הפך 250 ל-350 (19.7).
+_SET_QTY_VERB = re.compile(
+    r'(?<![א-ת])(?:עדכן|עדכני|תעדכן|תעדכני|לעדכן|שנה|תשנ[יה]|לשנות|קבע|תקבע|קבעי)(?![א-ת])',
+    re.UNICODE
+)
+
+# פועל-חיבור. כשהוא מופיע בהודעה יחד עם פועל-קביעה, החיבור מנצח — "תעדכן לדני
+# בבקשה, מוסיף לך 50 גרם" היא הוספה, לא קביעה (ביקורת-פייבל 19.7).
+_ADD_QTY_VERB = re.compile(
+    r'(?<![א-ת])(?:מוסי[פף]\w*|תוסי[פף]\w*|אוסי[פף]\w*|נוסי[פף]\w*'
+    r'|הוסי[פף]\w*|הוסף|להוסיף|מעלה|תעל\w*|להעלות'
+    r'|מכניס\w*|תכניס\w*|להכניס|הוספתי|העליתי|הכנסתי)(?![א-ת])',
     re.UNICODE
 )
 
@@ -2384,9 +2599,15 @@ _ACTION_VERB_PAT = re.compile(
 
 
 def _handle_read_query(request_text: str, name_override: str = "",
-                       meal_override: str = "", user_id_override: str = "") -> str:
+                       meal_override: str = "", user_id_override: str = "",
+                       meal_id_override: str = "") -> str:
     """שאילתת קריאה: 'מה יש לדני בצהריים?' → רשימת מזונות ללא שינוי."""
-    meal_key = _extract_meal(meal_override) if meal_override else _extract_meal(request_text)
+    # override עשוי להיות שם מלא שנבחר מהרשימה; אסור לכווץ
+    # "ארוחת צהריים" ל"צהריים" ולאבד את ההתאמה המדויקת.
+    if meal_override and meal_override.strip().startswith("ארוחת"):
+        meal_key = meal_override.strip()
+    else:
+        meal_key = _extract_meal(meal_override) if meal_override else _extract_meal(request_text)
 
     if name_override:
         name = name_override
@@ -2436,12 +2657,26 @@ def _handle_read_query(request_text: str, name_override: str = "",
                 lines.append(f"  • {f.get('food_name','')}" + (f" {qty}ג'" if qty else ""))
         return "\n".join(lines) if len(lines) > 1 else f"לא נמצא תפריט עבור {full_name}"
 
-    full_meal = _meal_map_rq.get(meal_key, f"ארוחת {meal_key}")
-    target = next(
-        (m for m in all_meals
-         if full_meal in m.get("meal_name","") or m.get("meal_name","") in full_meal),
-        None
-    )
+    full_meal = (_meal_map_rq.get(meal_key, f"ארוחת {meal_key}")
+                 if not str(meal_key).startswith("ארוחת") else str(meal_key))
+    _named = [(m, (m.get("meal_name", "") or "").strip()) for m in all_meals]
+    target = (next((m for m, _ in _named
+                    if str(m.get("id")) == str(meal_id_override)), None)
+              if meal_id_override else None)
+    if meal_id_override and target is None:
+        return "❌ הארוחה שנבחרה כבר אינה קיימת; לא בוצעה פעולה."
+    if target is None:
+        target = next((m for m, db_name in _named if db_name == full_meal), None)
+    if target is None:
+        _norm_m = lambda s: re.sub(r'(?<=\s)ה(?=[א-ת])', '', s).strip()
+        target = next((m for m, db_name in _named
+                       if _norm_m(db_name) == _norm_m(full_meal)), None)
+    if target is None:
+        _contains = [(abs(len(db_name) - len(full_meal)), i, m)
+                     for i, (m, db_name) in enumerate(_named)
+                     if full_meal in db_name or db_name in full_meal]
+        if _contains:
+            target = min(_contains, key=lambda x: (x[0], x[1]))[2]
     if not target:
         return f"לא מצאתי {full_meal} עבור {full_name}"
 
@@ -2460,6 +2695,18 @@ def _handle_read_query(request_text: str, name_override: str = "",
 # לא כולל "עם" (לרוב מנה אחת: "סלט עם עגבניות") ולא "בנוסף ל" (מטופל כ-hint).
 _FOOD_SEP_RE = r'\s*,\s*|\s*\+\s*|\s*/\s*|\s+ו-?גם\s+|\s+ו(?:\s+|(?=[א-ת]))|\s+גם\s+|\s+או\s+'
 
+
+def _meal_option_token(meal: dict) -> str:
+    """מקודד גם מזהה וגם תווית; שם לבדו אינו חד-משמעי כשיש שתי ארוחות זהות."""
+    name = (meal.get("meal_name", "") or "").strip()
+    mid = meal.get("id")
+    return f"{mid}::{name}" if mid not in (None, "") else name
+
+
+def _decode_meal_option(token: str) -> tuple:
+    m = re.match(r'^\s*(\d+)::(.*)$', token or "")
+    return (m.group(1), m.group(2).strip()) if m else ("", (token or "").strip())
+
 def _is_exact_food(token: str, coach_id: str = "") -> bool:
     """האם token הוא שם מזון מדויק במאגר (עמיד-לבישול). לשימוש ב-tokenization חמדני.
     תומך גם באליאס וברבים→יחיד ('שיבולות שועל' = 'שיבולת שועל') כדי שפיצול מולטי-מזון
@@ -2471,6 +2718,11 @@ def _is_exact_food(token: str, coach_id: str = "") -> bool:
         qc = _canon_cook(t.lower())
         return any(_canon_cook(f.get("food_name", "").lower()) == qc for f in search_food(t, coach_id))
     if _hit(token):
+        return True
+    # צורה מנורמלת: דני כותב "קוטג 5 אחוז", המאגר "קוטג 5%" — בלי זה השם המדויק
+    # לא מזוהה ו-"קוטג 5 אחוז ולחם" לא מתפצל (ביקורת-קודקס 19.7).
+    _nt = normalize_food_query(token)
+    if _nt != token and _hit(_nt):
         return True
     alias = _FOOD_ALIASES.get(token)
     if alias and _hit(alias):
@@ -2487,6 +2739,13 @@ def _split_multi_new_food(new_foods_str: str, coach_id: str = ""):
     s = (new_foods_str or "").strip()
     if not s:
         return []
+    # "1,5 אחוז" → "1.5%" *לפני* בדיקת הפסיק, אחרת הפסיק העשרוני נראה כמפריד-רשימה
+    # ו-"יוגורט 1,5 אחוז" נחתך ל-"יוגורט 1" + "5 אחוז" (ביקורת-קודקס 19.7).
+    s = re.sub(r'(\d+)[.,](\d+)\s*(?:%\s*)?אחוז(?:ים|י)?(?![א-ת])', r'\1.\2%', s)
+    # פסיק עשוי להיות חלק משם המוצר עצמו. בדיקת השם השלם חייבת להקדים את
+    # מפרידי הרשימה, אחרת מוצר מדויק כמו סאנט דלפור נחתך ונשלח ל-FOOD_OPTIONS.
+    if _is_exact_food(s, coach_id):
+        return [s]
     # ספרת-גרמים בלבד מבטלת פיצול (מטופל בפיצול הגרמים). ספרה שהיא חלק משם מזון
     # ("קוטג 5%", "גבינה לבנה 3%") לא צריכה לבטל פיצול-רשימה מפורש.
     _has_grams = bool(re.search(r'\d+\s*(?:גרם|גר(?![א-ת])|ג(?![א-ת]))', s))
@@ -2495,13 +2754,26 @@ def _split_multi_new_food(new_foods_str: str, coach_id: str = ""):
     if not _has_grams and re.search(r'[,+/]|\sו-?גם\s|\sגם\s|\sאו\s', s):
         parts = [p.strip() for p in re.split(_FOOD_SEP_RE, s) if p.strip()]
         return parts if len(parts) >= 2 else [s]
-    if re.search(r'\d', s):  # מספרים/גרמים → מטופלים בפיצול הגרמים הנפרד
+    if re.search(r'\d', s):
+        # ספרת-גרמים → הפיצול לפי גרמים מטפל בזה. ספרת-אחוז ("קוטג 5 אחוז ולחם")
+        # היא חלק משם המזון, ולכן מותר לה להמשיך לגיבוי-ו' (ביקורת-קודקס 19.7).
+        if _has_grams:
+            return [s]
+        return _split_on_vav_fallback(s, coach_id)
+    # השם השלם קיים במאגר → מוצר אחד, לא רשימה. חייב לרוץ *לפני* החמדני:
+    # "חזה עוף ואורז" הוא מזון אמיתי, והחמדני היה מפצל אותו לשתי תוספות שגויות
+    # כי גם "חזה עוף" וגם "אורז" מדויקים בפני עצמם (ביקורת-קודקס 19.7).
+    if _is_exact_food(s, coach_id):
         return [s]
+    # כשיש ו' חיבור, ה-greedy מוחק אותה לפני ההתאמה ועלול להעדיף שם קצר
+    # ("חזה עוף") על prefix מדויק ארוך ("חזה עוף ואורז"). שמור את הגבולות.
+    if _VAV_SPLIT_RE.search(s):
+        return _split_on_vav_fallback(s, coach_id)
     # רווחים + 'ו' — חמדני: פצל רק אם כל הטוקנים מזון מדויק
     words = re.sub(_FOOD_SEP_RE, ' ', s).split()  # 'ו' צמוד → רווח
     if len(words) < 2:
         return [s]
-    tokens, i = [], 0
+    tokens, i, greedy_ok = [], 0, True
     while i < len(words):
         matched = None
         for j in range(min(len(words), i + 4), i, -1):  # הצירוף הארוך ביותר שהוא מזון
@@ -2510,10 +2782,76 @@ def _split_multi_new_food(new_foods_str: str, coach_id: str = ""):
                 matched = (cand, j)
                 break
         if not matched:
-            return [s]  # מילה שאינה מזון → כנראה שם רב-מילי/טעות → אל תפצל
+            greedy_ok = False  # מילה שאינה מזון → כנראה שם רב-מילי/טעות → נסה גיבוי-ו'
+            break
         tokens.append(matched[0])
         i = matched[1]
-    return tokens if len(tokens) >= 2 else [s]
+    if greedy_ok and len(tokens) >= 2:
+        return tokens
+    return _split_on_vav_fallback(s, coach_id)
+
+
+_VAV_SPLIT_RE = re.compile(r'\s+ו-?(?:גם\s+)?(?=[א-ת])|\s+ו\s+')
+_HEADWORD_MIN = 5      # כמה שמות במאגר חייבים *להתחיל* במילה כדי שתיחשב קטגוריית-מזון
+_headword_cache: dict = {}
+
+
+def _is_food_headword(token: str, coach_id: str = "") -> bool:
+    """האם המילה היא קטגוריית-מזון שדני משתמש בה ('לחם', 'פסטה', 'אורז') — כלומר
+    מילה שהרבה שמות במאגר *מתחילים* בה. זה מה שמבדיל 'לחם' (93 שמות מתחילים בו,
+    אבל אין מזון בשם 'לחם' לבדו) מ'גרעינים'/'תרד'/'ניל' (0-1) שהן מילים בתוך שם
+    מוצר ארוך. בלי ההבחנה הזו הגיבוי היה חותך שמות אמיתיים באמצע."""
+    tok = (token or "").strip()
+    if len(tok) < 3 or " " in tok or re.search(r'\d', tok):
+        return False
+    key = (tok, coach_id)
+    if key in _headword_cache:
+        return _headword_cache[key]
+    try:
+        n = sum(1 for f in search_food(tok, coach_id)
+                if normalize_food_query(f.get("food_name", "")).lower().startswith(tok.lower()))
+    except Exception:
+        n = 0
+    _headword_cache[key] = n >= _HEADWORD_MIN
+    return _headword_cache[key]
+
+
+def _split_on_vav_fallback(s: str, coach_id: str = "", _depth: int = 0) -> list:
+    """גיבוי לפיצול חמדני שוויתר: 'פסטה ולחם' לא פוצל כי 'לחם' אינו שם מדויק
+    במאגר (יש רק סוגי לחם), ולכן הבוט חיפש מזון יחיד בשם 'פסטה ולחם' והחזיר זבל.
+
+    חותכים ב-ו' *אחת בכל פעם*, משמאל לימין, ורק כשהחצי השמאלי הוא שם-מזון מדויק
+    והימני מזון מדויק או קטגוריית-מזון. כך:
+      'פשטידת קוטג ותרד ולחם' → ['פשטידת קוטג ותרד', 'לחם']  (החיתוך הראשון נדחה
+        כי 'פשטידת קוטג' אינו שם מדויק — לא חותכים מוצר באמצע)
+      'לחם מחמצת וגרעינים'    → נשאר שלם ('גרעינים' אינה קטגוריה)
+      'ריבה ולחם'             → ['ריבה', 'לחם']
+    ⚠️ אין להשתמש כאן ב-find_best_food כבדיקת 'השלם קיים': יש לו ברירות-מחדל
+    (למשל 'ריבה' → מעדן סאנט דלפור) שמחזירות התאמה גם למחרוזת שאינה שם אמיתי,
+    וכך הלחם היה נעלם בשקט. _is_exact_food הוא הבדיקה האמינה."""
+    if _depth > 4:
+        return [s]
+    s = (s or "").strip()
+    if _is_exact_food(s, coach_id):
+        return [s]                       # שם אמיתי שמכיל ו' ('פשטידת קוטג ותרד')
+    # מימין לשמאל = prefix שמאלי ארוך ביותר קודם; כך שם מוצר מדויק מנצח
+    # את תתי-המזונות המדויקים שמרכיבים אותו.
+    for m in reversed(list(_VAV_SPLIT_RE.finditer(s))):
+        left, right = s[:m.start()].strip(), s[m.end():].strip()
+        if not left or not right:
+            continue
+        if not (_is_exact_food(left, coach_id) or _is_food_headword(left, coach_id)):
+            continue                     # אל תחתוך מוצר באמצע — נסה את ה-ו' הבאה
+        if _is_exact_food(right, coach_id) or _is_food_headword(right, coach_id):
+            return [left] + _split_on_vav_fallback(right, coach_id, _depth + 1)
+        # הימני אינו מזון בודד — אבל אולי הוא עצמו רשימה ("בננה ולחם" בתוך
+        # "פסטה ובננה ולחם"). ננסה לפרק אותו; רק אם הצליח נאשר את החיתוך כאן.
+        _rest = _split_on_vav_fallback(right, coach_id, _depth + 1)
+        if len(_rest) >= 2:
+            return [left] + _rest
+        # לא רשימה → כנראה המשך השם ('לחם מחמצת וגרעינים') → אל תפצל
+        break
+    return [s]
 
 
 _MEAL_NAMES = r'(?:בוקר|צהריים|צהרים|ערב|ביניים|לילה)'
@@ -2568,10 +2906,25 @@ def execute_request(request_text: str, force: bool = False,
                     name_override: str = "", meal_override: str = "",
                     food_override: str = "", hint_override: str = "",
                     user_id_override: str = "", cal_mode=None,
-                    allow_fuzzy: bool = False) -> str:
+                    allow_fuzzy: bool = False, meal_id_override: str = "",
+                    resume_op_index=None, _execution_state=None) -> str:
+    # state חי רק לאורך פקודה אחת (כולל פיצולי-המשנה שלה), ולעולם לא בין הודעות.
+    # ממצא 22: בלי השיתוף כל חלק טען snapshot ישן מחדש ודרס את תוצאת החלק הקודם.
+    if _execution_state is None:
+        _execution_state = {"meals_by_user": {}}
+    # תאימות: גם Node ישן שמעביר את token כולו דרך --meal שומר את המזהה.
+    if meal_override and not meal_id_override:
+        _decoded_id, _decoded_name = _decode_meal_option(meal_override)
+        if _decoded_id:
+            meal_id_override, meal_override = _decoded_id, _decoded_name
+    # פסיק עשרוני → נקודה, *לפני כל פיצול*. "12,5 גרם שמן זית" נחתך בפסיק ל-"12"
+    # ול-"5 גרם שמן זית", ונוספו 5 גרם בלבד (ביקורת-קודקס 19.7). רק בין ספרה לספרה,
+    # כך שפסיק-רשימה אמיתי ("אורז, בטטה") לא נפגע.
+    request_text = re.sub(r'(?<=\d),(?=\d)', '.', request_text)
     # ── שאילתת קריאה: "מה יש לדני בצהריים?" ────────────────────────────────────
     if _READ_QUERY_PAT.search(request_text) and not _ACTION_VERB_PAT.search(request_text):
-        return _handle_read_query(request_text, name_override, meal_override, user_id_override)
+        return _handle_read_query(request_text, name_override, meal_override,
+                                  user_id_override, meal_id_override)
     # ── שלילה: "אל תוסיפי" / "לא להוסיף" ─────────────────────────────────────
     if _NEGATION_PREFIX.search(request_text.strip()):
         return "❓ לא הבנתי — נראה כמו שלילה. אם רצית לבצע פעולה, שלח שוב ללא 'אל' / 'לא'."
@@ -2581,13 +2934,6 @@ def execute_request(request_text: str, force: bool = False,
     # בלי הסרה היא נדבקת לשם המזון ושוברת התאמה (hint יוצא "תפריט אורז לפני בישול" → לא נמצא).
     # ב-READ_QUERY ("מה יש בתפריט") כבר חזרנו למעלה, אז כאן זה תמיד מילת-מיקום מיותרת.
     request_text = re.sub(r'(?<![א-ת])[לבמ]?ה?תפריט(?![א-ת])', ' ', request_text)
-    # ── מצב קלוריות: "מוריד 80 קלוריות מהפיתה" → המר ל-"80 גרם" ואותת cal_mode.
-    # ההמרה לגרמים-אמיתיים (לפי המזון) נעשית ב-handle_calorie_adjust. cal_mode מועבר
-    # לכל הקריאות הרקורסיביות כי אחרי ההמרה "קלוריות" כבר לא בטקסט.
-    if cal_mode is None:
-        cal_mode = bool(_CAL_UNIT_RE.search(request_text))
-    if cal_mode:
-        request_text = _CAL_UNIT_RE.sub(r'\1 גרם', request_text)
     # ── קיזוז / אופציות-מרובות: דפוסים שאסור לפצל ל-multi-task (מכילים 'מוריד'/'ו') ──
     _special_cmd = bool(_OFFSET_TRIG.search(request_text) or _OPTIONS_TRIG.search(request_text))
     # ── ריבוי אנשים: "לדני ולרון X" → 2 בקשות נפרדות ──────────────────────────
@@ -2605,8 +2951,16 @@ def execute_request(request_text: str, force: bool = False,
             if uid2 and uid2 not in ("MULTIPLE", "NOT_FOUND"):
                 req1 = request_text[:_mp.start()] + f'ל{n1} ' + request_text[_mp.end():]
                 req2 = request_text[:_mp.start()] + f'ל{n2} ' + request_text[_mp.end():]
-                r1 = execute_request(req1.strip(), force, name_override, meal_override, food_override, hint_override, user_id_override, cal_mode)
-                r2 = execute_request(req2.strip(), force, name_override, meal_override, food_override, hint_override, user_id_override, cal_mode)
+                r1 = execute_request(req1.strip(), force, name_override, meal_override, food_override,
+                                     hint_override, user_id_override, cal_mode,
+                                     meal_id_override=meal_id_override,
+                                     resume_op_index=resume_op_index,
+                                     _execution_state=_execution_state)
+                r2 = execute_request(req2.strip(), force, name_override, meal_override, food_override,
+                                     hint_override, user_id_override, cal_mode,
+                                     meal_id_override=meal_id_override,
+                                     resume_op_index=resume_op_index,
+                                     _execution_state=_execution_state)
                 return f"{r1}\n\n{r2}"
     # ── ריבוי משימות: "מוסיף לך X בבוקר ותוסיף Y בערב" / שורות נפרדות ───────
     # עובד גם ב-V3 (שם מגיע מטלפון) — לא רק כשהשם בטקסט.
@@ -2620,8 +2974,10 @@ def execute_request(request_text: str, force: bool = False,
         # כינוי-גוף אופציונלי בין ו'/שורה-חדשה לפועל: "ואני מוסיף", "ואז תוסיף", "וגם מוריד"
         _PRON_LK = r'(?:אני\s+|אנחנו\s+|אז\s+|גם\s+)?'
         _mt_parts = re.split(
-            rf'(?:\s+ו\s*{_PRON_LK}{_MEAL_LK}(?={_MULTI_VERBS})'
-            rf'|\n\s*ו?\s*{_PRON_LK}{_MEAL_LK}(?={_MULTI_VERBS}))',
+            # "הוסף:" הוא שם שדה מובנה, לא תחילת תת-פקודה חופשית. פיצולו לפני
+            # parse_message עקף את ניקוי marker של "מזון חדש" וזיהם את החיפוש.
+            rf'(?:\s+ו\s*{_PRON_LK}{_MEAL_LK}(?={_MULTI_VERBS}(?![א-ת:]))'
+            rf'|\n\s*ו?\s*{_PRON_LK}{_MEAL_LK}(?={_MULTI_VERBS}(?![א-ת:])))',
             request_text.strip()
         )
         if len(_mt_parts) > 1:
@@ -2652,7 +3008,10 @@ def execute_request(request_text: str, force: bool = False,
                         continue
                 sub_results.append(execute_request(part, force, name_override,
                                                    meal_override, food_override, hint_override,
-                                                   user_id_override, cal_mode))
+                                                   user_id_override, cal_mode,
+                                                   meal_id_override=meal_id_override,
+                                                   resume_op_index=resume_op_index,
+                                                   _execution_state=_execution_state))
             # החזר רק אם באמת פוצל למשימות מרובות (אחרת המשך לפרסינג רגיל)
             if len(sub_results) > 1:
                 # ── ריבוי-ארוחות של אותה פעולה: כל תתי-המשימות מחזירות את אותה
@@ -2687,8 +3046,26 @@ def execute_request(request_text: str, force: bool = False,
             for part in _parts:
                 sub_results.append(execute_request(part, force, name_override,
                                                    meal_override, food_override, hint_override,
-                                                   user_id_override, cal_mode))
+                                                   user_id_override, cal_mode,
+                                                   meal_id_override=meal_id_override,
+                                                   resume_op_index=resume_op_index,
+                                                   _execution_state=_execution_state))
             return "\n\n─────────────\n\n".join(sub_results)
+
+    # ── מצב קלוריות: זיהוי מקומי *אחרי* כל פיצולי ה-top-level. קודם הדגל חושב
+    # לכל ההודעה והועבר רקורסיבית, ולכן "80 קלוריות ... ותוסיף 50 גרם" פירש גם
+    # את הפעולה השנייה כקלוריות. כל תת-פקודה מגיעה לכאן בנפרד ומזהה את היחידה שלה.
+    # cal_mode מפורש עדיין נשמר ברקורסיית confirm, שבה הטקסט כבר הומר לגרמים.
+    # בשדה מובנה "הוספה:" parse_message מצמיד את הדגל לכל op; אסור להמיר כאן
+    # את כל ההודעה, אחרת שורת גרמים שכנה מקבלת בטעות cal_mode של השורה הראשונה.
+    _structured_cal = bool(re.search(
+        r'(?m)^\s*הוספה\s*:\s*.*' + _CAL_UNIT_RE.pattern,
+        request_text,
+    ))
+    if cal_mode is None:
+        cal_mode = bool(_CAL_UNIT_RE.search(request_text)) and not _structured_cal
+    if cal_mode:
+        request_text = _CAL_UNIT_RE.sub(r'\1 גרם', request_text)
 
     # force=True = הלקוח כבר זוהה (רקורסיה אחרי פתרון שם) → לעולם לא לחלץ שם שוב מהטקסט,
     # אחרת מזון שנראה כמו שם פרטי ("כוסמת"/"פתיתים"/"בננה") נאכל בטעות כשם ושובר את הפקודה.
@@ -2741,7 +3118,10 @@ def execute_request(request_text: str, force: bool = False,
         if not is_fuzzy and parsed.get("change"):
             return execute_request(request_text, force=True, name_override=found_name,
                                    meal_override=meal_override, food_override=food_override,
-                                   hint_override=hint_override, cal_mode=cal_mode)
+                                   hint_override=hint_override, cal_mode=cal_mode,
+                                   meal_id_override=meal_id_override,
+                                   resume_op_index=resume_op_index,
+                                   _execution_state=_execution_state)
 
         # שם להצגה — אם fuzzy → מציין את התיקון
         if is_fuzzy:
@@ -2795,8 +3175,14 @@ def execute_request(request_text: str, force: bool = False,
 
     # בנה רשימת ארוחות ברירת מחדל
     if meal_override:
-        m = _extract_meal(meal_override)
-        meals_list = [m if m else meal_override]
+        # שם-ארוחה מלא ("ארוחת צהריים אחרי בישול") מגיע כשדני *בחר* ארוחה מהרשימה
+        # שהבוט הציע. אסור לכווץ אותו ל"צהריים" — הכיווץ מחק את "אחרי בישול"
+        # והבחירה המפורשת נדרסה לטובת "ארוחת צהריים" (ביקורת-קודקס 19.7).
+        if meal_override.strip().startswith("ארוחת"):
+            meals_list = [meal_override.strip()]
+        else:
+            m = _extract_meal(meal_override)
+            meals_list = [m if m else meal_override]
     else:
         meals_list = parsed.get("meals") or [parsed.get("meal", "ערב")]
 
@@ -2831,8 +3217,44 @@ def execute_request(request_text: str, force: bool = False,
     if is_fuzzy and name_override and name_override == name and not allow_fuzzy:
         return f"NAME_NOT_FOUND:{name}"
 
-    # קבל ארוחות (פעם אחת)
-    all_meals = get_user_meals(user_id)
+    # קבל ארוחות פעם אחת לכל מתאמן לאורך כל חלקי אותה פקודה. האובייקטים במטמון
+    # מתעדכנים אחרי כתיבה מוצלחת, כך שתת-הפקודה הבאה מתחילה מהכמות החדשה.
+    _meals_by_user = _execution_state.setdefault("meals_by_user", {})
+    _user_state_key = str(user_id)
+    if _user_state_key not in _meals_by_user:
+        _meals_by_user[_user_state_key] = get_user_meals(user_id)
+    all_meals = _meals_by_user[_user_state_key]
+    if meal_id_override:
+        _selected_meal = next((m for m in all_meals
+                               if str(m.get("id")) == str(meal_id_override)), None)
+        if _selected_meal is None:
+            # fail closed: מזהה ישן/של מתאמן אחר לעולם לא נופל להתאמת שם.
+            return "❌ הארוחה שנבחרה כבר אינה קיימת אצל המתאמן; לא בוצעה פעולה."
+        _selected_name = (_selected_meal.get("meal_name", "") or "").strip()
+        meal_override = _selected_name
+        meals_list = [_selected_name]
+        # כל מסלולי ההתאמה הקיימים בוחרים את ההתאמה המדויקת הראשונה; הקדמת
+        # האובייקט שנבחר משמרת את ה-ID גם כשיש שתי ארוחות בעלות אותו שם.
+        all_meals = [_selected_meal] + [m for m in all_meals if m is not _selected_meal]
+    else:
+        # שם מלא יכול להופיע פעמיים. אין לבחור את הראשון בשקט: החזר tokens עם ID
+        # כדי שהבחירה הבאה תהיה חד-משמעית.
+        for _requested_meal in meals_list:
+            _requested_full = meal_map.get(
+                _requested_meal,
+                _requested_meal if "ארוחת" in _requested_meal else f"ארוחת {_requested_meal}",
+            ).strip()
+            _same_name = [m for m in all_meals
+                          if (m.get("meal_name", "") or "").strip() == _requested_full]
+            if len(_same_name) > 1:
+                _tokens = [_meal_option_token(m) for m in _same_name]
+                _lines = "\n".join(
+                    f"{i+1}. {_requested_full} (מיקום {m.get('order') or i+1})"
+                    for i, m in enumerate(_same_name)
+                )
+                return (f"MEAL_OPTIONS:{_requested_full}|{'|'.join(_tokens)}\n"
+                        f"❓ יש כמה ארוחות בשם *{_requested_full}*:\n{_lines}\n\n"
+                        "שלח מספר ארוחה.")
     coach_id = load_coach_id()
 
     # ── קיזוז קלורי / הוספה עם אופציות מרובות ────────────────────────────
@@ -2857,16 +3279,14 @@ def execute_request(request_text: str, force: bool = False,
 
     # ── התאמת קלוריות למזון קיים: "מוריד/מוסיף N קלוריות מ/ל-FOOD" ───────
     # (ריבוי-פעולות עם "ו" כבר פוצל ל-multi-task; כאן פעולה בודדת)
-    if cal_mode and not food_override and not hint_override:
+    if (cal_mode and not food_override and not hint_override
+            and not any(op.get("_cal_mode") for op in parsed.get("ops", []))):
         return handle_calorie_adjust(user_id, full_name, all_meals,
-                                     parsed, meals_list, request_text)
+                                     parsed, meals_list, request_text,
+                                     mutate_snapshot=True)
 
     # ── בנה רשימת פעולות ─────────────────────────────────────────
-    # food/hint override → פעולה בודדת (תשובה לתיקון)
-    if food_override or hint_override:
-        ops_list = [{"change": parsed["change"], "meal": None}]
-    else:
-        ops_list = parsed.get("ops") or [{"change": parsed["change"], "meal": None}]
+    ops_list = parsed.get("ops") or [{"change": parsed["change"], "meal": None}]
 
     # ── פיצול multi-food: "הוסף (X גרם FOOD ו Y גרם FOOD2)" → שתי פעולות ──
     _split_ops = []
@@ -2889,7 +3309,7 @@ def execute_request(request_text: str, force: bool = False,
         # כל מחרוזת רב-מילית עוברת ל-_split_multi_new_food (כולל רשימה ברווחים בלבד "כוסמת פסטה בורגול");
         # הפונקציה מחליטה בבטחה — מפצלת רק אם כל הטוקנים מזון מדויק, אחרת משאירה שלם.
         # שער: רווח *או* מפריד-רשימה (פסיק/+/וגם/או) — "כוסמת,פתיתים" בלי רווח חייב להיכנס גם.
-        if not food_override and not hint_override and _mb and not _sop.get("extra_grams") and re.search(r'[\s,+]|וגם|\bאו\b', _mb.group(2).strip()):
+        if _mb and not _sop.get("extra_grams") and re.search(r'[\s,+]|וגם|\bאו\b', _mb.group(2).strip()):
             _foods = _split_multi_new_food(_mb.group(2).strip(), coach_id)
             if len(_foods) >= 2:
                 for _f in _foods:
@@ -2900,17 +3320,66 @@ def execute_request(request_text: str, force: bool = False,
         _split_ops_b.append(_sop)
     ops_list = _split_ops_b
 
+    # בחירה אינטראקטיבית חייבת לדעת לאיזו פעולה היא שייכת. קודם override צמצם
+    # תמיד לפעולה 0, הריץ אותה שוב והחיל עליה בחירה שנועדה לפעולה 1.
+    _indexed_ops = list(enumerate(ops_list))
+    if resume_op_index is not None and str(resume_op_index) != "":
+        try:
+            _resume_idx = int(resume_op_index)
+        except (TypeError, ValueError):
+            return "❌ יעד הפעולה לבחירה אינו תקין; לא בוצעה פעולה."
+        if _resume_idx < 0 or _resume_idx >= len(_indexed_ops):
+            return "❌ יעד הפעולה לבחירה כבר אינו קיים; לא בוצעה פעולה."
+        _indexed_ops = [_indexed_ops[_resume_idx]]
+    elif (food_override or hint_override) and len(_indexed_ops) > 1:
+        # fail closed עבור clients ישנים: בלי metadata אסור לנחש פעולה 0.
+        return "❌ חסר יעד לבחירת המזון בבקשה מרובת פעולות; לא בוצעה פעולה."
+    _active_op_count = len(_indexed_ops)
+
     _VP = r'(?:להוסיף|הוסיפ[יי]?|הוסיף|תוסיפ[יי]?|הוסף|החלף[יי]?|החליף|תחליף|תחליפ[יי]?|להחליף)'
 
     all_results = []
     # מזונות מ-multi-food שלא נמצאו במאגר — נאספים כדי לשאול עליהם בסוף (אחרי ביצוע הנמצאים)
-    missing_foods = []  # [(query, alternatives), ...]
+    missing_foods = []  # [(query, alternatives, hint, source_op_index), ...]
+    # שאלת ארוחה באמצע מולטי-op אינה עוצרת את הזנב: הזנב מבוצע עכשיו, וב-retry
+    # חוזרים רק ל-op העמום לפי source_op_index (ממצאים 19/20).
+    pending_multimeals = []  # [(source_op_index, tokens, names, hint), ...]
 
     # האם צוינה ארוחה כלשהי בטקסט? (גם free-text, לא רק op-level)
     _meal_in_text = bool(re.search(r'(?:בוקר|צהריי?ם|ערב|ביניים|בינים|לילה|לפני\s+אימון|אחרי\s+אימון)', request_text))
-    for op_idx, op in enumerate(ops_list):
+    for op_idx, (source_op_idx, op) in enumerate(_indexed_ops):
+        _resume_meta = (f"RESUME_OP_INDEX:{source_op_idx}\n"
+                        if len(ops_list) > 1 or resume_op_index is not None else "")
         op_change = op.get("change") or parsed.get("change", "")
         op_meal_str = op.get("meal") or None  # ארוחה ספציפית לפעולה זו
+        # בחירת ארוחה כפולה לפני שבוצעה כתיבה היא ברירת-המחדל של הבקשה; במולטי-op
+        # אסור לה לדרוס op שמצהיר ארוחה אחרת. ב-single או resume היא הבחירה של ה-op.
+        _meal_override_for_op = bool(
+            meal_override and (
+                resume_op_index is not None or len(ops_list) == 1 or not op_meal_str
+            )
+        )
+
+        if op.get("_cal_mode"):
+            # מסלול קלורי מקומי לפעולה מובנית אחת; שאר ה-ops ממשיכים כגרמים.
+            _cal_parsed = dict(parsed)
+            _cal_parsed.update({
+                "ops": [op],
+                "change": op_change,
+                "extra_grams": op.get("extra_grams"),
+                "reduce": bool(op.get("reduce")),
+            })
+            if _meal_override_for_op:
+                _cal_meals = meals_list
+            elif op_meal_str:
+                _cal_meals = [op_meal_str]
+            else:
+                _cal_meals = meals_list
+            all_results.append(handle_calorie_adjust(
+                user_id, full_name, all_meals, _cal_parsed, _cal_meals, op_change,
+                mutate_snapshot=True,
+            ))
+            continue
 
         # parse food + hint מהchange
         add_match = (
@@ -2919,7 +3388,7 @@ def execute_request(request_text: str, force: bool = False,
             or re.search(r'^(.+?)\s+במקום(?:\s+של)?\s+(.+)$', op_change)
         )
         if not add_match:
-            if len(ops_list) == 1:
+            if _active_op_count == 1:
                 return "לא הבנתי. שלח: הוסף (מזון) במקום (מזון קיים)"
             all_results.append(f"⚠️ לא הבנתי את הפעולה: {op_change[:40]}")
             continue
@@ -2996,7 +3465,7 @@ def execute_request(request_text: str, force: bool = False,
                         options = "\n".join(f"{i+1}. {_fmt(f)}" for i, f in enumerate(alternatives[:10]))
                         alts_pipe = "|".join(f"{f.get('food_name','')}:{int(float(f.get('calories',0) or 0))}" for f in alternatives)
                         more_hint = f"\n\n_שלח *עוד* לאפשרויות נוספות_" if len(alternatives) > 10 else ""
-                        return (f"FOOD_OPTIONS:{normalize_food_query(food_override)}||{alts_pipe}\n"
+                        return (f"FOOD_OPTIONS:{normalize_food_query(food_override)}||{alts_pipe}\n{_resume_meta}"
                                 f"לא מצאתי *{food_override}*, מה שמצאתי:\n"
                                 f"{options}\n\n"
                                 f"בחר מספר, כתוב שם אחר, או שלח *עוד*.{more_hint}")
@@ -3007,24 +3476,32 @@ def execute_request(request_text: str, force: bool = False,
             _food_letters = re.sub(r'גרם|גר|[\d\s.\-]', '', new_food_query)
             if new_food_query.strip() in _NOT_FOOD_WORDS:
                 # מילת-אישור/שיחה ("כן") — לא מאכל. דלג בשקט (לא להוסיף שטות לתפריט).
-                if len(ops_list) == 1:
+                if _active_op_count == 1:
                     return "❓ לא זיהיתי מאכל בבקשה (נראה כמו תשובה כללית). שלח שוב עם שם המזון."
                 continue
             if len(_food_letters) < 2:
                 _miss = "❓ לא ציינת איזה מזון. דוגמה: *מוסיף לך 50 גרם אורז בצהריים*"
-                if len(ops_list) == 1:
+                if _active_op_count == 1:
                     return _miss
                 all_results.append(_miss)
                 continue
             # הורדה ממזון קיים: אל תחפש במאגר הגלובלי ("לחם"=30+ וריאציות → שאלה מיותרת).
             # בלוק ההורדה בהמשך מאתר את המזון *בארוחה* ומפחית. best_food לא נדרש להורדה.
             _is_reduce_op = bool(op.get("reduce") or parsed.get("reduce"))
+            # הפחתה בלי כמות ("מוריד לך אורז") — אין מה להפחית, ואסור שתיפול
+            # למסלול-ההוספה: 19.7 הבוט *הוסיף* 100 גרם אורז במקום להוריד. שואלים.
+            if _is_reduce_op and not extra_grams:
+                _ask = f"❓ כמה להוריד מ-*{new_food_query}*? (למשל: מוריד לך 30 גרם {new_food_query})"
+                if _active_op_count == 1:
+                    return _ask
+                all_results.append(_ask)
+                continue
             if _is_reduce_op and extra_grams and not group_hint:
                 best_food, alternatives = None, []
             else:
                 best_food, alternatives = find_best_food(new_food_query, coach_id)
                 if not best_food:
-                    if len(ops_list) == 1:
+                    if _active_op_count == 1:
                         if alternatives:
                             def _fmt(f):
                                 cal = int(float(f.get('calories') or 0))
@@ -3032,22 +3509,22 @@ def execute_request(request_text: str, force: bool = False,
                             options = "\n".join(f"{i+1}. {_fmt(f)}" for i, f in enumerate(alternatives[:10]))
                             alts_pipe = "|".join(f"{f.get('food_name','')}:{int(float(f.get('calories',0) or 0))}" for f in alternatives)
                             more_hint = f"\n\n_שלח *עוד* לאפשרויות נוספות_" if len(alternatives) > 10 else ""
-                            return (f"FOOD_OPTIONS:{new_food_query}||{alts_pipe}\n"
+                            return (f"FOOD_OPTIONS:{new_food_query}||{alts_pipe}\n{_resume_meta}"
                                     f"לא מצאתי *{new_food_query}*, מה שמצאתי:\n"
                                     f"{options}\n\n"
                                     f"בחר מספר, כתוב שם אחר, או שלח *עוד*.{more_hint}")
-                        return (f"FOOD_OPTIONS:{new_food_query}||\n"
+                        return (f"FOOD_OPTIONS:{new_food_query}||\n{_resume_meta}"
                                 f"לא מצאתי *{new_food_query}* במאגר 🤔\n"
                                 f"כתוב שם מזון אחר:")
                     # multi-food: אל תדלג בשקט — אסוף את החסר ושאל עליו בסוף (אחרי ביצוע הנמצאים)
-                    missing_foods.append((new_food_query, alternatives or [], group_hint))
+                    missing_foods.append((new_food_query, alternatives or [], group_hint, source_op_idx))
                     continue
 
         # קבע ארוחות לפעולה זו
-        if op_meal_str:
-            op_meals = [op_meal_str]
-        elif meal_override:
+        if _meal_override_for_op:
             op_meals = meals_list
+        elif op_meal_str:
+            op_meals = [op_meal_str]
         else:
             op_meals = meals_list
 
@@ -3055,7 +3532,7 @@ def execute_request(request_text: str, force: bool = False,
         for meal_item in op_meals:
             full_meal = meal_map.get(meal_item, meal_item if "ארוחת" in meal_item else f"ארוחת {meal_item}")
             # אם אין ארוחה מפורשת ויש מאכל-להחלפה — מצא באיזו ארוחה הוא נמצא
-            if group_hint and not op_meal_str and not _meal_in_text and not meal_override:
+            if group_hint and not op_meal_str and not _meal_in_text and not _meal_override_for_op:
                 _hw = normalize_food_query(group_hint).split()
                 _hint_meals = []
                 for _m in all_meals:
@@ -3068,27 +3545,58 @@ def execute_request(request_text: str, force: bool = False,
                     _mnames = [m.get("meal_name","").strip() for m in _hint_meals]
                     _opts = "\n".join(f"{i+1}. {nm}" for i, nm in enumerate(_mnames))
                     _prefix = ("\n\n".join(all_results) + "\n\n") if all_results else ""
-                    return ("MULTIMEAL:" + "|".join(_mnames) + f"\n{_prefix}"
-                            f"❓ *{group_hint}* נמצא ב-{len(_hint_meals)} ארוחות:\n{_opts}\n\n"
-                            f"שלח מספר לארוחה אחת, או *הכל* לכולן.")
+                    _mtokens = [_meal_option_token(m) for m in _hint_meals]
+                    if _active_op_count == 1:
+                        return ("MULTIMEAL:" + "|".join(_mtokens) + f"\n{_resume_meta}{_prefix}"
+                                f"❓ *{group_hint}* נמצא ב-{len(_hint_meals)} ארוחות:\n{_opts}\n\n"
+                                f"שלח מספר לארוחה אחת, או *הכל* לכולן.")
+                    pending_multimeals.append(
+                        (source_op_idx, _mtokens, _mnames, group_hint)
+                    )
+                    break
 
             # ─── גרמים ללא group_hint → UPDATE כמות קיימת ────────────────────
             # force_new=True (בקשת "מזון חדש") → תמיד ADD, לא UPDATE
             _is_reduce = op.get("reduce") or parsed.get("reduce")
-            if extra_grams and not group_hint and (not parsed.get("force_new") or _is_reduce):
+            _force_new_for_op = bool(op.get("force_new") or parsed.get("force_new"))
+            if extra_grams and not group_hint and (not _force_new_for_op or _is_reduce):
                 _, upd_row, upd_err = find_meal_and_food(all_meals, full_meal, new_food_query)
                 if upd_row:
                     curr_q = float(upd_row.get("quantity") or upd_row.get("quantity_to_calculate") or 0)
                     _unit = (upd_row.get("measure") or "grams").strip().lower() == "unit"
                     _ul = "יח'" if _unit else "גרם"
                     _fmtq = (lambda x: f"{x:.1f}".rstrip("0").rstrip(".")) if _unit else (lambda x: f"{int(round(x))}")
+                    # שורה שנמדדת ביחידות: המספר שדני כתב הוא *מספר יחידות*, לא גרמים.
+                    # "מוסיף לך 1 ביצה" הומר ל-55 גרם ונכתב כ-55 יחידות — 3 ביצים הפכו
+                    # ל-58 (ביקורת-קודקס 19.7). ההמרה לגרמים תקפה רק לשורה שבגרמים.
+                    if _unit:
+                        _cnt = re.search(r'(?<![א-ת\d])(\d+(?:\.\d+)?)\s*(?:יחיד[הות]\w*\s+(?:של\s+)?)?ביצ',
+                                         request_text)
+                        if _cnt:
+                            extra_grams = _cnt.group(1)
                     if _is_reduce:
                         if curr_q <= 0:
                             all_results.append(f"⚠️ '{new_food_query}' כבר ב-0 {_ul} ב{full_meal}")
                             continue
-                        new_q = max(0.0, curr_q - float(extra_grams))
+                        _reduce_amount = float(extra_grams)
+                        _quantity_kind = op.get("quantity_kind") or parsed.get("quantity_kind")
+                        if _quantity_kind == "egg_count" and not _unit:
+                            # אותה בקשה מול שורת grams היא משקל של ביצה, ומול unit היא יחידה אחת.
+                            _reduce_amount *= 55
+                        new_q = max(0.0, curr_q - _reduce_amount)
                         action_label = "הופחת"
                         arrow = "↓"
+                    elif (len(ops_list) == 1
+                          and _SET_QTY_VERB.search(request_text)
+                          and not _ADD_QTY_VERB.search(request_text)):
+                        # "עדכן את חזה העוף 100 גרם" = *קבע* 100, לא "הוסף 100".
+                        # קודם כל פעולה חיובית חיברה, ו-250 הפך ל-350 (19.7).
+                        # ⚠️ אם יש בהודעה גם פועל-חיבור ("תעדכן לדני בבקשה, מוסיף לך
+                        # 50 גרם") — זו הוספה. בלי התנאי הזה 200 נקבע ל-50 במקום 250
+                        # (ביקורת-פייבל 19.7). בספק — מחברים, כי זו ההתנהגות הוותיקה.
+                        new_q = float(extra_grams)
+                        action_label = "עודכן"
+                        arrow = "→"
                     else:
                         new_q = curr_q + float(extra_grams)
                         action_label = "עודכן"
@@ -3096,6 +3604,11 @@ def execute_request(request_text: str, force: bool = False,
                     upd = update_food_quantity(user_id, upd_row["id"], new_q)
                     fname = upd_row.get("food_name", "")
                     if upd.get("status"):
+                        # ה-snapshot נטען פעם אחת לכל הבקשה. בלי לעדכן אותו כאן,
+                        # הפחתה שנייה מאותו מזון חישבה שוב מהכמות הישנה ודרסה את הראשונה.
+                        upd_row["quantity"] = str(new_q)
+                        if "quantity_to_calculate" in upd_row:
+                            upd_row["quantity_to_calculate"] = str(new_q)
                         all_results.append(
                             f"✅ {action_label}: *{fname}* "
                             f"{_fmtq(curr_q)}{arrow}{_fmtq(new_q)} {_ul} "
@@ -3130,7 +3643,8 @@ def execute_request(request_text: str, force: bool = False,
             meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint)
             # אם המאכל-להחלפה לא נמצא בארוחה שצוינה/ברירת-המחדל — חפש אותו בכל הארוחות.
             # (דני לרוב לא מציין ארוחה: "תוסיף X באופציה של Y" → מצא איפה Y נמצא)
-            if err and group_hint and "לא נמצא" in err:
+            if (err and group_hint and "לא נמצא" in err
+                    and not op_meal_str and not _meal_in_text and not _meal_override_for_op):
                 _hw = normalize_food_query(group_hint).split()
                 _found = []
                 for _m in all_meals:
@@ -3141,8 +3655,15 @@ def execute_request(request_text: str, force: bool = False,
                 if len(_found) == 1:
                     full_meal = _found[0].get("meal_name","").strip()
                     meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint)
+            # דיווח כן: הקבלה תציג את *שם הארוחה שאליה נכתב בפועל*, לא את מה שהתבקש.
+            # (בלי זה, התאמה לא-מדויקת נראית כהצלחה בארוחה שהמאמן ביקש.)
+            if meal_id:
+                _resolved = next((m.get("meal_name", "").strip() for m in all_meals
+                                  if str(m.get("id")) == str(meal_id)), "")
+                if _resolved:
+                    full_meal = _resolved
             if err:
-                multi_meal = len(op_meals) > 1 or len(ops_list) > 1
+                multi_meal = len(op_meals) > 1 or _active_op_count > 1
                 prefix = ("\n\n".join(all_results) + "\n\n") if all_results else ""
                 if "לא נמצאה ארוחה" in err or "לא נמצאו ארוחות" in err:
                     available = [m.get("meal_name","").strip() for m in all_meals]
@@ -3151,7 +3672,8 @@ def execute_request(request_text: str, force: bool = False,
                         # אם דני לא ציין ארוחה (ברירת מחדל ערב) — שאל ישר "לאיזו ארוחה", לא "לא מצאתי ערב"
                         _q = (f"❓ לא מצאתי '{full_meal}'. יש:" if (op_meal_str or _meal_in_text)
                               else f"❓ לאיזו ארוחה להוסיף את *{new_food_query}*?")
-                        return f"MEAL_OPTIONS:{full_meal}|" + "|".join(available) + f"\n{prefix}{_q}\n{opts}\n\nשלח מספר או שם ארוחה."
+                        _meal_tokens = [_meal_option_token(m) for m in all_meals]
+                        return f"MEAL_OPTIONS:{full_meal}|" + "|".join(_meal_tokens) + f"\n{_resume_meta}{prefix}{_q}\n{opts}\n\nשלח מספר או שם ארוחה."
                 if meal_id and "לא נמצא" in err:
                     if not multi_meal:
                         meal_foods = next((m.get("mealFoods") or m.get("new_meal_food") or []
@@ -3162,7 +3684,7 @@ def execute_request(request_text: str, force: bool = False,
                                 return f"{f.get('food_name','')}{f' — {cal} קל' if cal else ''}"
                             opts = "\n".join(f"{i+1}. {_fmt_h(f)}" for i, f in enumerate(meal_foods))
                             foods_list = "|".join(f"{f.get('food_name','')}:{int(float(f.get('calories',0) or 0))}" for f in meal_foods)
-                            return (f"HINT_OPTIONS:{group_hint}||{foods_list}\n{prefix}"
+                            return (f"HINT_OPTIONS:{group_hint}||{foods_list}\n{_resume_meta}{prefix}"
                                     f"לא מצאתי *{group_hint}* ב{full_meal}, במה תרצה להחליף את *{new_food_query}*?\n"
                                     f"המזונות שיש בארוחה:\n{opts}\n\n"
                                     f"בחר מספר או כתוב שם אחר.")
@@ -3217,10 +3739,23 @@ def execute_request(request_text: str, force: bool = False,
             else:
                 all_results.append(add_result)
 
+    # ── שאלה מושהית על ארוחה: כל ה-ops שאינם תלויים בבחירה כבר בוצעו ──
+    if pending_multimeals:
+        _pidx, _ptokens, _pnames, _phint = pending_multimeals[0]
+        _done = "\n\n".join(all_results)
+        _done_block = (_done + "\n\n") if _done else ""
+        _popts = "\n".join(f"{i+1}. {nm}" for i, nm in enumerate(_pnames))
+        _more_pending = (f"\n_(ממתינות עוד {len(pending_multimeals) - 1} בחירות ארוחה)_"
+                         if len(pending_multimeals) > 1 else "")
+        return ("MULTIMEAL:" + "|".join(_ptokens) + f"\nRESUME_OP_INDEX:{_pidx}\n"
+                f"{_done_block}❓ *{_phint}* נמצא ב-{len(_pnames)} ארוחות:\n{_popts}"
+                f"{_more_pending}\n\nשלח מספר לארוחה אחת, או *הכל* לכולן.")
+
     # ── דיווח חלקי: חלק מהמזונות נמצאו ובוצעו, חלק לא — שלח קבלה ושאל על החסר ──
     if missing_foods:
         _done = "\n\n".join(all_results)
-        _mq, _malts, _mhint = missing_foods[0]
+        _mq, _malts, _mhint, _mop_idx = missing_foods[0]
+        _missing_meta = f"RESUME_OP_INDEX:{_mop_idx}\n"
         # מה שעוד נשאר אחרי החסר הנוכחי — להזכיר לדני שיצטרך לטפל בו בנפרד
         _rest = [m[0] for m in missing_foods[1:]]
         _rest_note = f"\n_(ממתינים גם: {', '.join(_rest)} — נטפל אחרי זה)_" if _rest else ""
@@ -3229,10 +3764,10 @@ def execute_request(request_text: str, force: bool = False,
             _opts = "\n".join(f"{i+1}. {f['food_name']}{(' — ' + str(int(float(f.get('calories') or 0))) + ' קל') if float(f.get('calories') or 0) else ''}" for i, f in enumerate(_malts[:10]))
             _alts_pipe = "|".join(f"{f.get('food_name','')}:{int(float(f.get('calories',0) or 0))}" for f in _malts)
             _more = "\n\n_שלח *עוד* לאפשרויות נוספות_" if len(_malts) > 10 else ""
-            return (f"FOOD_OPTIONS:{_mq}||{_alts_pipe}\n"
+            return (f"FOOD_OPTIONS:{_mq}||{_alts_pipe}\n{_missing_meta}"
                     f"{_done_block}❓ צריך עזרה ב-*{_mq}* — מה שמצאתי:\n{_opts}{_rest_note}\n\n"
                     f"בחר מספר, כתוב שם אחר, או שלח *עוד*.{_more}")
-        return (f"FOOD_OPTIONS:{_mq}||\n"
+        return (f"FOOD_OPTIONS:{_mq}||\n{_missing_meta}"
                 f"{_done_block}❓ לא מצאתי *{_mq}* במאגר 🤔{_rest_note}\nכתוב שם מזון אחר:")
 
     return "\n\n".join(all_results) if all_results else "❌ לא בוצעה פעולה"
@@ -3935,6 +4470,9 @@ if __name__ == "__main__":
 
     name_override    = _pop_arg("--name")
     meal_override    = _pop_arg("--meal")
+    meal_id_override = _pop_arg("--meal-id")
+    resume_op_index_s = _pop_arg("--resume-op-index")
+    resume_op_index = resume_op_index_s if resume_op_index_s != "" else None
     food_override    = _pop_arg("--food")
     hint_override    = _pop_arg("--hint")
     menu_name        = _pop_arg("--menu")
@@ -4092,7 +4630,9 @@ if __name__ == "__main__":
                               food_override=food_override,
                               hint_override=hint_override,
                               user_id_override=user_id_override,
-                              allow_fuzzy=allow_fuzzy)
+                              allow_fuzzy=allow_fuzzy,
+                              meal_id_override=meal_id_override,
+                              resume_op_index=resume_op_index)
         # רשת ביטחון: לעולם אל תחזיר ריק — מחרוזת ריקה גורמת ל-node להציג
         # "✅ בוצע" כוזב בזמן ששום פעולה לא קרתה. תמיד יש הודעת מפלט ברורה.
         if _result is None or not str(_result).strip():
