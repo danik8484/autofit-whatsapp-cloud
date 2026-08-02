@@ -505,12 +505,9 @@ def format_menu(user_id: str, full_name: str, meal_filter: str = "") -> str:
     return "\n".join(lines).strip()
 
 
-def find_meal_and_food(meals: list, meal_name: str, food_hint: str, sub_parent: bool = False) -> tuple:
+def find_meal_and_food(meals: list, meal_name: str, food_hint: str) -> tuple:
     """
     מחזיר (meal_id, food_row) לפי שם ארוחה ו-food_hint (group_hint / "במקום X").
-    sub_parent=True: אם ה-hint הוא *אופציה* (subFood), החזר את שורת מזון-האב שלה.
-    מיועד רק למסלול העוגן של "כאופציה ל-X" — תחליף חדש נקשר תמיד למזון ראשי.
-    אסור להדליק במסלולי עדכון-כמות: שם החזרת האב תשנה את הכמות של מזון אחר.
     """
     # נרמל ה' הידיעה משם הארוחה לחיפוש ("ארוחת הערב" → "ארוחת ערב")
     _meal_search = re.sub(r'(?<=\s)ה(?=[א-ת])', '', meal_name).strip()
@@ -532,21 +529,6 @@ def find_meal_and_food(meals: list, meal_name: str, food_hint: str, sub_parent: 
                   if _meal_search in dn or meal_name in dn]
         if _cands:
             target_meal = min(_cands, key=lambda c: (c[0], c[1]))[2]
-    # התאמת-מילים: שם-ארוחה מחובר בתפריט ("ארוחת צהריים /ערב") מול בקשה לחלק ממנו
-    # ("ארוחת ערב"). ההכלה למעלה לא תופסת כי "ארוחת ערב" אינו רצף-אותיות בתוך השם,
-    # וה-fuzzy למטה נופל (0.69<0.8). משווים מילים *שלמות* בלבד — "ערב" לא ייתפס
-    # בתוך מילה אחרת — ו"ארוחת" לא נספרת. (גילי קין 27.7: "צהריים/ערב" כווץ ל"ערב".)
-    if target_meal is None:
-        _q_words = [w for w in re.split(r'[^א-ת]+', _meal_search) if w and w != 'ארוחת']
-        if _q_words:
-            _cands_w = [(abs(len(dn) - len(_meal_search)), i, m)
-                        for i, (m, dn) in enumerate(_named)
-                        if all(qw in re.split(r'[^א-ת]+', _norm_meal(dn)) for qw in _q_words)]
-            # ביקורת-קודקס 27.7: רק מועמדת *יחידה*. שתי ארוחות שמכילות את המילה
-            # ("ערב" גם ב"ארוחת ערב קלה" וגם ב"צהריים /ערב") = ספק אמיתי — עדיף
-            # ליפול לרשימת-הבחירה מאשר לבחור לפי אורך/סדר ולכתוב לארוחה הלא-נכונה.
-            if len(_cands_w) == 1:
-                target_meal = _cands_w[0][2]
     # נפילה רכה: שם הארוחה ב-DB מאוית לא נכון ("ארחת צהריים" במקום "ארוחת צהריים")
     # → התאמה fuzzy לפי דמיון מילים, כדי שטעות-כתיב בתפריט לא תחסום שינוי.
     if not target_meal and meals:
@@ -634,25 +616,6 @@ def find_meal_and_food(meals: list, meal_name: str, food_hint: str, sub_parent: 
                     match = next((f for f in foods if _word_fuzzy(_sw, f.get("food_name", ""))), None)
                 if match:
                     break
-
-        # העוגן הוא אופציה, לא מזון ראשי: "מנגו כאופציה לאננס" כשאננס הוא אופציה
-        # של תמרים (גילי קין 27.7). מחזירים את שורת-האב כי תחליף נקשר למזון ראשי.
-        # בכוונה בלי fuzzy — התאמה שגויה כאן מצמידה את המזון החדש לאב הלא-נכון.
-        # ביקורת-קודקס 27.7: זהות-מלאה עדיפה על הכלה, ורק אב *יחיד*. אותה אופציה
-        # תחת שני אבות (קורה בתפריטים אמיתיים) = ספק — עדיף שאלת-הבהרה מניחוש.
-        if not match and sub_parent:
-            _exact_parents, _loose_parents = [], []
-            for f in foods:
-                for _sub in (f.get("subFoods") or []):
-                    _sn = _norm(_sub.get("food_name", ""))
-                    if _canon_cook(_sn.lower()) == _hint_canon:
-                        _exact_parents.append(f); break
-                    if hint_words and all(w in _sn for w in hint_words):
-                        _loose_parents.append(f); break
-            if len(_exact_parents) == 1:
-                match = _exact_parents[0]
-            elif not _exact_parents and len(_loose_parents) == 1:
-                match = _loose_parents[0]
 
         if not match:
             available_foods = [f.get("food_name","") for f in foods]
@@ -1771,12 +1734,6 @@ def parse_message(text: str, skip_name: bool = False) -> dict:
     # מילות-זמן ("צהריים + ערב השבוע" ← ראם 16.7) — כאן, בשער הפענוח, שיחולו על כל
     # סוגי הפקודות (הוספה/הפחתה/העלאה/החלפה), לא רק על חילוץ-מזון.
     text = _strip_time_words(text)
-    # שם-ארוחה מחובר "צהריים/ערב" (תפריט עם ארוחה אחת משולבת — גילי קין 27.7):
-    # מנקי-הארוחה שבהמשך מסירים רק את המילה הראשונה, וה-"/ערב" נשאר דבוק לשם
-    # המזון ("אננס /ערב"). מקפלים כאן את הצמד למילה הראשונה; ההתאמה לתפריט
-    # (find_meal_and_food, מעבר-המילים) מוצאת ממנה את השם המחובר המלא.
-    _mw_pair = r'(?:ערב|בוקר|צהריי?ם|ביניים|לילה)'
-    text = re.sub(rf'({_mw_pair})\s*/\s*{_mw_pair}(?![א-ת])', r'\1', text)
     # שם-פנייה מוביל ("ליה הורדתי לך 30 גרם" / "אילן אני מוסיף לך") — ב-skip_name השם
     # מגיע מהטלפון, אז מילה מובילה לפני פועל-פקודה היא פנייה ללקוח, לא חלק מהמזון → הסר.
     if skip_name:
@@ -3683,7 +3640,7 @@ def execute_request(request_text: str, force: bool = False,
                         all_results.append(f"❌ לא מצאתי '{new_food_query}' ב{full_meal}.{_other_str}")
                     continue
 
-            meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint, sub_parent=True)
+            meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint)
             # אם המאכל-להחלפה לא נמצא בארוחה שצוינה/ברירת-המחדל — חפש אותו בכל הארוחות.
             # (דני לרוב לא מציין ארוחה: "תוסיף X באופציה של Y" → מצא איפה Y נמצא)
             if (err and group_hint and "לא נמצא" in err
@@ -3697,7 +3654,7 @@ def execute_request(request_text: str, force: bool = False,
                             _found.append(_m); break
                 if len(_found) == 1:
                     full_meal = _found[0].get("meal_name","").strip()
-                    meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint, sub_parent=True)
+                    meal_id, food_row, err = find_meal_and_food(all_meals, full_meal, group_hint)
             # דיווח כן: הקבלה תציג את *שם הארוחה שאליה נכתב בפועל*, לא את מה שהתבקש.
             # (בלי זה, התאמה לא-מדויקת נראית כהצלחה בארוחה שהמאמן ביקש.)
             if meal_id:

@@ -1127,7 +1127,7 @@ const {
   TRIGGER_WORDS, QUOTED_TYPES,
   normalizeBizText, extractMsgText, hasTriggerWord, hasExerciseTrigger,
   hasSetCommand, anchorToCommand, splitBizCommands, splitAndClassify,
-  parseMealOptionToken, extractResumeOpMetadata,
+  parseMealOptionToken, extractResumeOpMetadata, looksLikeMissedCommand,
 } = require('./biz_routing');
 
 // ─── ניתוב פר-פקודה (תיקון 16.7 — אור איבגי) ─────────────────────
@@ -2235,7 +2235,20 @@ async function processBizBody(body) {
     if (!isAllowed) return;
   }
 
-  if (!hasTriggerWord(text)) return;
+  if (!hasTriggerWord(text)) {
+    // ── פקודה-כמעט: פועל-פקודה בלי "לך" ────────────────────────────────
+    // 20.7 (ליה אפרים): דני כתב "אני מוסיף כוסמת+בורגול+קינואה כאופציה לאורז"
+    // בלי "לך". הבוט דורש "מוסיף לך", ולכן התעלם *בשקט* — לא ביצע, לא התריע,
+    // והלקוחה לא קיבלה שינוי. הבוט *לא* מריץ הודעה כזו (ניחוש עלול לשנות תפריט
+    // לא-נכון), אבל *מתריע* לדני לשלוח שוב עם "לך". התראה לא יכולה לקלקל תפריט.
+    if (looksLikeMissedCommand(text)) {
+      const _ph = chatId.replace('@c.us', '');
+      const _nm = body?.senderData?.chatName || _ph;
+      console.log(`[biz] פקודה-כמעט (בלי "לך"): "${_nm}" (${_ph}) | "${text.slice(0,60)}"`);
+      sendBizMessage(BIZ_GROUP, `⚠️ נראה שכתבת פקודה ל*${_nm}* בלי המילה "לך" — ולכן היא *לא בוצעה*.\nשלח שוב עם "לך" (למשל: "מוסיף לך...").\n\n"${text.slice(0,150)}"`);
+    }
+    return;
+  }
   console.log(`[biz] פקודה: chatId=${chatId} | "${text.slice(0,60)}"`);
 
   const clientPhone = chatId.replace('@c.us', '');
