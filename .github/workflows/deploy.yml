@@ -7,6 +7,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: guard - /test route must not exist
+        run: |
+          if grep -rnE "app\.[a-z]+\([[:space:]]*['\"]/test['\"]" --include='*.js' --exclude-dir=node_modules .; then
+            echo "GUARD: /test route found - deploy blocked"; exit 1
+          fi
       - run: npm install -g @railway/cli
       - run: railway up --service bot
         env:

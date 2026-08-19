@@ -2475,7 +2475,6 @@ app.get('/debug-recs', (_, res) => {
 
 // ─── Health check ─────────────────────────────────────────────
 app.get('/', (_, res) => res.send('✅ v2 autofit bot running'));
-app.get('/test', (req, res) => { const {spawn}=require('child_process'); const p=spawn('python3',[require('path').join(__dirname,'autofit_api.py'),'שם: רון וליצקו\nארוחה: ערב\nהוספה: טונה ל חזה עוף מבושל']); let o=''; p.stdout.on('data',d=>{o+=d}); p.on('close',()=>res.send(o)); });
 
 // ─── ניטור שינויים בחשבון מודעות פייסבוק ───────────────────────
 // לולאה עצמאית: קוראת את יומן הפעילות של החשבון כל 3 דק', ושולחת לדני
